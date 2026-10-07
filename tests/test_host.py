@@ -2,13 +2,30 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from app import package_version
-from app.cli import Client, judge_swap, main, parse_slot_sets, slot_patch, split_args
+from app.cli import (
+    Client,
+    as_json,
+    format_deploys,
+    format_exps,
+    format_inspect,
+    format_record,
+    format_repos,
+    format_slot_table,
+    format_tokens,
+    judge_swap,
+    main,
+    parse_slot_sets,
+    slot_hint,
+    slot_patch,
+    split_args,
+)
 from app.config import Config, hook_url
 from app.errors import YardError
 from app.machine import (
@@ -51,12 +68,270 @@ def test_version_prints_the_package_version(capsys: pytest.CaptureFixture[str]):
     assert capsys.readouterr().out.strip() == package_version()
 
 
+def test_help_is_a_short_list(capsys: pytest.CaptureFixture[str]):
+    with pytest.raises(SystemExit) as caught:
+        main([])
+    assert caught.value.code == 0
+    out = capsys.readouterr().out
+    assert f"yard {package_version()}" in out
+    assert "git push -u yard main" in out
+    assert "Save the host and the token" in out
+    assert "yard <command> --help" in out
+
+
+def test_help_flag_lists_the_commands(capsys: pytest.CaptureFixture[str]):
+    with pytest.raises(SystemExit) as caught:
+        main(["--help"])
+    assert caught.value.code == 0
+    out = capsys.readouterr().out
+    assert "revoke" in out
+    assert "https://github.com/Bobowski/yard" in out
+
+
+def test_unknown_command_exits(capsys: pytest.CaptureFixture[str]):
+    with pytest.raises(SystemExit) as caught:
+        main(["nope"])
+    assert caught.value.code == 2
+    assert "Show, log, and edit apps" in capsys.readouterr().err
+
+
+def test_a_missing_verb_lists_the_verbs(capsys: pytest.CaptureFixture[str]):
+    with pytest.raises(SystemExit) as caught:
+        main(["slot"])
+    assert caught.value.code == 0
+    out = capsys.readouterr().out
+    assert "logs <name>" in out
+    assert "Read the container log" in out
+    assert "deploys <name>" in out
+
+
+def test_half_a_command_prints_its_flags(capsys: pytest.CaptureFixture[str]):
+    with pytest.raises(SystemExit) as caught:
+        main(["slot", "logs"])
+    assert caught.value.code == 2
+    err = capsys.readouterr().err
+    assert "yard slot logs <name>" in err
+    assert "--follow" in err
+    assert "Keep reading" in err
+
+
+def test_help_flag_on_a_command(capsys: pytest.CaptureFixture[str]):
+    with pytest.raises(SystemExit) as caught:
+        main(["help", "slot", "logs"])
+    assert caught.value.code == 0
+    out = capsys.readouterr().out
+    assert "yard slot logs <name>" in out
+    assert "--tail <n>" in out
+
+
+def test_records_stay_short():
+    secret = format_record('{"name":"ci","token":"yard-secret","parent":"admin"}')
+    assert secret == "ci\nyard-secret\n"
+    assert "parent" not in secret
+    settings = format_record(
+        '{"domain":"yard.example.com","email":"","self_repo":"","self_ref":"main","self_image":""}'
+    )
+    assert "yard.example.com" in settings
+    assert "ghcr.io/bobowski/yard:latest" in settings
+    assert "self_repo" not in settings
+    assert format_record('{"name":"heldso","created":"t"}') == "heldso\n"
+
+
+def test_deploy_list_drops_the_repeated_columns():
+    started = (datetime.now(UTC) - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ended = (datetime.now(UTC) - timedelta(hours=3) + timedelta(seconds=19)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    text = format_deploys(
+        [
+            {
+                "id": 4,
+                "slot": "honorata",
+                "repo": "honorata",
+                "status": "ok",
+                "sha": "dfa7dd027e8bd735",
+                "started": started,
+                "ended": ended,
+            }
+        ]
+    )
+    assert text.splitlines()[0].split() == ["id", "status", "rev", "took", "when"]
+    assert "dfa7dd0" in text
+    assert "dfa7dd027e8b" not in text
+    assert "honorata" not in text
+    assert "3h" in text
+    failed = format_deploys([{"id": 5, "status": "failed", "sha": "abc", "started": started}], color=True)
+    assert "\033[31m" in failed
+    assert "took" not in failed.splitlines()[0]
+
+
+def test_formats_stay_on_their_paths(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False)
+    assert as_json(split_args(["slot", "list"])) is True
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    assert as_json(split_args(["slot", "list"])) is False
+    assert as_json(split_args(["--json", "slot", "list"])) is True
+    assert as_json(split_args(["--text", "slot", "list"])) is False
+
+
+def test_every_list_uses_the_same_table():
+    started = (datetime.now(UTC) - timedelta(minutes=12)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    repos = format_repos([{"name": "heldso", "created": started}])
+    assert repos.splitlines()[0].split() == ["repo", "when"]
+    assert "12m" in repos
+    assert "\033[" not in repos
+    tokens = format_tokens(
+        [
+            {"name": "ci", "parent": "admin", "revoked": False},
+            {"name": "old", "parent": "admin", "revoked": True},
+        ],
+        color=True,
+    )
+    assert "revoked" in tokens
+    assert "\033[31m" in tokens
+    assert "state" not in format_tokens([{"name": "ci", "parent": "admin", "revoked": False}])
+    assert format_exps([{"id": 1, "title": "first", "labels": []}]).splitlines()[0].split() == ["id", "title"]
+    raw = json.dumps(
+        [
+            {
+                "Name": "/honorata",
+                "State": {"Status": "running", "ExitCode": 0, "StartedAt": started},
+                "ImageName": "ghcr.io/bobowski/honorata:latest",
+            }
+        ]
+    )
+    inspected = format_inspect(raw, color=True)
+    assert inspected.splitlines()[0].startswith("\033[2m")
+    assert "up 12m" in inspected
+    failed = format_inspect(
+        json.dumps([{"Name": "/shop", "State": {"Status": "exited", "ExitCode": 1, "StartedAt": started}}]),
+        color=True,
+    )
+    assert "failed" in failed
+    assert "\033[31m" in failed
+
+
+def test_slot_table_is_one_line_per_app():
+    text = format_slot_table(
+        [
+            {
+                "slot": "honorata",
+                "container": "honorata",
+                "state": "running",
+                "status": "Up 18 minutes",
+                "cpu": "0.40%",
+                "mem": "116.1MB",
+                "sha": "dfa7dd027e8bd735",
+                "expected": "dfa7dd027e8bd735",
+                "build": "ok 47s",
+            },
+            {
+                "slot": "shop",
+                "container": "shop",
+                "state": "running",
+                "status": "Exited (1) 4 minutes ago",
+                "health": "unhealthy",
+                "cpu": "1%",
+                "mem": "20MB",
+                "data": "12.4MB",
+                "sha": "aaaaaaabbbbb",
+                "expected": "cccccccddddd",
+                "build": "failed",
+            },
+            {
+                "slot": "caddy",
+                "container": "caddy",
+                "state": "running",
+                "status": "Up About an hour",
+                "cpu": "0.05%",
+                "mem": "17.13MB",
+            },
+            {"slot": "total", "cpu": "1.45% / 1200%", "mem": "153.5MB / 67.32GB", "data": "12.4MB / 468GB"},
+        ]
+    )
+    assert "HEALTH" not in text
+    assert "ok 47s" not in text
+    assert "up 18m" in text
+    assert "dfa7dd0" in text
+    assert "dfa7dd027e8b" not in text
+    assert "unhealthy · failed" in text
+    assert "aaaaaaa → ccccccc" in text
+    assert "up 1h" in text
+    assert "1.45% of 12 cores" in text
+    assert "153.5 MB of 67.32 GB" in text
+    assert "116.1 MB" in text
+    assert text.splitlines()[0].split() == ["name", "state", "cpu", "mem", "data", "rev"]
+    assert text.splitlines()[-1] == "1.45% of 12 cores · 153.5 MB of 67.32 GB · 12.4 MB of 468 GB"
+    quiet = format_slot_table(
+        [
+            {
+                "slot": "shop",
+                "container": "shop",
+                "state": "running",
+                "status": "Up 1 minute",
+                "cpu": "0%",
+                "mem": "1MB",
+                "data": "0B",
+                "sha": "abcdef0",
+                "expected": "abcdef0",
+            }
+        ]
+    )
+    assert "0 B" not in quiet
+    assert "0%" in quiet
+
+
+def test_color_marks_only_a_slot_that_needs_attention():
+    text = format_slot_table(
+        [
+            {
+                "slot": "honorata",
+                "container": "honorata",
+                "state": "running",
+                "status": "Up 18 minutes",
+                "cpu": "0.40%",
+                "mem": "116.1MB",
+            },
+            {
+                "slot": "shop",
+                "container": "shop",
+                "state": "exited",
+                "status": "Exited (1) 4 minutes ago",
+                "health": "failed",
+                "cpu": "0%",
+                "mem": "1MB",
+            },
+        ],
+        color=True,
+    )
+    lines = text.splitlines()
+    assert lines[0].startswith("\033[2m")
+    honorata = next(line for line in lines if "honorata" in line)
+    shop = next(line for line in lines if "shop" in line)
+    assert "\033[31m" not in honorata
+    assert "\033[33m" not in honorata
+    assert "\033[31m" in shop
+    assert (
+        slot_hint(
+            [
+                {
+                    "slot": "shop",
+                    "container": "shop",
+                    "state": "exited",
+                    "health": "failed",
+                    "status": "Exited (1) 1 minute ago",
+                }
+            ]
+        )
+        == "yard slot logs shop"
+    )
+    assert slot_hint([{"slot": "honorata", "container": "honorata", "state": "running", "status": "Up 1 minute"}]) == ""
+
+
 def test_login_keeps_url_and_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
     path = tmp_path / "config.json"
     monkeypatch.setattr("app.cli.config_path", lambda: path)
     main(["login", "--url", "yard.bobowski.dev", "--token", "secret"])
     assert path.read_text() == '{\n  "url": "https://yard.bobowski.dev",\n  "token": "secret"\n}\n'
-    assert capsys.readouterr().out.strip() == str(path)
+    assert capsys.readouterr().out.strip() == "https://yard.bobowski.dev\n" + str(path)
     with pytest.raises(SystemExit):
         main(["login"])
 
@@ -100,9 +375,10 @@ def test_init_creates_the_repo_and_slot(
     seen = _no_push(monkeypatch)
     main(["--text", "init", "--domain", "heldso.example.com"])
     text = capsys.readouterr().out
-    assert "repo heldso" in text
-    assert "remote yard -> https://yard.example.com/git/heldso.git" in text
-    assert "commit, then: git push -u yard main" in text
+    assert "repo    heldso" in text
+    assert "remote  https://yard.example.com/git/heldso.git" in text
+    assert "commit, then" in text
+    assert "git push -u yard main" in text
     assert calls[0][0:2] == ("POST", "/api/v1/repos")
     assert calls[1] == (
         "POST",
@@ -161,8 +437,8 @@ def test_init_can_split_the_repo_and_the_slot(
     _no_push(monkeypatch)
     main(["--text", "init", "--domain", "heldso.example.com", "--repo", "heldso-docs", "--slot", "heldso"])
     text = capsys.readouterr().out
-    assert "repo heldso-docs" in text
-    assert "slot heldso" in text
+    assert "repo    heldso-docs" in text
+    assert "slot    heldso" in text
     assert calls[0][2] == {"name": "heldso-docs", "force": False}
     assert calls[1][2] == {
         "SLOT_NAME": "heldso",

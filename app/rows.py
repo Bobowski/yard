@@ -64,6 +64,7 @@ def slot_rows(
             other.append(item)
         else:
             by_slot.setdefault(slot, []).append(item)
+
     rows: list[SlotRow] = []
     seen: set[str] = set()
     for slot in slots:
@@ -71,6 +72,7 @@ def slot_rows(
         rows.extend(_rows_for(slot.name, slot.every, by_slot.get(slot.name, []), samples, running_only))
     for slot in sorted(set(by_slot) - seen):
         rows.extend(_rows_for(slot, "", by_slot[slot], samples, running_only))
+
     for item in sorted(other, key=lambda row: row.name):
         if running_only and not item.running:
             continue
@@ -239,6 +241,7 @@ def total_row(rows: list[SlotRow], cpus: int, mem_limit: int, disk_limit: int) -
         if size is not None:
             data += size
             data_seen = True
+
     cpu_text = format_percent(cpu) if cpu_seen else ""
     if cpu_text and cpus > 0:
         cpu_text = f"{cpu_text} / {format_percent(cpus * 100)}"

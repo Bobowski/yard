@@ -38,33 +38,77 @@ def token_hash(plain: str) -> str:
 
 
 def check_name(name: str) -> None:
-    if not _NAME.fullmatch(name) or name == "yard" or name.startswith("yard-"):
-        raise YardError(400, "bad_name", "name must be a short lowercase word")
+    if name == "yard" or name.startswith("yard-"):
+        raise YardError(
+            400,
+            "bad_name",
+            "name must be a short lowercase word",
+            context={"name": name},
+            help_text="yard and yard-* are reserved for this host.",
+            example="heldso",
+        )
+    if not _NAME.fullmatch(name):
+        raise YardError(
+            400,
+            "bad_name",
+            "name must be a short lowercase word",
+            context={"name": name},
+            help_text="Start with a letter. Then use letters, digits, and hyphens, up to 63 characters.",
+            example="heldso",
+        )
 
 
 def check_slot_name(name: str) -> None:
     check_name(name)
     if name == "caddy":
-        raise YardError(400, "bad_name", "name must be a short lowercase word")
+        raise YardError(
+            400,
+            "bad_name",
+            "name must be a short lowercase word",
+            context={"name": name},
+            help_text="caddy is reserved for the proxy.",
+            example="heldso",
+        )
 
 
 def check_ref(ref: str) -> None:
     if not ref or ".." in ref or ref.startswith("/") or any(ch in ref for ch in " \t\\"):
-        raise YardError(400, "bad_ref", "ref must be a branch name")
+        raise YardError(
+            400,
+            "bad_ref",
+            "ref must be a branch name",
+            context={"ref": ref},
+            help_text="Use a branch name. Do not start with a slash, and do not use spaces or ..",
+            example="main",
+        )
 
 
 def check_domain(domain: str) -> None:
     if not domain:
         return
     if ".." in domain or not _DOMAIN.fullmatch(domain):
-        raise YardError(400, "bad_domain", "domain must be a hostname")
+        raise YardError(
+            400,
+            "bad_domain",
+            "domain must be a hostname",
+            context={"domain": domain},
+            help_text="Use a lowercase hostname. One domain belongs to one slot.",
+            example="heldso.example.com",
+        )
 
 
 def check_image(image: str) -> None:
     if not image:
         return
     if image != YARD_IMAGE:
-        raise YardError(400, "bad_image", f"image must be {YARD_IMAGE}")
+        raise YardError(
+            400,
+            "bad_image",
+            f"image must be {YARD_IMAGE}",
+            context={"image": image},
+            help_text="That is the published image. To build from a repo, set self_repo and leave the image empty.",
+            example=f"yard settings --self-image {YARD_IMAGE}",
+        )
 
 
 def clean_dir(directory: str) -> str:
@@ -72,11 +116,22 @@ def clean_dir(directory: str) -> str:
     if directory in {"", ".", "./"}:
         return ""
     if directory.startswith("/") or not _DIR.fullmatch(directory):
-        raise YardError(400, "bad_dir", "directory must be a relative path inside the repo, such as projects/mono")
+        _bad_dir(directory)
     clean = posixpath.normpath(directory)
     if clean in {".", ".."} or clean.startswith("../") or "/../" in f"/{clean}/":
-        raise YardError(400, "bad_dir", "directory must be a relative path inside the repo, such as projects/mono")
+        _bad_dir(directory)
     return clean
+
+
+def _bad_dir(directory: str) -> NoReturn:
+    raise YardError(
+        400,
+        "bad_dir",
+        "directory must be a relative path inside the repo",
+        context={"directory": directory},
+        help_text="The path stays inside the repo. Do not start with / and do not use ..",
+        example="projects/mono",
+    )
 
 
 def parse_duration(text: str) -> float:
@@ -104,6 +159,36 @@ def parse_duration(text: str) -> float:
     return total
 
 
+def _domain_taken(domain: str, *, host: bool) -> NoReturn:
+    reason = "The Yard host keeps that domain." if host else "One domain belongs to one slot."
+    raise YardError(409, "domain_taken", "domain already in use", context={"domain": domain}, help_text=reason)
+
+
+def _unknown_token(name: str) -> NoReturn:
+    raise YardError(404, "not_found", "unknown token", context={"name": name}, help_text="Run yard token list.")
+
+
+def _outside(name: str) -> NoReturn:
+    raise YardError(
+        403,
+        "forbidden",
+        "that token is outside your tree",
+        context={"name": name},
+        help_text="Revoke a token you created. You cannot revoke your own token.",
+    )
+
+
+def _bad_every(text: str) -> NoReturn:
+    raise YardError(
+        400,
+        "bad_every",
+        "every must be a duration, or empty",
+        context={"every": text},
+        help_text="Use at least 1s. An empty value, off, or - clears the job.",
+        example="5m",
+    )
+
+
 def parse_every(text: str) -> str:
     text = text.strip().lower().removeprefix("every ")
     if text in {"", "off", "-"}:
@@ -111,9 +196,9 @@ def parse_every(text: str) -> str:
     try:
         seconds = parse_duration(text)
     except ValueError as exc:
-        raise YardError(400, "bad_every", "every must be a duration such as 5m, or empty") from exc
+        raise _bad_every(text) from exc
     if seconds < 1:
-        raise YardError(400, "bad_every", "every must be a duration such as 5m, or empty")
+        raise _bad_every(text)
     if seconds % 3600 == 0:
         return f"{int(seconds // 3600)}h"
     if seconds % 60 == 0:
@@ -264,15 +349,19 @@ class Store:
             CREATE INDEX IF NOT EXISTS exp_labels_exp ON exp_labels(exp_id);
             """
         )
+
+        # The column arrived after the first schema. A later boot already has it.
         try:
             self._db.execute("ALTER TABLE slots ADD COLUMN every TEXT NOT NULL DEFAULT ''")
         except sqlite3.OperationalError as exc:
             if "duplicate column" not in str(exc).lower():
                 raise
+
         self._db.execute("DROP INDEX IF EXISTS slots_port")
         self._db.execute("DROP INDEX IF EXISTS deploy_steps_deploy")
         self._db.execute("DROP TABLE IF EXISTS deploy_steps")
         self._db.execute("DROP TABLE IF EXISTS events")
+
         columns = {row[1] for row in self._db.execute("PRAGMA table_info(slots)")}
         if "host_port" in columns:
             self._db.execute("ALTER TABLE slots DROP COLUMN host_port")
@@ -314,7 +403,13 @@ class Store:
     def repo(self, name: str) -> Repo:
         row = self._one("SELECT name, created FROM repos WHERE name = ?", (name,))
         if row is None:
-            raise YardError(404, "not_found", "repo does not exist")
+            raise YardError(
+                404,
+                "not_found",
+                "repo does not exist",
+                context={"name": name},
+                help_text="Run yard repo list to see the repos on this host.",
+            )
         return Repo(str(row["name"]), str(row["created"]))
 
     def create_repo(self, name: str) -> None:
@@ -324,10 +419,23 @@ class Store:
     def delete_repo(self, name: str) -> None:
         count = self._one("SELECT COUNT(*) AS n FROM slots WHERE repo = ?", (name,))
         if count and int(count["n"]) > 0:
-            raise YardError(409, "repo_in_use", "repo still has slots")
+            raise YardError(
+                409,
+                "repo_in_use",
+                "repo still has slots",
+                context={"name": name},
+                help_text="Remove each slot that uses this repo, then delete the repo.",
+                example="yard slot rm heldso",
+            )
         cur = self._write("DELETE FROM repos WHERE name = ?", (name,))
         if cur.rowcount == 0:
-            raise YardError(404, "not_found", "repo does not exist")
+            raise YardError(
+                404,
+                "not_found",
+                "repo does not exist",
+                context={"name": name},
+                help_text="Run yard repo list to see the repos on this host.",
+            )
 
     def list_slots(self) -> list[Slot]:
         return [self._slot(row) for row in self._all(_SLOT_SQL + " ORDER BY name")]
@@ -335,7 +443,13 @@ class Store:
     def slot(self, name: str) -> Slot:
         row = self._one(_SLOT_SQL + " WHERE name = ?", (name,))
         if row is None:
-            raise YardError(404, "not_found", "slot does not exist")
+            raise YardError(
+                404,
+                "not_found",
+                "slot does not exist",
+                context={"name": name},
+                help_text="Run yard slot list to see the apps on this host.",
+            )
         return self._slot(row)
 
     def slots_for_repo(self, repo: str) -> list[Slot]:
@@ -349,7 +463,14 @@ class Store:
         directory = clean_dir(directory)
         self._domain_free(domain, "")
         if self._one("SELECT 1 FROM repos WHERE name = ?", (repo,)) is None:
-            raise YardError(404, "not_found", "repo does not exist")
+            raise YardError(
+                404,
+                "not_found",
+                "repo does not exist",
+                context={"repo": repo},
+                help_text="Create the repo first.",
+                example=f"yard repo new {repo}",
+            )
         every = parse_every(every)
         self._write(
             """
@@ -363,7 +484,13 @@ class Store:
     def delete_slot(self, name: str) -> None:
         cur = self._write("DELETE FROM slots WHERE name = ?", (name,))
         if cur.rowcount == 0:
-            raise YardError(404, "not_found", "slot does not exist")
+            raise YardError(
+                404,
+                "not_found",
+                "slot does not exist",
+                context={"name": name},
+                help_text="Run yard slot list to see the apps on this host.",
+            )
 
     def patch_slot(
         self,
@@ -387,6 +514,7 @@ class Store:
         if every is not None:
             slot.every = parse_every(every)
         slot.env = env
+
         self._write(
             "UPDATE slots SET ref = ?, dir = ?, domain = ?, every = ?, env_json = ? WHERE name = ?",
             (slot.ref, slot.directory, slot.domain, slot.every, json.dumps(env, sort_keys=True), name),
@@ -401,10 +529,10 @@ class Store:
         if not domain:
             return
         if domain == self.meta("domain"):
-            raise YardError(409, "domain_taken", "domain already in use")
+            _domain_taken(domain, host=True)
         row = self._one("SELECT name FROM slots WHERE domain = ? AND name != ?", (domain, except_name))
         if row is not None:
-            raise YardError(409, "domain_taken", "domain already in use")
+            _domain_taken(domain, host=False)
 
     def create_token(self, name: str, parent: str) -> str:
         check_name(name)
@@ -412,7 +540,7 @@ class Store:
             check_name(parent)
             row = self._one("SELECT COUNT(*) AS n FROM tokens WHERE name = ? AND revoked = 0", (parent,))
             if row is None or int(row["n"]) == 0:
-                raise YardError(404, "not_found", "unknown token")
+                _unknown_token(parent)
         plain = secrets.token_hex(24)
         self._write(
             "INSERT INTO tokens (name, hash, parent, created) VALUES (?, ?, ?, ?)",
@@ -426,11 +554,13 @@ class Store:
 
     def revoke_token(self, actor: str, name: str) -> None:
         if not actor or actor == name:
-            raise YardError(403, "forbidden", "that token is outside your tree")
+            _outside(name)
         if self._one("SELECT 1 FROM tokens WHERE name = ?", (name,)) is None:
-            raise YardError(404, "not_found", "unknown token")
+            _unknown_token(name)
         if not self._descendant(actor, name):
-            raise YardError(403, "forbidden", "that token is outside your tree")
+            _outside(name)
+
+        # A revoked token takes the tokens created under it.
         self._write(
             """
             WITH RECURSIVE sub(name) AS (
@@ -453,6 +583,8 @@ class Store:
         if row is None:
             return None
         token = self._token(row)
+
+        # A live child of a revoked parent is not a live token.
         if token.revoked or not self._ancestors_live(token.name):
             return None
         return token
@@ -508,7 +640,13 @@ class Store:
             (deploy_id,),
         )
         if row is None:
-            raise YardError(404, "not_found", "deploy does not exist")
+            raise YardError(
+                404,
+                "not_found",
+                "deploy does not exist",
+                context={"id": deploy_id},
+                help_text="Run yard slot deploys <name> to see the ids.",
+            )
         return self._deploy(row)
 
     def list_deploys(self, slot: str, limit: int) -> list[Deploy]:
@@ -542,14 +680,23 @@ class Store:
         if incoming.domain:
             check_domain(incoming.domain)
             if self._one("SELECT name FROM slots WHERE domain = ?", (incoming.domain,)) is not None:
-                raise YardError(409, "domain_taken", "domain already in use")
+                _domain_taken(incoming.domain, host=False)
         if incoming.self_image and incoming.self_repo:
-            raise YardError(400, "one_source", "set self_image or self_repo")
+            raise YardError(
+                400,
+                "one_source",
+                "set self_image or self_repo",
+                help_text=(
+                    "A repo and an image cannot both be the source. An empty value returns to the published image."
+                ),
+                example="yard settings --self-repo yard",
+            )
         if incoming.self_image:
             check_image(incoming.self_image)
         if incoming.self_repo:
             check_name(incoming.self_repo)
             self.repo(incoming.self_repo)
+
         ref = incoming.self_ref or "main"
         check_ref(ref)
         pairs = (
@@ -598,7 +745,14 @@ class Store:
                     continue
                 row = db.execute("SELECT COUNT(*) AS n FROM experiments WHERE id = ?", (exp_id,)).fetchone()
                 if row is None or int(row["n"]) == 0:
-                    raise YardError(404, "not_found", f"experiment does not exist: {exp_id}")
+                    raise YardError(
+                        404,
+                        "not_found",
+                        f"experiment does not exist: {exp_id}",
+                        context={"id": exp_id},
+                        help_text="Run yard exp to see the notes on this host.",
+                    )
+
             stamp = now()
             saved: list[Experiment] = []
             for has_id, exp_id, title, body, labels in blocks:
@@ -623,6 +777,8 @@ class Store:
                         (exp_id, label.key, label.value),
                     )
                 saved.append(Experiment(exp_id, title, body, list(labels), created, stamp))
+
+            # An id in this save stays, even when the editor also marked it deleted.
             keep = {exp_id for has_id, exp_id, *_rest in blocks if has_id}
             for exp_id in drop:
                 if exp_id in keep:
@@ -689,9 +845,14 @@ _SLOT_SQL = "SELECT name, repo, ref, dir, domain, live_image, every, env_json, c
 def _raise_integrity(exc: sqlite3.IntegrityError) -> NoReturn:
     text = str(exc)
     if "slots_domain" in text or "slots.domain" in text:
-        raise YardError(409, "domain_taken", "domain already in use") from exc
+        raise YardError(
+            409,
+            "domain_taken",
+            "domain already in use",
+            help_text="One domain belongs to one slot.",
+        ) from exc
     if "UNIQUE" in text:
-        raise YardError(409, "exists", "already exists") from exc
+        raise YardError(409, "exists", "already exists", help_text="Pick another name.") from exc
     raise exc
 
 

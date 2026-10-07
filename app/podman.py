@@ -72,7 +72,12 @@ class Podman:
                 stderr=asyncio.subprocess.PIPE,
             )
         except FileNotFoundError as exc:
-            raise YardError(502, "podman", f"podman {' '.join(args)}: {exc}") from exc
+            raise YardError(
+                502,
+                "podman",
+                f"podman {' '.join(args)}: {exc}",
+                help_text="The podman command has to be on PATH.",
+            ) from exc
         try:
             if timeout is None:
                 out, err = await proc.communicate()
@@ -80,10 +85,21 @@ class Podman:
                 out, err = await asyncio.wait_for(proc.communicate(), timeout)
         except TimeoutError as exc:
             proc.kill()
-            raise YardError(502, "podman", f"podman {' '.join(args)}: timed out") from exc
+            raise YardError(
+                502,
+                "podman",
+                f"podman {' '.join(args)}: timed out",
+                help_text="The command did not finish. The container may still be starting.",
+            ) from exc
         text = ((out or b"") + (err or b"")).decode(errors="replace").strip()
         if proc.returncode:
-            raise YardError(502, "podman", f"podman {' '.join(args)}: {text}", exit_code=proc.returncode)
+            raise YardError(
+                502,
+                "podman",
+                f"podman {' '.join(args)}: {text}",
+                exit_code=proc.returncode,
+                help_text="Yard talks to Podman through the socket on this host.",
+            )
         return text
 
     async def popen(self, *args: str) -> asyncio.subprocess.Process:
@@ -94,7 +110,12 @@ class Podman:
                 stderr=asyncio.subprocess.STDOUT,
             )
         except FileNotFoundError as exc:
-            raise YardError(502, "podman", f"podman {' '.join(args)}: {exc}") from exc
+            raise YardError(
+                502,
+                "podman",
+                f"podman {' '.join(args)}: {exc}",
+                help_text="The podman command has to be on PATH.",
+            ) from exc
 
     async def ensure_network(self, name: str) -> None:
         try:
@@ -129,14 +150,28 @@ def stats_args(names: list[str] | None = None) -> list[str]:
     args = ["stats", "--no-stream", "--format", "json"]
     for name in names or []:
         if not ok_name(name):
-            raise YardError(400, "bad_args", "bad container name")
+            raise YardError(
+                400,
+                "bad_args",
+                "bad container name",
+                context={"name": name},
+                help_text="Start with a letter or digit. Then use letters, digits, and . _ -",
+                example="heldso",
+            )
         args.append(name)
     return args
 
 
 def inspect_args(name: str) -> list[str]:
     if not ok_name(name):
-        raise YardError(400, "bad_args", "bad container name")
+        raise YardError(
+            400,
+            "bad_args",
+            "bad container name",
+            context={"name": name},
+            help_text="Start with a letter or digit. Then use letters, digits, and . _ -",
+            example="heldso",
+        )
     return ["inspect", name]
 
 
@@ -261,6 +296,7 @@ def page_log_rows(raw: str, cursor: str, since: str, until: str, limit: int) -> 
     stop = _parsed_stamp(until)
     nxt = cursor
     kept: list[LogRow] = []
+
     for line in raw.split("\n"):
         if not line:
             continue
@@ -273,6 +309,7 @@ def page_log_rows(raw: str, cursor: str, since: str, until: str, limit: int) -> 
                 continue
             if stop is not None and stamp >= stop:
                 continue
+
         if len(kept) == limit:
             return kept, nxt, True
         row = LogRow(at="", line=line, raw=line)
@@ -298,7 +335,12 @@ def _rows(raw: str) -> list[dict]:
         return []
     data = json.loads(raw)
     if not isinstance(data, list):
-        raise YardError(502, "podman", "podman json is not a list")
+        raise YardError(
+            502,
+            "podman",
+            "podman json is not a list",
+            help_text="Podman --format json has to return a list of objects.",
+        )
     return [row for row in data if isinstance(row, dict)]
 
 

@@ -100,6 +100,26 @@ def format_values(values: dict[str, str]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _env_error(message: str) -> YardError:
+    return YardError(
+        400,
+        "bad_key",
+        message,
+        help_text="A line is NAME=value. A # line is a comment.",
+        example="SLOT_DOMAIN=heldso.example.com",
+    )
+
+
+def _note_error(message: str) -> YardError:
+    return YardError(
+        400,
+        "bad_title",
+        message,
+        help_text="A note starts with # and a title. A label line is @ key: value.",
+        example="# first try\n@ area: login",
+    )
+
+
 def parse_env(text: str) -> dict[str, str]:
     found: dict[str, str] = {}
     for number, line in enumerate(text.replace("\r\n", "\n").split("\n"), 1):
@@ -110,20 +130,20 @@ def parse_env(text: str) -> dict[str, str]:
         key, sep, value = trimmed.partition("=")
         key = key.strip()
         if not sep or not name_ok(key):
-            raise YardError(400, "bad_key", f"line {number} must be NAME=value")
+            raise _env_error(f"line {number} must be NAME=value")
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] == '"':
             try:
                 parsed = ast.literal_eval(value)
             except (SyntaxError, ValueError) as exc:
-                raise YardError(400, "bad_key", f"line {number} has a broken quoted value") from exc
+                raise _env_error(f"line {number} has a broken quoted value") from exc
             if not isinstance(parsed, str):
-                raise YardError(400, "bad_key", f"line {number} has a broken quoted value")
+                raise _env_error(f"line {number} has a broken quoted value")
             value = parsed
         if "\r" in value or "\n" in value:
-            raise YardError(400, "bad_key", f"line {number}: a value stays on one line")
+            raise _env_error(f"line {number}: a value stays on one line")
         if key in found:
-            raise YardError(400, "bad_key", f"line {number} repeats {key}")
+            raise _env_error(f"line {number} repeats {key}")
         found[key] = value
     return found
 
@@ -142,16 +162,12 @@ def apply_slot_keys(slot: Slot, patch: dict[str, str]) -> SlotEdit:
     values = slot_values(slot)
     for key, value in patch.items():
         if not name_ok(key):
-            raise YardError(400, "bad_key", f"bad key {key}")
+            raise _env_error(f"bad key {key}")
         if value == "":
             values.pop(key, None)
         else:
             values[key] = value
     return apply_values(slot, values)
-
-
-def apply_slot_file(slot: Slot, text: str) -> SlotEdit:
-    return apply_values(slot, parse_env(text))
 
 
 def apply_values(slot: Slot, parsed: dict[str, str]) -> SlotEdit:
@@ -162,10 +178,13 @@ def apply_values(slot: Slot, parsed: dict[str, str]) -> SlotEdit:
             continue
         if key in parsed and parsed[key] != current.get(key, ""):
             edit.warn.append(f"{key} stays {current.get(key, '')}")
+
     edit.ref = _changed(parsed, "SLOT_BRANCH", slot.ref, keep_empty=True)
     edit.directory = _changed(parsed, "SLOT_DIRECTORY", slot.directory, keep_empty=False)
     edit.domain = _changed(parsed, "SLOT_DOMAIN", slot.domain, keep_empty=False)
     edit.every = _changed(parsed, "SLOT_INTERVAL", slot.every, keep_empty=False)
+
+    # Anything else is an environment value for the container.
     defaults = process_defaults(slot.name)
     unknown: list[str] = []
     for key, value in parsed.items():
@@ -186,6 +205,7 @@ def _changed(parsed: dict[str, str], key: str, current: str, *, keep_empty: bool
         if current == "" or keep_empty:
             return None
         return ""
+
     got = parsed[key]
     if (keep_empty and got == "") or got == current:
         return None
@@ -210,7 +230,7 @@ class Block:
 def parse_blocks(text: str) -> list[Block]:
     text = text.replace("\r\n", "\n").removeprefix("\ufeff")
     if len(text) > 1 << 20:
-        raise YardError(400, "bad_title", "the file is too large")
+        raise _note_error("the file is too large")
     if not text.strip():
         return []
     lines = text.removesuffix("\n").split("\n")
@@ -222,11 +242,11 @@ def parse_blocks(text: str) -> list[Block]:
     while index < len(lines):
         title, ok = _title(lines[index])
         if not ok:
-            raise YardError(400, "bad_title", f"line {index + 1}: a title line starts with # ")
+            raise _note_error(f"line {index + 1}: a title line starts with # ")
         if not title:
-            raise YardError(400, "bad_title", f"line {index + 1}: a title is required")
+            raise _note_error(f"line {index + 1}: a title is required")
         if len(title) > 200:
-            raise YardError(400, "bad_title", f"line {index + 1}: the title is too long")
+            raise _note_error(f"line {index + 1}: the title is too long")
         index += 1
         labels: list[ExpLabel] = []
         exp_id = 0
@@ -234,22 +254,22 @@ def parse_blocks(text: str) -> list[Block]:
         while index < len(lines) and lines[index].startswith("@ "):
             key, value, ok = _label(lines[index])
             if not ok:
-                raise YardError(400, "bad_title", f"line {index + 1}: a label line is @ key: value")
+                raise _note_error(f"line {index + 1}: a label line is @ key: value")
             if key == "id":
                 if has_id:
-                    raise YardError(400, "bad_title", f"line {index + 1}: id is already set")
+                    raise _note_error(f"line {index + 1}: id is already set")
                 if not value.isdigit() or int(value) <= 0:
-                    raise YardError(400, "bad_title", f"line {index + 1}: id must be a number")
+                    raise _note_error(f"line {index + 1}: id must be a number")
                 exp_id = int(value)
                 if exp_id in seen:
-                    raise YardError(400, "bad_title", f"line {index + 1}: id {exp_id} is repeated")
+                    raise _note_error(f"line {index + 1}: id {exp_id} is repeated")
                 seen.add(exp_id)
                 has_id = True
             else:
                 if not value:
-                    raise YardError(400, "bad_title", f"line {index + 1}: a label needs a value")
+                    raise _note_error(f"line {index + 1}: a label needs a value")
                 if len(value) > 500:
-                    raise YardError(400, "bad_title", f"line {index + 1}: the label value is too long")
+                    raise _note_error(f"line {index + 1}: the label value is too long")
                 labels.append(ExpLabel(key, value))
             index += 1
         if index < len(lines) and not lines[index].strip():

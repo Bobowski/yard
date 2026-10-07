@@ -25,6 +25,8 @@ async def bootstrap(app: App, span: Span):
     store = Store.open(config.data_dir)
     if config.domain:
         store.set_meta("domain", config.domain)
+
+    # An empty setting keeps the image this process was started from.
     self_image = os.environ.get("YARD_SELF_IMAGE", "").strip()
     if self_image and not store.meta("self_image"):
         check_image(self_image)
@@ -36,6 +38,7 @@ async def bootstrap(app: App, span: Span):
     if config.boot:
         await yard.boot(app)
     register_api(app, yard)
+
     try:
         yield
     finally:

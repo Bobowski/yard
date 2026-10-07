@@ -106,6 +106,7 @@ def plan_job(every: float, image: str, runs: list[RunState], now: datetime) -> J
 async def build_image(podman: Podman, paths: Paths, repo: str, directory: str, sha: str, image: str) -> str:
     if await podman.image_exists(image):
         return f"reuse {image}"
+
     build_dir = paths.build(repo, directory, sha)
     shutil.rmtree(build_dir, ignore_errors=True)
     try:
@@ -127,10 +128,13 @@ async def deploy_slot(podman: Podman, paths: Paths, slot: Slot, sha: str) -> Res
     except Exception as exc:
         lines.append(str(exc))
         return Result(image, "\n".join(lines) + "\n", str(exc))
+
+    # A job keeps the image and does not stay up.
     if slot.every:
         await _remove_stay(podman, slot.name)
         lines.append(f"job every {slot.every} image {image}")
         return Result(image, "\n".join(lines) + "\n")
+
     paths.data(slot.name).mkdir(parents=True, exist_ok=True)
     try:
         await podman.ensure_network("yard")
@@ -144,6 +148,8 @@ async def deploy_slot(podman: Podman, paths: Paths, slot: Slot, sha: str) -> Res
         lines.append(str(exc))
         await _rollback(podman, paths, slot, image, lines)
         return Result(image, "\n".join(lines) + "\n", str(exc))
+
+    # Health has to answer before this image replaces the previous one.
     health = f"http://{slot.name}:{APP_PORT}/"
     lines.append(f"wait {health}")
     try:
@@ -264,13 +270,16 @@ def _probe(url: str) -> None:
 def containerfile(root: Path, sub: str) -> tuple[Path, Path]:
     directory = root if not sub else root / sub
     if sub and not directory.is_dir():
-        raise RuntimeError(f"directory {sub!r} is not in the repo at this revision")
+        raise RuntimeError(
+            f"directory {sub!r} is not in the repo at this revision. "
+            "Use a path that exists at this revision, such as projects/heldso."
+        )
     for name in ("Containerfile", "Dockerfile", "ops/Containerfile", "ops/Dockerfile"):
         path = directory / name
         if path.is_file():
             return path, directory
     where = sub or "the repo root"
-    raise RuntimeError(f"no Containerfile in {where}")
+    raise RuntimeError(f"no Containerfile in {where}. Add Containerfile or ops/Containerfile.")
 
 
 @dataclass(slots=True)
@@ -300,6 +309,7 @@ def caddy_document(sock: Path, email: str, routes: list[Route]) -> bytes:
     issuer: dict[str, object] = {"challenges": {"http": {"disabled": True}}, "module": "acme"}
     if email:
         issuer["email"] = email
+
     document = {
         "admin": {"listen": f"unix/{sock}|0600"},
         "apps": {
@@ -357,6 +367,7 @@ async def ensure_caddy(podman: Podman, root: Path, sock: Path) -> None:
     if not auto.is_file() or auto.stat().st_size == 0:
         auto.write_bytes(caddy_document(sock, "", []))
         auto.chmod(0o600)
+
     try:
         await podman.run("container", "exists", CADDY_NAME, timeout=20)
         exists = True
@@ -376,11 +387,8 @@ async def ensure_caddy(podman: Podman, root: Path, sock: Path) -> None:
         except Exception:
             pass
         await podman.run(*caddy_run_args(root, sock), timeout=None)
+
     await _wait_sock(sock, 15)
-
-
-async def load_caddy(sock: Path, email: str, routes: list[Route]) -> None:
-    await asyncio.to_thread(_post_unix, sock, caddy_document(sock, email, routes))
 
 
 def _post_unix(sock: Path, body: bytes) -> None:

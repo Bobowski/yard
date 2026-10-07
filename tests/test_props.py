@@ -14,7 +14,7 @@ from app.store import Slot, check_domain, check_name, check_ref, check_slot_name
 from app.text import (
     Block,
     ExpLabel,
-    apply_slot_file,
+    apply_values,
     format_blocks,
     format_values,
     parse_blocks,
@@ -283,7 +283,7 @@ def test_slot_file_round_trip(env: dict[str, str]) -> None:
         env,
         "",
     )
-    edit = apply_slot_file(slot, format_values(slot_values(slot)))
+    edit = apply_values(slot, parse_env(format_values(slot_values(slot))))
     assert edit.ref is None
     assert edit.domain is None
     assert edit.directory is None
@@ -298,7 +298,7 @@ def test_slot_file_round_trip(env: dict[str, str]) -> None:
 def test_slot_repo_key_stays(name: str) -> None:
     slot = Slot("heldso", "heldso", "main", "", "", "", "", {}, "")
     text = format_values(slot_values(slot)).replace("SLOT_REPO=heldso", f"SLOT_REPO={name}", 1)
-    edit = apply_slot_file(slot, text)
+    edit = apply_values(slot, parse_env(text))
     assert edit.warn == ["SLOT_REPO stays heldso"]
     assert edit.ref is None
 

@@ -2,7 +2,7 @@ import pytest
 
 from app.errors import YardError
 from app.store import Slot, parse_every
-from app.text import apply_slot_file, format_blocks, format_values, parse_blocks, parse_env, slot_values
+from app.text import apply_values, format_blocks, format_values, parse_blocks, parse_env, slot_values
 from app.yard import git_repo
 
 
@@ -47,7 +47,7 @@ def test_slot_file_round_trip():
         "API_TOKEN=secret",
     ):
         assert line + "\n" in text
-    edit = apply_slot_file(slot, text)
+    edit = apply_values(slot, parse_env(text))
     assert edit.ref is None
     assert edit.domain is None
     assert edit.every is None
@@ -63,7 +63,7 @@ def test_slot_file_keeps_read_only_keys():
     text = text.replace("SLOT_REPO=heldso", "SLOT_REPO=other", 1)
     text = text.replace("SLOT_DOMAIN=", "SLOT_DOMAIN=app.example.com", 1)
     text = text.replace("SLOT_INTERVAL=", "SLOT_INTERVAL=off", 1)
-    edit = apply_slot_file(slot, text)
+    edit = apply_values(slot, parse_env(text))
     assert edit.warn == ["SLOT_REPO stays heldso"]
     assert edit.domain == "app.example.com"
     assert edit.every == "off"
@@ -72,7 +72,7 @@ def test_slot_file_keeps_read_only_keys():
 def test_slot_file_leaves_app_names_alone():
     slot = Slot("heldso", "heldso", "main", "", "heldso.example.com", "", "", {}, "")
     text = format_values(slot_values(slot)) + "DOMAIN=internal\nREF=other\n"
-    edit = apply_slot_file(slot, text)
+    edit = apply_values(slot, parse_env(text))
     assert edit.domain is None
     assert edit.ref is None
     assert edit.env["DOMAIN"] == "internal"

@@ -33,7 +33,7 @@ def register_api(app: App, yard: Yard) -> None:
         name = body.get("name", "")
         force = body.get("force", False)
         if not isinstance(name, str) or not isinstance(force, bool):
-            raise YardError(400, "bad_json", "bad json")
+            raise YardError(400, "bad_json", "bad json", help_text="name is a string. force is true or false.")
         responses.json(w, await yard.create_repo(name, force))
 
     async def repos_delete(c: Context, w: Writer) -> None:
@@ -70,13 +70,20 @@ def register_api(app: App, yard: Yard) -> None:
         name = c.match.params["name"]
         tail_text = c.req.query.get("tail") or "200"
         if not tail_text.isdigit() or int(tail_text) < 1:
-            raise YardError(400, "bad_tail", "tail must be a positive number")
+            raise YardError(
+                400,
+                "bad_tail",
+                "tail must be a positive number",
+                help_text="tail is how many log lines to read.",
+                example="200",
+            )
         tail = int(tail_text)
         cursor = c.req.query.get("cursor") or ""
         container = c.req.query.get("container") or ""
         if c.req.query.get("follow") == "1":
             await _follow(yard, w, name, tail, cursor, container)
             return
+
         responses.json(w, await yard.log_page(name, tail, cursor, container))
 
     async def deploys(c: Context, w: Writer) -> None:
@@ -91,7 +98,13 @@ def register_api(app: App, yard: Yard) -> None:
         yard.store.slot(name)
         raw = c.match.params["id"]
         if not raw.isdigit():
-            raise YardError(400, "bad_id", "deploy id must be a number")
+            raise YardError(
+                400,
+                "bad_id",
+                "deploy id must be a number",
+                help_text="The id is the number from yard slot deploys <name>.",
+            )
+
         row = yard.store.deploy(int(raw))
         if row.slot != name:
             raise YardError(404, "not_found", "deploy does not exist")
@@ -139,7 +152,7 @@ def register_api(app: App, yard: Yard) -> None:
         body = await _object(c)
         name = body.get("name", "")
         if not isinstance(name, str):
-            raise YardError(400, "bad_json", "bad json")
+            raise YardError(400, "bad_json", "bad json", help_text="name is a string.")
         actor = str(c.state.get("actor") or "")
         plain = yard.store.create_token(name, actor)
         responses.json(w, {"name": name, "token": plain, "parent": actor})
@@ -186,20 +199,31 @@ def register_api(app: App, yard: Yard) -> None:
         body = await _object(c)
         repo, old, new, ref = body.get("repo", ""), body.get("old", ""), body.get("new", ""), body.get("ref", "")
         if not all(isinstance(item, str) for item in (repo, old, new, ref)):
-            raise YardError(400, "bad_json", "bad json")
+            raise YardError(
+                400,
+                "bad_json",
+                "bad json",
+                help_text="repo, old, new, and ref are strings.",
+            )
         status, text = await yard.hook_push(repo, old, new, ref)
         responses.text(w, text, status)
 
     async def yard_post(c: Context, w: Writer) -> None:
         action = (await _object(c)).get("action", "")
         if not isinstance(action, str):
-            raise YardError(400, "bad_json", "bad json")
+            raise YardError(400, "bad_json", "bad json", help_text="action is a string.")
         if action == "rollback":
             await yard.rollback()
             responses.json(w, {"image": "localhost/yard:previous", "container": "yard-swap"})
             return
         if action not in {"", "update"}:
-            raise YardError(400, "bad_action", "action is update or rollback")
+            raise YardError(
+                400,
+                "bad_action",
+                "action is update or rollback",
+                help_text="Omit action to update.",
+                example='{"action": "rollback"}',
+            )
         responses.json(w, await yard.update_yard())
 
     async def yard_get(_c: Context, w: Writer) -> None:
@@ -218,10 +242,22 @@ def _bearer(yard: Yard) -> Middleware:
             try:
                 token = yard.store.token_ok(raw)
             except YardError as exc:
-                responses.json(w, {"error": {"code": exc.code, "message": exc.message}}, exc.status)
+                responses.json(w, {"error": exc.payload()}, exc.status)
                 return
             if token is None:
-                responses.json(w, {"error": {"code": "unauthorized", "message": "unauthorized"}}, 401)
+                responses.json(
+                    w,
+                    {
+                        "error": YardError(
+                            401,
+                            "unauthorized",
+                            "unauthorized",
+                            help_text="Pass a live token, or run yard login.",
+                            example="Authorization: Bearer <token>",
+                        ).payload()
+                    },
+                    401,
+                )
                 return
             c.state["actor"] = token.name
             try:
@@ -229,7 +265,7 @@ def _bearer(yard: Yard) -> Middleware:
             except YardError as exc:
                 # The writer already sent bytes. A second body would corrupt that response.
                 if not w.started:
-                    responses.json(w, {"error": {"code": exc.code, "message": exc.message}}, exc.status)
+                    responses.json(w, {"error": exc.payload()}, exc.status)
             except Exception as exc:
                 if not w.started:
                     responses.json(w, {"error": {"code": "internal", "message": str(exc)}}, 500)
@@ -267,9 +303,9 @@ async def _object(c: Context) -> dict:
     try:
         body = json.loads(raw) if raw else None
     except json.JSONDecodeError as exc:
-        raise YardError(400, "bad_json", "bad json") from exc
+        raise YardError(400, "bad_json", "bad json", help_text="Send one JSON object.") from exc
     if not isinstance(body, dict):
-        raise YardError(400, "bad_json", "bad json")
+        raise YardError(400, "bad_json", "bad json", help_text="Send one JSON object.")
     return body
 
 
@@ -277,7 +313,7 @@ def _string_map(body: dict) -> dict[str, str]:
     found: dict[str, str] = {}
     for key, value in body.items():
         if not isinstance(key, str) or not isinstance(value, str):
-            raise YardError(400, "bad_json", "bad json")
+            raise YardError(400, "bad_json", "bad json", help_text="Every slot field is a string.")
         found[key] = value
     return found
 
@@ -287,18 +323,29 @@ def _optional(body: dict, key: str) -> str | None:
         return None
     value = body[key]
     if not isinstance(value, str):
-        raise YardError(400, "bad_json", "bad json")
+        raise YardError(400, "bad_json", "bad json", help_text=f"{key} is a string.")
     return value
 
 
 def _one_exp(yard: Yard, raw: str) -> Experiment:
     if not raw.isdigit() or int(raw) <= 0:
-        raise YardError(400, "bad_id", "experiment id must be a number")
+        raise YardError(
+            400,
+            "bad_id",
+            "experiment id must be a number",
+            help_text="The id is the number from yard exp.",
+        )
     exp_id = int(raw)
     for exp in yard.store.list_experiments():
         if exp.id == exp_id:
             return exp
-    raise YardError(404, "not_found", "experiment does not exist")
+    raise YardError(
+        404,
+        "not_found",
+        "experiment does not exist",
+        context={"id": exp_id},
+        help_text="Run yard exp to see the notes on this host.",
+    )
 
 
 async def _exp_body(c: Context) -> tuple[str, str, list[Label]]:
@@ -307,13 +354,18 @@ async def _exp_body(c: Context) -> tuple[str, str, list[Label]]:
     text = body.get("body", "")
     labels = body.get("labels", [])
     if not isinstance(title, str) or not isinstance(text, str) or not isinstance(labels, list):
-        raise YardError(400, "bad_json", "bad json")
+        raise YardError(
+            400,
+            "bad_json",
+            "bad json",
+            help_text="title and body are strings. labels is a list of {key, value}.",
+        )
     if not title.strip():
-        raise YardError(400, "bad_title", "a title is required")
+        raise YardError(400, "bad_title", "a title is required", help_text="The first line of a note is a title.")
     parsed: list[Label] = []
     for item in labels:
         if not isinstance(item, dict) or not isinstance(item.get("key"), str) or not isinstance(item.get("value"), str):
-            raise YardError(400, "bad_json", "bad json")
+            raise YardError(400, "bad_json", "bad json", help_text="A label is {key, value}, and both are strings.")
         parsed.append(Label(item["key"], item["value"]))
     return title.strip(), text, parsed
 
