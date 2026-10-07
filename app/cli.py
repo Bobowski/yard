@@ -991,7 +991,7 @@ def _update(opt: Opt) -> None:
             _die(body)
         print(body)
         print("swap started. Waiting until Yard answers.", file=sys.stderr)
-    _wait_swap(client, 90)
+    _wait_swap(client, 180)
 
 
 def _wait_swap(client: Client, limit: float) -> None:
@@ -1024,8 +1024,8 @@ def _wait_swap(client: Client, limit: float) -> None:
     if last in {"building", "pulling"}:
         _die("Yard is still on the previous process. The update stopped before the swap. Run yard update again.")
     if last == "swapping":
-        _die("The swap started but Yard did not report ready. Check the yard-swap container logs.")
-    _die(f"Yard did not confirm the swap (last status {last}). Run yard slot list.")
+        _die("The swap started but Yard did not report ready. Read /srv/yard/data/yard/swap.log on the host.")
+    _die(f"Yard did not confirm the swap (last status {last}). Read /srv/yard/data/yard/swap.log on the host.")
 
 
 def judge_swap(status: str, health_ok: bool) -> tuple[bool, bool, str]:

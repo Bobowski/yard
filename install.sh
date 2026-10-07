@@ -438,7 +438,7 @@ yard_health() {
 
 run_yard_container() {
   set -- podman run -d --name yard --restart=always --network yard \
-    --log-driver journald --group-add keep-groups \
+    --log-driver journald \
     -p "127.0.0.1:${public_port}:${public_port}" \
     -v "${root}:${root}" \
     -v "${sock}:/run/podman/podman.sock" \

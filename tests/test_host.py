@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -40,7 +41,7 @@ from app.podman import (
 from app.rows import SlotRow, build_label, dir_size, slot_label, slot_rows, total_row
 from app.store import Slot, Store
 from app.text import slot_env
-from app.yard import Yard
+from app.yard import _SWAP, Yard
 
 
 def test_version_prints_the_package_version(capsys: pytest.CaptureFixture[str]):
@@ -263,7 +264,14 @@ def test_page_log_rows_honors_the_window():
 def test_update_pulls_the_registry_image(tmp_path: Path):
     log = tmp_path / "podman.log"
     binary = tmp_path / "podman"
-    binary.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexit 0\n")
+    binary.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {log}\n"
+        'case "$*" in\n'
+        "  inspect*) printf '%s\\n' sha256:previous ;;\n"
+        "esac\n"
+        "exit 0\n"
+    )
     binary.chmod(0o755)
     store = Store.open(tmp_path / "data")
     store.set_meta("self_image", "ghcr.io/bobowski/yard:latest")
@@ -289,12 +297,228 @@ def test_update_pulls_the_registry_image(tmp_path: Path):
         assert body["image"] == "ghcr.io/bobowski/yard:latest"
         assert body["status"] == "swapping"
         assert body["log"] == "pull ghcr.io/bobowski/yard:latest"
-        assert log.read_text().splitlines()[0] == "pull ghcr.io/bobowski/yard:latest"
+        text = log.read_text()
+        assert text.splitlines()[0].startswith("inspect ")
+        assert text.index("tag sha256:previous localhost/yard:previous") < text.index(
+            "pull ghcr.io/bobowski/yard:latest"
+        )
+        assert "stop -t 10 yard" in text
+        assert store.meta("swap_status") == "swapping"
+        assert store.meta("swap_id")
 
     try:
         asyncio.run(check())
     finally:
         store.close()
+
+
+def test_update_stops_when_the_running_image_cannot_be_saved(tmp_path: Path):
+    log = tmp_path / "podman.log"
+    binary = tmp_path / "podman"
+    binary.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexit 1\n")
+    binary.chmod(0o755)
+    store = Store.open(tmp_path / "data")
+    yard = Yard(
+        Config(
+            root=tmp_path,
+            caddy_sock=None,
+            podman_sock="",
+            podman_bin=str(binary),
+            public_port=8000,
+            hook_url="http://127.0.0.1:8000",
+            domain="",
+            skip_deploy=True,
+            boot=False,
+            remote=False,
+        ),
+        store,
+    )
+    try:
+        with pytest.raises(YardError) as caught:
+            asyncio.run(yard.update_yard())
+        assert caught.value.code == "swap_failed"
+        assert store.meta("swap_status") == "failed"
+        assert "pull " not in log.read_text()
+    finally:
+        store.close()
+
+
+def test_swap_boot_ignores_the_registry_tag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    config = Config(
+        root=tmp_path,
+        caddy_sock=None,
+        podman_sock="",
+        podman_bin="podman",
+        public_port=8000,
+        hook_url="http://127.0.0.1:8000",
+        domain="",
+        skip_deploy=True,
+        boot=False,
+        remote=False,
+    )
+    store = Store.open(config.data_dir)
+    yard = Yard(config, store)
+    store.set_meta("swap_status", "swapping")
+    store.set_meta("swap_id", "abc")
+    store.set_meta("swap_image", "ghcr.io/bobowski/yard:latest")
+    monkeypatch.setenv("YARD_IMAGE", "ghcr.io/bobowski/yard:latest")
+    monkeypatch.delenv("YARD_SWAP_ACK", raising=False)
+    monkeypatch.delenv("YARD_SWAP_ID", raising=False)
+    try:
+        yard._note_swap_boot()
+        assert store.meta("swap_status") == "swapping"
+        monkeypatch.setenv("YARD_SWAP_ACK", "1")
+        monkeypatch.setenv("YARD_SWAP_ID", "other")
+        yard._note_swap_boot()
+        assert store.meta("swap_status") == "swapping"
+        monkeypatch.setenv("YARD_SWAP_ID", "abc")
+        yard._note_swap_boot()
+        assert store.meta("swap_status") == "ready"
+    finally:
+        store.close()
+
+
+def test_swap_boot_reads_a_matching_restore_result(tmp_path: Path):
+    config = Config(
+        root=tmp_path,
+        caddy_sock=None,
+        podman_sock="",
+        podman_bin="podman",
+        public_port=8000,
+        hook_url="http://127.0.0.1:8000",
+        domain="",
+        skip_deploy=True,
+        boot=False,
+        remote=False,
+    )
+    store = Store.open(config.data_dir)
+    yard = Yard(config, store)
+    store.set_meta("swap_status", "swapping")
+    store.set_meta("swap_id", "abc")
+    result = config.data_dir / "swap.result"
+    try:
+        result.write_text("rolled_back nope\n")
+        yard._note_swap_boot()
+        assert store.meta("swap_status") == "swapping"
+        assert not result.exists()
+        result.write_text("rolled_back abc\n")
+        yard._note_swap_boot()
+        assert store.meta("swap_status") == "rolled_back"
+        assert not result.exists()
+    finally:
+        store.close()
+
+
+_FAKE_PODMAN = """#!/usr/bin/env python3
+import os
+import sys
+
+log = os.environ["PODMAN_LOG"]
+args = sys.argv[1:]
+line = " ".join(args)
+with open(log, "a") as handle:
+    handle.write(line + "\\n")
+mode = os.environ.get("PODMAN_MODE", "unhealthy")
+if "exec" in args and "yard-next" in args:
+    raise SystemExit(0 if mode in {"published-fails", "ready"} else 1)
+if "exec" in args:
+    raise SystemExit(0 if mode == "ready" else 1)
+if "--name" in args:
+    name = args[args.index("--name") + 1]
+    if name == "yard-next" and mode == "next-fails":
+        raise SystemExit(1)
+    if name == "yard" and mode == "published-fails":
+        raise SystemExit(1)
+if args[:3] == ["--remote", "container", "exists"]:
+    body = open(log).read()
+    raise SystemExit(0 if "rename yard yard-old" in body else 1)
+if "inspect" in args and os.environ.get("PODMAN_STATUS"):
+    print(os.environ["PODMAN_STATUS"])
+raise SystemExit(0)
+"""
+
+
+def _run_swap(tmp_path: Path, mode: str, status: str = "") -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    podman_log = tmp_path / "podman.log"
+    fake = bin_dir / "podman"
+    fake.write_text(_FAKE_PODMAN)
+    fake.chmod(0o755)
+    root = tmp_path / "root"
+    (root / "data" / "yard").mkdir(parents=True)
+    env = os.environ.copy()
+    env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+    env["PODMAN_LOG"] = str(podman_log)
+    env["PODMAN_MODE"] = mode
+    if status:
+        env["PODMAN_STATUS"] = status
+    env["YARD_IMAGE"] = "ghcr.io/bobowski/yard:latest"
+    env["YARD_ROOT"] = str(root)
+    env["YARD_PODMAN_SOCK"] = "/sock"
+    env["YARD_CADDY_SOCK"] = "/caddy.sock"
+    env["YARD_PUBLIC_PORT"] = "8000"
+    env["YARD_DOMAIN"] = "yard.example"
+    env["YARD_SELF_IMAGE"] = "ghcr.io/bobowski/yard:latest"
+    env["YARD_SWAP_ID"] = "abc"
+    env["YARD_SWAP_WAIT"] = "2"
+    env["YARD_SWAP_TRIES"] = "1"
+    env["YARD_SWAP_DELAY"] = "0"
+    done = subprocess.run(["sh", "-c", _SWAP], env=env, capture_output=True, text=True)
+    return done, podman_log, root
+
+
+def test_swap_script_parses():
+    subprocess.run(["sh", "-n", "-c", _SWAP], check=True)
+    assert "sleep 2" not in _SWAP
+
+
+def test_swap_script_keeps_the_stopped_container_when_the_new_image_exits(tmp_path: Path):
+    done, log, root = _run_swap(tmp_path, "unhealthy", "exited")
+    assert done.returncode == 1, done.stderr
+    lines = log.read_text().splitlines()
+    assert "--remote stop -t 10 yard" in lines
+    assert "--remote start yard" in lines
+    assert "--remote rm -f yard" not in lines
+    assert "--remote rename yard yard-old" not in lines
+    assert (root / "data" / "yard" / "swap.result").read_text() == "rolled_back abc\n"
+
+
+def test_swap_script_restores_when_the_new_container_does_not_start(tmp_path: Path):
+    done, log, _root = _run_swap(tmp_path, "next-fails")
+    assert done.returncode == 1, done.stderr
+    lines = log.read_text().splitlines()
+    assert "--remote rm -f yard" not in lines
+    assert "--remote start yard" in lines
+
+
+def test_swap_script_restores_the_renamed_container_when_publish_fails(tmp_path: Path):
+    done, log, root = _run_swap(tmp_path, "published-fails")
+    assert done.returncode == 1, done.stderr
+    lines = log.read_text().splitlines()
+    assert lines.index("--remote rename yard yard-old") < lines.index("--remote rm -f yard")
+    assert "--remote start yard" in lines
+    assert (root / "data" / "yard" / "swap.result").read_text() == "rolled_back abc\n"
+
+
+def test_swap_script_removes_the_old_container_only_after_health(tmp_path: Path):
+    done, log, root = _run_swap(tmp_path, "ready")
+    assert done.returncode == 0, done.stderr + done.stdout
+    text = log.read_text()
+    assert text.index("--remote rename yard yard-old") < text.index("--name yard --network")
+    assert text.index("--name yard --network") < text.index("--remote rm -f yard-old")
+    assert "--remote start yard" not in text.splitlines()
+    next_line = next(line for line in text.splitlines() if "--name yard-next" in line)
+    yard_line = next(line for line in text.splitlines() if "--name yard --network" in line)
+    assert "YARD_SWAP_ACK" not in next_line
+    assert "--group-add" not in next_line
+    assert "-p" not in next_line
+    assert "YARD_SWAP_ACK=1" in yard_line
+    assert "--group-add" not in yard_line
+    assert "127.0.0.1:8000:8000" in yard_line
+    assert "YARD_DOMAIN=yard.example" in yard_line
+    assert not (root / "data" / "yard" / "swap.result").exists()
+    assert "ready" in (root / "data" / "yard" / "swap.log").read_text()
 
 
 def test_a_missing_image_is_absent(tmp_path: Path):

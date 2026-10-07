@@ -4,6 +4,7 @@ import asyncio
 import base64
 import logging
 import os
+import secrets
 import shutil
 import subprocess
 from dataclasses import asdict, dataclass, field
@@ -502,6 +503,7 @@ class Yard:
         }
 
     async def update_yard(self) -> JsonValue:
+        await self._tag_running()
         settings = self.store.settings()
         if not settings.self_repo:
             image = YARD_IMAGE
@@ -529,24 +531,45 @@ class Yard:
             except Exception as exc:
                 self.store.set_meta("swap_status", "failed")
                 raise YardError(500, "build_failed", str(exc)) from exc
-        try:
-            current = (await self.podman.run("inspect", "--format", "{{.Image}}", "yard")).strip()
-            if current:
-                await self.podman.run("tag", current, "localhost/yard:previous")
-        except YardError:
-            pass
-        self.store.set_meta("swap_status", "swapping")
-        try:
-            await self.swap(image)
-        except Exception as exc:
+        if not await self.podman.image_exists(image) or not await self.podman.image_exists("localhost/yard:previous"):
             self.store.set_meta("swap_status", "failed")
-            raise YardError(500, "swap_failed", str(exc)) from exc
+            raise YardError(500, "swap_failed", "the new image or the previous image is not on this host")
+        await self._begin_swap(image)
         return {"image": image, "sha": sha, "status": "swapping", "log": built, "container": "yard-swap"}
 
     async def rollback(self) -> None:
-        await self.swap("localhost/yard:previous")
+        if not await self.podman.image_exists("localhost/yard:previous"):
+            raise YardError(400, "no_previous", "no previous image is tagged")
+        await self._begin_swap("localhost/yard:previous")
 
-    async def swap(self, image: str) -> None:
+    async def _tag_running(self) -> None:
+        try:
+            current = (await self.podman.run("inspect", "--format", "{{.Image}}", "yard")).strip()
+        except YardError as exc:
+            self.store.set_meta("swap_status", "failed")
+            raise YardError(500, "swap_failed", "Yard could not read the running image.") from exc
+        if not current:
+            self.store.set_meta("swap_status", "failed")
+            raise YardError(500, "swap_failed", "Yard could not read the running image.")
+        try:
+            await self.podman.run("tag", current, "localhost/yard:previous")
+        except YardError as exc:
+            self.store.set_meta("swap_status", "failed")
+            raise YardError(500, "swap_failed", "Yard could not save the running image.") from exc
+
+    async def _begin_swap(self, image: str) -> None:
+        swap_id = secrets.token_hex(8)
+        self.store.set_meta("swap_image", image)
+        self.store.set_meta("swap_id", swap_id)
+        self.store.set_meta("swap_status", "swapping")
+        try:
+            await self.swap(image, swap_id)
+        except Exception as exc:
+            self.store.set_meta("swap_status", "failed")
+            raise YardError(500, "swap_failed", str(exc)) from exc
+
+    async def swap(self, image: str, swap_id: str) -> None:
+        settings = self.store.settings()
         sock = self.config.podman_sock or "/run/podman/podman.sock"
         await self.podman.run(
             "run",
@@ -558,6 +581,8 @@ class Yard:
             "journald",
             "-v",
             f"{sock}:/run/podman/podman.sock",
+            "-v",
+            f"{self.paths.root}:{self.paths.root}",
             "-e",
             "CONTAINER_HOST=unix:///run/podman/podman.sock",
             "-e",
@@ -570,6 +595,12 @@ class Yard:
             f"YARD_CADDY_SOCK={self.config.caddy_sock or ''}",
             "-e",
             f"YARD_PUBLIC_PORT={self.config.public_port}",
+            "-e",
+            f"YARD_DOMAIN={settings.domain}",
+            "-e",
+            f"YARD_SELF_IMAGE={settings.self_image or image}",
+            "-e",
+            f"YARD_SWAP_ID={swap_id}",
             "quay.io/podman/stable",
             "sh",
             "-c",
@@ -585,12 +616,25 @@ class Yard:
         }
 
     def _note_swap_boot(self) -> None:
+        result = self.config.data_dir / "swap.result"
+        try:
+            text = result.read_text().strip()
+        except OSError:
+            text = ""
+        if text:
+            result.unlink(missing_ok=True)
+        kind, _, token = text.partition(" ")
+        if kind in {"rolled_back", "failed"} and token and token == self.store.meta("swap_id"):
+            self.store.set_meta("swap_status", kind)
+            return
         if self.store.meta("swap_status") != "swapping":
             return
-        got = os.environ.get("YARD_IMAGE", "")
-        if not got:
+        if os.environ.get("YARD_SWAP_ACK") != "1":
             return
-        self.store.set_meta("swap_status", "ready" if got == self.store.meta("swap_image") else "rolled_back")
+        want = self.store.meta("swap_id")
+        got = os.environ.get("YARD_SWAP_ID", "")
+        if want and got == want:
+            self.store.set_meta("swap_status", "ready")
 
     async def push_caddy(self) -> None:
         sock = self.config.caddy_sock
@@ -816,30 +860,166 @@ while read old new ref; do
 done
 """
 
-_SWAP = """set -eu
-run() {
-  podman --remote run -d --name yard --restart=always --network yard --log-driver journald \\
-    --group-add keep-groups \\
-    -p "127.0.0.1:${YARD_PUBLIC_PORT}:8000" \\
-    -v "$YARD_ROOT:$YARD_ROOT" \\
-    -v "$YARD_PODMAN_SOCK:/run/podman/podman.sock" \\
-    -e CONTAINER_HOST=unix:///run/podman/podman.sock \\
-    -e "YARD_IMAGE=$1" \\
-    -e "YARD_ROOT=$YARD_ROOT" \\
-    -e "YARD_PODMAN_SOCK=$YARD_PODMAN_SOCK" \\
-    -e "YARD_CADDY_SOCK=$YARD_CADDY_SOCK" \\
-    -e "YARD_PUBLIC_PORT=$YARD_PUBLIC_PORT" \\
-    "$1"
-}
-podman --remote rm -f yard || true
-run "$YARD_IMAGE"
-sleep 2
-if ! podman --remote exec yard /workspace/.venv/bin/python -c \\
-  'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/health")'; then
-  podman --remote rm -f yard || true
-  run localhost/yard:previous
+_SWAP = r"""# Stop the live container and keep it until the new image answers /health.
+if [ -z "${YARD_IMAGE:-}" ] || [ -z "${YARD_ROOT:-}" ] || [ -z "${YARD_PODMAN_SOCK:-}" ]; then
+  echo "swap: missing env" >&2
   exit 1
 fi
+if [ -z "${YARD_PUBLIC_PORT:-}" ]; then
+  echo "swap: missing env" >&2
+  exit 1
+fi
+YARD_SWAP_WAIT="${YARD_SWAP_WAIT:-60}"
+YARD_SWAP_TRIES="${YARD_SWAP_TRIES:-15}"
+YARD_SWAP_DELAY="${YARD_SWAP_DELAY:-1}"
+YARD_DOMAIN="${YARD_DOMAIN:-}"
+YARD_SELF_IMAGE="${YARD_SELF_IMAGE:-}"
+YARD_CADDY_SOCK="${YARD_CADDY_SOCK:-}"
+YARD_SWAP_ID="${YARD_SWAP_ID:-}"
+mkdir -p "$YARD_ROOT/data/yard"
+result_file="$YARD_ROOT/data/yard/swap.result"
+
+log() {
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$YARD_ROOT/data/yard/swap.log"
+}
+
+mark() {
+  printf '%s %s\n' "$1" "$YARD_SWAP_ID" > "$result_file"
+}
+
+healthy() {
+  podman --remote exec "$1" /workspace/.venv/bin/python -c \
+    'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=3).read()' \
+    >/dev/null 2>&1
+}
+
+wait_healthy() {
+  name="$1"
+  try=0
+  while [ "$try" -lt "$YARD_SWAP_WAIT" ]; do
+    if healthy "$name"; then
+      return 0
+    fi
+    state=$(podman --remote inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)
+    if [ "$state" = "exited" ] || [ "$state" = "dead" ]; then
+      log "$name is $state"
+      return 1
+    fi
+    try=$((try + 1))
+    if [ "$try" -lt "$YARD_SWAP_WAIT" ]; then
+      sleep 1
+    fi
+  done
+  log "$name did not answer /health"
+  return 1
+}
+
+save_logs() {
+  name="$1"
+  err=$(podman --remote logs --tail 80 "$name" 2>&1 || true)
+  if [ -n "$err" ]; then
+    log "logs $name: $err"
+  fi
+}
+
+run_container() {
+  name="$1"
+  image="$2"
+  publish="$3"
+  ack="$4"
+  podman --remote rm -f "$name" >/dev/null 2>&1 || true
+  set -- podman --remote run -d --name "$name" --network yard --log-driver journald \
+    -v "$YARD_ROOT:$YARD_ROOT" \
+    -v "$YARD_PODMAN_SOCK:/run/podman/podman.sock" \
+    -e CONTAINER_HOST=unix:///run/podman/podman.sock \
+    -e "YARD_IMAGE=$image" \
+    -e "YARD_ROOT=$YARD_ROOT" \
+    -e "YARD_PODMAN_SOCK=$YARD_PODMAN_SOCK" \
+    -e "YARD_CADDY_SOCK=$YARD_CADDY_SOCK" \
+    -e "YARD_PUBLIC_PORT=$YARD_PUBLIC_PORT" \
+    -e YARD_BOOT=1
+  if [ -n "$YARD_DOMAIN" ]; then
+    set -- "$@" -e "YARD_DOMAIN=$YARD_DOMAIN"
+  fi
+  if [ -n "$YARD_SELF_IMAGE" ]; then
+    set -- "$@" -e "YARD_SELF_IMAGE=$YARD_SELF_IMAGE"
+  fi
+  if [ "$ack" = "1" ]; then
+    set -- "$@" -e YARD_SWAP_ACK=1 -e "YARD_SWAP_ID=$YARD_SWAP_ID"
+  fi
+  if [ "$publish" = "1" ]; then
+    set -- "$@" --restart=always -p "127.0.0.1:${YARD_PUBLIC_PORT}:8000"
+  fi
+  set -- "$@" "$image"
+  if ! err=$("$@" 2>&1); then
+    log "run $name failed: $err"
+    return 1
+  fi
+  log "run $name"
+  return 0
+}
+
+start_published() {
+  image="$1"
+  try=0
+  while [ "$try" -lt "$YARD_SWAP_TRIES" ]; do
+    if run_container yard "$image" 1 1; then
+      return 0
+    fi
+    try=$((try + 1))
+    if [ "$try" -lt "$YARD_SWAP_TRIES" ]; then
+      sleep 1
+    fi
+  done
+  return 1
+}
+
+restore() {
+  log "restore the previous container"
+  save_logs yard-next
+  save_logs yard
+  podman --remote rm -f yard-next >/dev/null 2>&1 || true
+  if podman --remote container exists yard-old >/dev/null 2>&1; then
+    podman --remote rm -f yard >/dev/null 2>&1 || true
+    podman --remote rename yard-old yard >/dev/null 2>&1 || log "rename yard-old failed"
+  fi
+  mark rolled_back
+  if podman --remote start yard; then
+    log "started the previous container"
+    exit 1
+  fi
+  log "the previous container did not start"
+  if start_published localhost/yard:previous; then
+    mark rolled_back
+    exit 1
+  fi
+  mark failed
+  log "no yard container is running"
+  exit 1
+}
+
+if [ "$YARD_SWAP_DELAY" != "0" ]; then
+  sleep "$YARD_SWAP_DELAY"
+fi
+log "swap $YARD_IMAGE"
+if ! podman --remote stop -t 10 yard; then
+  log "stop failed"
+  exit 1
+fi
+if ! run_container yard-next "$YARD_IMAGE" 0 0 || ! wait_healthy yard-next; then
+  restore
+fi
+if ! podman --remote rename yard yard-old; then
+  log "rename yard failed"
+  restore
+fi
+podman --remote rm -f yard-next >/dev/null 2>&1 || true
+if ! start_published "$YARD_IMAGE" || ! wait_healthy yard; then
+  restore
+fi
+podman --remote rm -f yard-old >/dev/null 2>&1 || true
+log "ready"
+exit 0
 """
 
 

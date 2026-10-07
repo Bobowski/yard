@@ -385,19 +385,36 @@ async def test_container_inspect_rejects_a_bad_name(yard):
     assert res.status_code == 400
 
 
+def _git_env() -> dict[str, str]:
+    env = os.environ.copy()
+    name = env.get("GIT_AUTHOR_NAME") or _git_value("user.name")
+    email = env.get("GIT_AUTHOR_EMAIL") or _git_value("user.email")
+    if not name:
+        name = "Adam Bobowski"
+    if not email:
+        email = "bobowskiadam@gmail.com"
+    env["GIT_AUTHOR_NAME"] = name
+    env["GIT_AUTHOR_EMAIL"] = email
+    if not env.get("GIT_COMMITTER_NAME"):
+        env["GIT_COMMITTER_NAME"] = name
+    if not env.get("GIT_COMMITTER_EMAIL"):
+        env["GIT_COMMITTER_EMAIL"] = email
+    return env
+
+
+def _git_value(key: str) -> str:
+    found = subprocess.run(["git", "config", "--get", key], capture_output=True, text=True)
+    if found.returncode != 0:
+        return ""
+    return found.stdout.strip()
+
+
 def _commit_empty(directory: Path) -> str:
     tree = subprocess.check_output(["git", "-C", str(directory), "hash-object", "-t", "tree", "--stdin"], input=b"")
-    author = {
-        **os.environ,
-        "GIT_AUTHOR_NAME": "Yard",
-        "GIT_AUTHOR_EMAIL": "yard@example.com",
-        "GIT_COMMITTER_NAME": "Yard",
-        "GIT_COMMITTER_EMAIL": "yard@example.com",
-    }
     commit = subprocess.check_output(
         ["git", "-C", str(directory), "commit-tree", tree.decode().strip(), "-m", "init"],
         text=True,
-        env=author,
+        env=_git_env(),
     )
     sha = commit.strip()
     subprocess.check_call(["git", "-C", str(directory), "update-ref", "refs/heads/main", sha])
@@ -412,8 +429,6 @@ def _seed_merged_feature(bare: Path) -> str:
         work = bare.parent / "work"
         work.mkdir()
         _git(work, "init", "-b", "main")
-        _git(work, "config", "user.email", "yard@example.com")
-        _git(work, "config", "user.name", "Yard")
         (work / "readme.txt").write_text("one\n")
         _git(work, "add", "readme.txt")
         _git(work, "commit", "-m", "one")
@@ -433,4 +448,4 @@ def _seed_merged_feature(bare: Path) -> str:
 
 
 def _git(directory: Path, *args: str) -> None:
-    subprocess.check_call(["git", "-C", str(directory), *args])
+    subprocess.check_call(["git", "-C", str(directory), *args], env=_git_env())
