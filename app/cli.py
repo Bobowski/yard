@@ -9,18 +9,27 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import NoReturn
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
+from app import package_version
 from app.config import YARD_IMAGE
 from app.errors import YardError
+from app.rows import format_span, mem_used, slot_label
+from app.store import check_domain, check_name, check_ref, check_slot_name, clean_dir, parse_every
 from app.text import Block, ExpLabel, format_blocks, format_values, name_ok, parse_blocks, parse_env
 
 USAGE = """yard commands:
+  yard --version
   yard login --url <url> --token <token>
+  yard init [--name name] [--repo name] [--slot name] [--ref main] [--dir path] (--domain host | --every 5m)
+    Makes a git repo when this directory has none. Makes the Yard repo and the slot.
+    The repo name and the slot name match. --name sets both. --repo and --slot set one each.
+    One of --domain or --every is required. Init does not push.
+    Commit, then run: git push -u yard <ref>
   yard repo new <name> [--force]
   yard repo list
   yard repo rm <name>
@@ -30,10 +39,13 @@ USAGE = """yard commands:
     A domain is optional. The slot is removed when its branch is merged or deleted.
     --every 5m makes a job. One routine watches that slot, sleeps, and starts the next run.
   yard slot list [--running]
-    The container name is the slot name. A slot with no container still gets a row. --running hides stopped rows.
+    The container name is the slot name, so the table shows that name once. Caddy and Yard use the same column.
+    A slot with no container still gets a row. --running hides stopped rows.
+    The last row is the total. CPU max is 100% times the core count. Memory max and data max come from the host.
+    DATA is the size of that slot's data directory.
     HEALTH is healthy, unhealthy, failed, down, or idle. A plain running container leaves HEALTH empty.
     STATUS is the Podman line. It says how long a container has been up, or when the last run exited.
-    SHA is the revision the slot runs. WANT is the branch revision. BUILD is the latest build.
+    SHA is the revision the slot runs. WANT is the branch revision. BUILD is the latest build and how long it took.
   yard slot show <name>
     Prints the slot as NAME=value lines. The API stores those lines as keys.
   yard slot edit <name>
@@ -81,6 +93,9 @@ class Client:
 
 def main(argv: list[str] | None = None) -> None:
     opt = split_args(sys.argv[1:] if argv is None else argv)
+    if opt.rest in (["--version"], ["-V"], ["version"]):
+        print(package_version())
+        return
     if not opt.rest:
         _usage()
     command, *rest = opt.rest
@@ -88,6 +103,8 @@ def main(argv: list[str] | None = None) -> None:
         _exp(opt, rest)
     elif command == "login":
         _login(opt, rest)
+    elif command == "init":
+        _init(opt, rest)
     elif command == "repo":
         _repo(opt, rest)
     elif command == "slot":
@@ -186,6 +203,129 @@ def _login(opt: Opt, args: list[str]) -> None:
     path.write_text(json.dumps({"url": url, "token": token}, indent=2) + "\n")
     path.chmod(0o600)
     print(path)
+
+
+def _init(opt: Opt, args: list[str]) -> None:
+    parser = argparse.ArgumentParser(prog="yard init")
+    parser.add_argument("--name", default="")
+    parser.add_argument("--repo", default="")
+    parser.add_argument("--slot", default="")
+    parser.add_argument("--ref", default="main")
+    parser.add_argument("--domain", default="")
+    parser.add_argument("--dir", default="")
+    parser.add_argument("--every", default="")
+    parsed = parser.parse_args(args)
+    domain = parsed.domain.strip()
+    every = parsed.every.strip()
+    if not domain and not every:
+        _die("yard init needs --domain or --every")
+    try:
+        ref = parsed.ref.strip()
+        check_ref(ref)
+        if domain:
+            check_domain(domain)
+        directory_key = clean_dir(parsed.dir) if parsed.dir.strip() else ""
+        interval = parse_every(every) if every else ""
+        if every and not interval:
+            raise YardError(400, "bad_every", "yard init needs --domain or --every")
+    except YardError as exc:
+        _die(exc.message)
+    client = _load(opt)
+    top = _git_top()
+    folder = Path(top or Path.cwd()).name
+    shared = parsed.name.strip()
+    repo = _checked(parsed.repo.strip() or shared or folder, bool(parsed.repo.strip() or shared), check_name)
+    slot_name = _checked(parsed.slot.strip() or shared or folder, bool(parsed.slot.strip() or shared), check_slot_name)
+    directory = top or _make_git(ref)
+    created = _ensure_repo(client, repo)
+    remote = f"{client.url}/git/{repo}.git"
+    _link_dir(directory, remote, client.token)
+    body: dict[str, str] = {"SLOT_NAME": slot_name, "SLOT_REPO": repo, "SLOT_BRANCH": ref}
+    if domain:
+        body["SLOT_DOMAIN"] = domain
+    if directory_key:
+        body["SLOT_DIRECTORY"] = directory_key
+    if interval:
+        body["SLOT_INTERVAL"] = interval
+    slot_text = _api(client, "POST", "/api/v1/slots", body)
+    try:
+        slot = json.loads(slot_text)
+    except json.JSONDecodeError:
+        slot = {"raw": slot_text}
+    push = f"git push -u yard {ref}"
+    if as_json(opt):
+        print(
+            json.dumps(
+                {
+                    "name": slot_name,
+                    "repo": repo,
+                    "remote": remote,
+                    "created": created,
+                    "slot": slot,
+                    "push": push,
+                },
+            )
+        )
+        return
+    print(f"repo {repo}")
+    print(f"remote yard -> {remote}")
+    print(f"slot {slot_name}")
+    if _head_ok(directory):
+        print(f"push: {push}")
+        return
+    print(f"commit, then: {push}")
+
+
+def _checked(name: str, explicit: bool, check: Callable[[str], None]) -> str:
+    try:
+        check(name)
+    except YardError as exc:
+        if explicit:
+            _die(exc.message)
+        _die(f"{exc.message}. Pass --name, --repo, or --slot.")
+    return name
+
+
+def _git_top() -> str:
+    proc = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    if proc.returncode:
+        return ""
+    return proc.stdout.strip()
+
+
+def _make_git(ref: str) -> str:
+    _git([], ["init", "-b", ref])
+    top = _git_top()
+    if not top:
+        _die("git init did not create a repo")
+    return top
+
+
+def _head_ok(directory: str) -> bool:
+    proc = subprocess.run(["git", "-C", directory, "rev-parse", "--verify", "HEAD"], capture_output=True)
+    return proc.returncode == 0
+
+
+def _ensure_repo(client: Client, name: str) -> bool:
+    status, text = _api_try(client, "POST", "/api/v1/repos", {"name": name, "force": False})
+    if status < 300:
+        return True
+    if status == 409 and _error_code(text) == "exists":
+        return False
+    _die(text)
+
+
+def _error_code(text: str) -> str:
+    try:
+        body = json.loads(text)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    error = body.get("error")
+    if not isinstance(error, dict):
+        return ""
+    return str(error.get("code") or "")
 
 
 def _repo(opt: Opt, args: list[str]) -> None:
@@ -729,22 +869,27 @@ def _print_exps(rows: list) -> None:
 def _print_rows(rows: list) -> None:
     table = []
     for row in rows:
-        exit_code = "-" if not row.get("container") else str(row.get("exit_code", 0))
+        slot = str(row.get("slot") or "")
+        container = str(row.get("container") or "")
+        total = slot == "total"
+        mem = str(row.get("mem") or "")
+        if not total:
+            mem = mem_used(mem)
         table.append(
             [
-                str(row.get("slot") or ""),
-                str(row.get("container") or ""),
-                str(row.get("health") or "-"),
-                str(row.get("status") or "-"),
-                exit_code,
+                slot_label(slot, container),
+                "" if total else str(row.get("health") or "-"),
+                "" if total else str(row.get("status") or "-"),
+                "" if total else ("-" if not container else str(row.get("exit_code", 0))),
                 str(row.get("cpu") or "-"),
-                str(row.get("mem") or "-"),
-                _short(str(row.get("sha") or "-")),
-                _short(str(row.get("expected") or "-")),
-                str(row.get("build") or "-"),
+                mem or "-",
+                str(row.get("data") or "-"),
+                "" if total else _short(str(row.get("sha") or "")) or "-",
+                "" if total else _short(str(row.get("expected") or "")) or "-",
+                "" if total else str(row.get("build") or "-"),
             ]
         )
-    _table(["SLOT", "CONTAINER", "HEALTH", "STATUS", "EXIT", "CPU", "MEM", "SHA", "WANT", "BUILD"], table)
+    _table(["SLOT", "HEALTH", "STATUS", "EXIT", "CPU", "MEM", "DATA", "SHA", "WANT", "BUILD"], table)
 
 
 def _print_deploys(rows: list) -> None:
@@ -813,38 +958,7 @@ def _short(sha: str) -> str:
 
 
 def _took(started: str, ended: str) -> str:
-    start = _time(started)
-    stop = _time(ended)
-    if start is None or stop is None or stop <= start:
-        return "-"
-    return _duration(stop - start)
-
-
-def _time(text: str) -> datetime | None:
-    if not text:
-        return None
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        return datetime.fromisoformat(text)
-    except ValueError:
-        return None
-
-
-def _duration(delta: timedelta) -> str:
-    ms = int(round(delta.total_seconds() * 1000))
-    if ms < 1000:
-        return f"{ms}ms"
-    seconds, frac = divmod(ms, 1000)
-    minutes, seconds = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours}h{minutes}m{seconds}s"
-    if minutes:
-        return f"{minutes}m{seconds}s"
-    if frac:
-        return f"{seconds}.{frac:03d}".rstrip("0") + "s"
-    return f"{seconds}s"
+    return format_span(started, ended) or "-"
 
 
 def _settings_image(client: Client) -> bool:

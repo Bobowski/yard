@@ -39,6 +39,13 @@ class Sample:
 
 
 @dataclass(slots=True)
+class HostUse:
+    cpus: int = 0
+    mem: int = 0
+    disk: int = 0
+
+
+@dataclass(slots=True)
 class LogRow:
     at: str
     line: str
@@ -143,6 +150,30 @@ def ok_name(text: str) -> bool:
             continue
         return False
     return True
+
+
+def parse_info(raw: str) -> HostUse:
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError:
+        return HostUse()
+    if not isinstance(info, dict):
+        return HostUse()
+    host = info.get("host")
+    store = info.get("store")
+    cpus = mem = disk = 0
+    if isinstance(host, dict):
+        cpus = _number(host.get("cpus"))
+        mem = _number(host.get("memTotal"))
+    if isinstance(store, dict):
+        disk = _number(store.get("graphRootAllocated"))
+    return HostUse(cpus, mem, disk)
+
+
+def _number(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return int(value)
 
 
 def parse_stats(raw: str) -> dict[str, Sample]:

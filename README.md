@@ -23,6 +23,19 @@ Yard keeps its files under `/srv/yard`. Each slot keeps its files under `/srv/ya
 
 Caddy listens on port 8443. The host forwards port 443 to that port. Yard posts the Caddy config to a Unix socket.
 
+## CLI
+
+The command is `yard`. The package name is `staryard`. PyPI already has a package named `yard`.
+
+```sh
+uv tool install staryard
+yard --version
+```
+
+Python 3.14 is required. `yard login` stores the host and the token on this computer.
+
+`staryard[server]` installs the server libraries. The host still runs the container image.
+
 ## Install
 
 Run the script on the VM as root. A second run repairs a partial install. A healthy Yard container stays in place.
@@ -63,22 +76,24 @@ yard update
 
 ## Add an app
 
-Add an app with these commands:
+Run this in the app directory. The directory name is the repo name and the slot name.
 
 ```sh
-yard repo new heldso
-yard repo link heldso
-git push yard main
-yard slot new heldso --repo heldso --domain heldso.example.com
+yard init --domain heldso.example.com
+git push -u yard main
 ```
 
-`yard repo link` adds a git remote named `yard`.
+`yard init` makes a git repo when the directory has none. It makes the Yard repo and the slot. It adds a git remote named `yard`. It does not push.
+
+Pass `--domain` for a public host. Pass `--every 5m` for a job. One of them is required. `--name` sets the repo name and the slot name. `--repo` and `--slot` set one each.
+
+`yard repo new`, `yard repo link`, and `yard slot new` do those steps one at a time.
 
 ## Commands
 
 Run `yard` to see every command. These are the common ones:
 
-- `yard slot list` shows each slot and its container.
+- `yard slot list` shows each slot, its data size, and how long the last build took. The last row is the host total.
 - `yard slot edit <name>` changes the slot file.
 - `yard slot logs <name>` reads the container log.
 - `yard settings` sets the public host, the Caddy email, and the Yard image.

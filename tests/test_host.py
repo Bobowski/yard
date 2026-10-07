@@ -1,10 +1,13 @@
 import asyncio
+import json
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from app.cli import judge_swap, main, parse_slot_sets, slot_patch, split_args
+from app import package_version
+from app.cli import Client, judge_swap, main, parse_slot_sets, slot_patch, split_args
 from app.config import Config, hook_url
 from app.errors import YardError
 from app.machine import (
@@ -27,16 +30,24 @@ from app.podman import (
     latest_for_slot,
     page_log_rows,
     page_logs,
+    parse_info,
     parse_inspect,
     parse_ps,
     parse_stats,
     ps_args,
     stats_args,
 )
-from app.rows import slot_rows
+from app.rows import SlotRow, build_label, dir_size, slot_label, slot_rows, total_row
 from app.store import Slot, Store
 from app.text import slot_env
 from app.yard import Yard
+
+
+def test_version_prints_the_package_version(capsys: pytest.CaptureFixture[str]):
+    main(["--version"])
+    assert capsys.readouterr().out.strip() == package_version()
+    main(["version"])
+    assert capsys.readouterr().out.strip() == package_version()
 
 
 def test_login_keeps_url_and_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
@@ -47,6 +58,143 @@ def test_login_keeps_url_and_token(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert capsys.readouterr().out.strip() == str(path)
     with pytest.raises(SystemExit):
         main(["login"])
+
+
+def _init_api(repo_status: int = 200, repo_body: str = '{"name":"heldso","created":"t"}'):
+    calls: list[tuple[str, str, object]] = []
+
+    def fake(_client: Client, method: str, path: str, body: object) -> tuple[int, str]:
+        calls.append((method, path, body))
+        if path == "/api/v1/repos":
+            return repo_status, repo_body
+        return 200, '{"deploy":{"status":"waiting"}}'
+
+    return calls, fake
+
+
+def _no_push(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    seen: list[list[str]] = []
+    real = subprocess.run
+
+    def run(cmd, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if isinstance(cmd, list):
+            seen.append(cmd)
+            if "push" in cmd:
+                raise AssertionError(cmd)
+        return real(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return seen
+
+
+def test_init_creates_the_repo_and_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    root = tmp_path / "heldso"
+    root.mkdir()
+    monkeypatch.chdir(root)
+    calls, fake = _init_api()
+    monkeypatch.setattr("app.cli._load", lambda _opt: Client("https://yard.example.com", "secret"))
+    monkeypatch.setattr("app.cli._api_try", fake)
+    seen = _no_push(monkeypatch)
+    main(["--text", "init", "--domain", "heldso.example.com"])
+    text = capsys.readouterr().out
+    assert "repo heldso" in text
+    assert "remote yard -> https://yard.example.com/git/heldso.git" in text
+    assert "commit, then: git push -u yard main" in text
+    assert calls[0][0:2] == ("POST", "/api/v1/repos")
+    assert calls[1] == (
+        "POST",
+        "/api/v1/slots",
+        {"SLOT_NAME": "heldso", "SLOT_REPO": "heldso", "SLOT_BRANCH": "main", "SLOT_DOMAIN": "heldso.example.com"},
+    )
+    assert not any("push" in cmd for cmd in seen)
+    assert (root / ".git").exists()
+    remote = subprocess.run(["git", "remote", "get-url", "yard"], cwd=root, capture_output=True, text=True, check=True)
+    assert remote.stdout.strip() == "https://yard.example.com/git/heldso.git"
+
+
+def test_init_keeps_an_existing_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    root = tmp_path / "heldso"
+    root.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+    (root / "README").write_text("hi\n")
+    subprocess.run(["git", "add", "README"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Ada", "-c", "user.email=ada@example.com", "commit", "-m", "start"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    (root / "app").mkdir()
+    monkeypatch.chdir(root / "app")
+    calls, fake = _init_api(409, '{"error":{"code":"exists","message":"already exists"}}')
+    monkeypatch.setattr("app.cli._load", lambda _opt: Client("https://yard.example.com", "secret"))
+    monkeypatch.setattr("app.cli._api_try", fake)
+    seen = _no_push(monkeypatch)
+    main(["init", "--every", "5m", "--name", "heldso"])
+    body = json.loads(capsys.readouterr().out)
+    assert body["created"] is False
+    assert body["push"] == "git push -u yard main"
+    assert body["name"] == "heldso"
+    assert calls[1] == (
+        "POST",
+        "/api/v1/slots",
+        {"SLOT_NAME": "heldso", "SLOT_REPO": "heldso", "SLOT_BRANCH": "main", "SLOT_INTERVAL": "5m"},
+    )
+    assert not any(cmd[0] == "git" and "init" in cmd for cmd in seen)
+    assert not (root / "app" / ".git").exists()
+
+
+def test_init_can_split_the_repo_and_the_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    root = tmp_path / "app"
+    root.mkdir()
+    monkeypatch.chdir(root)
+    calls, fake = _init_api()
+    monkeypatch.setattr("app.cli._load", lambda _opt: Client("https://yard.example.com", "secret"))
+    monkeypatch.setattr("app.cli._api_try", fake)
+    _no_push(monkeypatch)
+    main(["--text", "init", "--domain", "heldso.example.com", "--repo", "heldso-docs", "--slot", "heldso"])
+    text = capsys.readouterr().out
+    assert "repo heldso-docs" in text
+    assert "slot heldso" in text
+    assert calls[0][2] == {"name": "heldso-docs", "force": False}
+    assert calls[1][2] == {
+        "SLOT_NAME": "heldso",
+        "SLOT_REPO": "heldso-docs",
+        "SLOT_BRANCH": "main",
+        "SLOT_DOMAIN": "heldso.example.com",
+    }
+    remote = subprocess.run(["git", "remote", "get-url", "yard"], cwd=root, capture_output=True, text=True, check=True)
+    assert remote.stdout.strip() == "https://yard.example.com/git/heldso-docs.git"
+
+
+def test_init_needs_a_domain_or_an_interval(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root = tmp_path / "heldso"
+    root.mkdir()
+    monkeypatch.chdir(root)
+    with pytest.raises(SystemExit):
+        main(["init"])
+    assert not (root / ".git").exists()
+
+
+def test_init_rejects_a_bad_directory_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root = tmp_path / "Heldso"
+    root.mkdir()
+    monkeypatch.chdir(root)
+    monkeypatch.setattr("app.cli._load", lambda _opt: Client("https://yard.example.com", "secret"))
+
+    def fail(*_args):  # type: ignore[no-untyped-def]
+        raise AssertionError("api")
+
+    monkeypatch.setattr("app.cli._api_try", fail)
+    with pytest.raises(SystemExit):
+        main(["init", "--domain", "heldso.example.com"])
+    assert not (root / ".git").exists()
 
 
 def test_split_args_keeps_the_name_before_flags():
@@ -236,12 +384,44 @@ def test_slot_rows_keep_stopped_containers():
     assert rows[1].container == ""
     assert rows[1].health == "down"
     assert rows[2].container == "caddy"
-    assert rows[2].slot == ""
+    assert rows[2].slot == "caddy"
+    assert slot_label("heldso", "heldso") == "heldso"
+    assert slot_label("backup", "run-1") == "backup (run-1)"
     idle = slot_rows([Slot("nightly", "", "", "", "", "", "5m", {}, "")], {}, {}, running_only=False)
     assert len(idle) == 1
     assert idle[0].health == "idle"
     running = slot_rows(slots, listed, samples, running_only=True)
     assert [row.container for row in running] == ["heldso", "caddy"]
+
+
+def test_total_row_sums_use_and_keeps_one_data_size():
+    rows = [
+        SlotRow(slot="heldso", container="heldso", cpu="1.50%", mem="20MB / 67.32GB", data="1MB"),
+        SlotRow(slot="heldso", container="run-1", cpu="0.50%", mem="10MB", data="1MB"),
+        SlotRow(slot="caddy", container="caddy", cpu="0.04%", mem="13MB", data="2MB"),
+    ]
+    total = total_row(rows, 12, 67_320_864_768, 467_909_804_032)
+    assert total.slot == "total"
+    assert total.cpu == "2.04% / 1200%"
+    assert total.mem == "43MB / 67.32GB"
+    assert total.data == "3MB / 467.9GB"
+    assert build_label("ok", "2026-10-07T11:00:00Z", "2026-10-07T11:00:47Z") == "ok 47s"
+    assert build_label("running", "2026-10-07T11:00:00Z", "") == "running"
+
+
+def test_dir_size_and_host_info(tmp_path: Path):
+    data = tmp_path / "slot"
+    data.mkdir()
+    (data / "app.sqlite3").write_bytes(b"x" * 1000)
+    nested = data / "wal"
+    nested.mkdir()
+    (nested / "extra").write_bytes(b"y" * 24)
+    assert dir_size(data) == 1024
+    host = parse_info('{"host":{"cpus":12,"memTotal":67320864768},"store":{"graphRootAllocated":467909804032}}')
+    assert host.cpus == 12
+    assert host.mem == 67320864768
+    assert host.disk == 467909804032
+    assert parse_info("nope").cpus == 0
 
 
 def test_job_due_and_plan():

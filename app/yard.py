@@ -32,17 +32,19 @@ from app.machine import (
     yard_route,
 )
 from app.podman import (
+    HostUse,
     Podman,
     ids_for_slot,
     latest_for_slot,
     page_logs,
+    parse_info,
     parse_inspect,
     parse_ps,
     parse_stats,
     ps_args,
     stats_args,
 )
-from app.rows import slot_rows
+from app.rows import build_label, dir_size, disk_capacity, format_bytes, slot_rows, total_row
 from app.store import Slot, Store, check_name, parse_duration
 from app.text import SlotEdit, apply_slot_keys, image_sha
 
@@ -245,7 +247,23 @@ class Yard:
         for row in rows:
             sha, expected, build = facts.get(row.slot, ("", "", ""))
             row.sha, row.expected, row.build = sha, expected, build
+            name = row.slot or row.container
+            path = self.paths.data(name) if name else None
+            if path is not None and path.is_dir():
+                row.data = format_bytes(dir_size(path))
+        host = await self.host_use()
+        rows.append(total_row(rows, host.cpus, host.mem, host.disk))
         return [asdict(row) for row in rows]
+
+    async def host_use(self) -> HostUse:
+        host = HostUse()
+        try:
+            host = parse_info(await self.podman.run("info", "--format", "json"))
+        except YardError:
+            host = HostUse()
+        if not host.disk:
+            host.disk = disk_capacity(self.paths.root)
+        return host
 
     async def slot_facts(self, slots: list[Slot]) -> dict[str, tuple[str, str, str]]:
         facts: dict[str, tuple[str, str, str]] = {}
@@ -258,7 +276,8 @@ class Yard:
             if found:
                 expected = sha
             last = self.store.last_deploy(slot.name)
-            facts[slot.name] = (image_sha(slot.live_image), expected, last.status if last else "")
+            build = "" if last is None else build_label(last.status, last.started, last.ended)
+            facts[slot.name] = (image_sha(slot.live_image), expected, build)
         return facts
 
     async def deploy_existing(self, slot: Slot) -> JsonValue:
