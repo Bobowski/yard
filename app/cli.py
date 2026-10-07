@@ -87,7 +87,7 @@ def main(argv: list[str] | None = None) -> None:
     if command == "exp":
         _exp(opt, rest)
     elif command == "login":
-        _login(rest)
+        _login(opt, rest)
     elif command == "repo":
         _repo(opt, rest)
     elif command == "slot":
@@ -159,22 +159,31 @@ def _load(opt: Opt) -> Client:
         url = opt.url
     if opt.token:
         token = opt.token
-    url = url.rstrip("/")
+    url = _http_url(url)
     if not url or not token:
         _die("run yard login, or set --url and --token")
     return Client(url, token)
 
 
-def _login(args: list[str]) -> None:
+def _http_url(url: str) -> str:
+    url = url.strip().rstrip("/")
+    if url and "://" not in url:
+        return "https://" + url
+    return url
+
+
+def _login(opt: Opt, args: list[str]) -> None:
     parser = argparse.ArgumentParser(prog="yard login")
     parser.add_argument("--url", default="")
     parser.add_argument("--token", default="")
     parsed = parser.parse_args(args)
-    if not parsed.url or not parsed.token:
+    url = _http_url(parsed.url or opt.url)
+    token = (parsed.token or opt.token).strip()
+    if not url or not token:
         _die("need --url and --token")
     path = config_path()
     path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-    path.write_text(json.dumps({"url": parsed.url, "token": parsed.token}, indent=2) + "\n")
+    path.write_text(json.dumps({"url": url, "token": token}, indent=2) + "\n")
     path.chmod(0o600)
     print(path)
 

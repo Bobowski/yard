@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from app.cli import judge_swap, parse_slot_sets, slot_patch, split_args
+from app.cli import judge_swap, main, parse_slot_sets, slot_patch, split_args
 from app.config import Config, hook_url
 from app.errors import YardError
 from app.machine import (
@@ -37,6 +37,16 @@ from app.rows import slot_rows
 from app.store import Slot, Store
 from app.text import slot_env
 from app.yard import Yard
+
+
+def test_login_keeps_url_and_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+    path = tmp_path / "config.json"
+    monkeypatch.setattr("app.cli.config_path", lambda: path)
+    main(["login", "--url", "yard.bobowski.dev", "--token", "secret"])
+    assert path.read_text() == '{\n  "url": "https://yard.bobowski.dev",\n  "token": "secret"\n}\n'
+    assert capsys.readouterr().out.strip() == str(path)
+    with pytest.raises(SystemExit):
+        main(["login"])
 
 
 def test_split_args_keeps_the_name_before_flags():

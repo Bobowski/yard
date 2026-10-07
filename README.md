@@ -31,7 +31,7 @@ Run the script on the VM as root. A second run repairs a partial install. A heal
 ./install.sh --domain yard.example.com
 ```
 
-The script installs `ghcr.io/bobowski/yard:latest`.
+The script installs `ghcr.io/bobowski/yard:latest`. A finished run has checked the health page, the container route, and the path to Let's Encrypt. With `--domain` it also checks the certificate and `https://<domain>/health`.
 
 The script prints an admin token. Log in from your computer:
 
