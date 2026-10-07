@@ -1,3 +1,4 @@
+import os
 import subprocess
 from pathlib import Path
 
@@ -386,9 +387,17 @@ async def test_container_inspect_rejects_a_bad_name(yard):
 
 def _commit_empty(directory: Path) -> str:
     tree = subprocess.check_output(["git", "-C", str(directory), "hash-object", "-t", "tree", "--stdin"], input=b"")
+    author = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Yard",
+        "GIT_AUTHOR_EMAIL": "yard@example.com",
+        "GIT_COMMITTER_NAME": "Yard",
+        "GIT_COMMITTER_EMAIL": "yard@example.com",
+    }
     commit = subprocess.check_output(
         ["git", "-C", str(directory), "commit-tree", tree.decode().strip(), "-m", "init"],
         text=True,
+        env=author,
     )
     sha = commit.strip()
     subprocess.check_call(["git", "-C", str(directory), "update-ref", "refs/heads/main", sha])
