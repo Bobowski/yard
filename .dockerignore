@@ -1,0 +1,12 @@
+.git
+.github
+.venv
+.hypothesis
+.pytest_cache
+.ruff_cache
+**/__pycache__
+**/*.py[cod]
+*.token
+yard-data
+.cursor
+tests

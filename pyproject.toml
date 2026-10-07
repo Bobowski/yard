@@ -1,0 +1,65 @@
+[project]
+name = "yard"
+version = "0.1.0"
+description = "Yard API and CLI. Slots, repos, and deploys."
+requires-python = ">=3.14"
+dependencies = [
+    "stario>=4,<5",
+    "uvloop>=0.21.0",
+]
+
+[project.scripts]
+yard = "app.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.8.6,<0.9.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = ["app"]
+module-root = ""
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.130",
+    "pyright>=1.1.403",
+    "pytest>=8.4.0",
+    "pytest-asyncio>=1.3.0",
+    "ruff>=0.12.8",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.pyright]
+pythonVersion = "3.14"
+typeCheckingMode = "standard"
+include = ["app", "tests"]
+exclude = ["**/.venv", "**/__pycache__", "**/node_modules"]
+reportMissingImports = true
+reportMissingModuleSource = false
+
+[tool.ruff]
+target-version = "py314"
+line-length = 120
+src = ["app", "tests"]
+exclude = [".venv", "__pycache__"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "tests"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
