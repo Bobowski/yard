@@ -46,7 +46,7 @@ def rel_dirs():
 
 def env_keys():
     return st.from_regex(r"[A-Z][A-Z0-9_]{1,12}", fullmatch=True).filter(
-        lambda key: key not in ORDER and not key.startswith(("SLOT_", "DEPLOY_"))
+        lambda key: key not in ORDER and not key.startswith("SLOT_")
     )
 
 
@@ -61,7 +61,6 @@ def words():
 def bad_repos():
     return st.one_of(
         st.just(""),
-        st.just("yard"),
         st.just("yard-sampler"),
         st.just("Heldso"),
         st.from_regex(r"[A-Z][A-Za-z0-9]{0,6}", fullmatch=True),

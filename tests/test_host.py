@@ -9,9 +9,11 @@ from pathlib import Path
 import pytest
 
 from app import package_version
+from app.apply import DEFAULT_COMPOSE, apply_compose, run_args
 from app.cli import (
     Client,
     as_json,
+    clone_git_args,
     format_deploys,
     format_exps,
     format_inspect,
@@ -19,7 +21,6 @@ from app.cli import (
     format_repos,
     format_slot_table,
     format_tokens,
-    judge_swap,
     main,
     parse_slot_sets,
     slot_hint,
@@ -31,13 +32,15 @@ from app.errors import YardError
 from app.machine import (
     JOB_RETRY,
     Paths,
+    Result,
     RunState,
+    _apply_env,
+    _revert_after_start,
     caddy_document,
-    caddy_run_args,
-    containerfile,
     image_tag,
     job_due,
     plan_job,
+    prepare_checkout,
     routes_from,
     yard_route,
 )
@@ -45,7 +48,7 @@ from app.podman import (
     Podman,
     ids_for_slot,
     inspect_args,
-    latest_for_slot,
+    log_hit,
     page_log_rows,
     page_logs,
     parse_info,
@@ -56,9 +59,9 @@ from app.podman import (
     stats_args,
 )
 from app.rows import SlotRow, build_label, dir_size, slot_label, slot_rows, total_row
-from app.store import Slot, Store
-from app.text import slot_env
-from app.yard import _SWAP, Yard
+from app.store import Slot, Store, check_origin, origin_name
+from app.text import parse_env
+from app.yard import Yard, job_states, run_cmd, track_origin
 
 
 def test_version_prints_the_package_version(capsys: pytest.CaptureFixture[str]):
@@ -75,8 +78,42 @@ def test_help_is_a_short_list(capsys: pytest.CaptureFixture[str]):
     out = capsys.readouterr().out
     assert f"yard {package_version()}" in out
     assert "git push -u yard main" in out
+    assert "yard clone <repo>" in out
+    assert "yard git <repo> fetch" in out
+    assert "Clone one branch from the host" in out
     assert "Save the host and the token" in out
     assert "yard <command> --help" in out
+
+
+def test_repo_help_leaves_git_at_the_top(capsys: pytest.CaptureFixture[str]):
+    with pytest.raises(SystemExit) as caught:
+        main(["repo"])
+    assert caught.value.code == 0
+    out = capsys.readouterr().out
+    assert "fetch <name>" not in out
+    assert "git <name> <command>" not in out
+    assert "pull" not in out
+    assert "clone <repo>" not in out
+    with pytest.raises(SystemExit) as caught:
+        main(["git"])
+    assert caught.value.code == 0
+    git_help = capsys.readouterr().out
+    assert "yard git <name> <command>" in git_help
+    assert "fetch" in git_help
+
+
+def test_clone_is_shallow_until_a_flag_asks_for_more():
+    assert clone_git_args(full=False, lazy=False) == ["clone", "--depth", "1", "--single-branch"]
+    assert "--filter=blob:none" not in clone_git_args(full=False, lazy=False)
+    assert clone_git_args(full=False, lazy=True) == [
+        "clone",
+        "--depth",
+        "1",
+        "--single-branch",
+        "--filter=blob:none",
+    ]
+    assert clone_git_args(full=True, lazy=False) == ["clone"]
+    assert clone_git_args(full=True, lazy=True) == ["clone", "--filter=blob:none"]
 
 
 def test_help_flag_lists_the_commands(capsys: pytest.CaptureFixture[str]):
@@ -92,7 +129,7 @@ def test_unknown_command_exits(capsys: pytest.CaptureFixture[str]):
     with pytest.raises(SystemExit) as caught:
         main(["nope"])
     assert caught.value.code == 2
-    assert "Show, log, and edit apps" in capsys.readouterr().err
+    assert "Show and edit apps" in capsys.readouterr().err
 
 
 def test_a_missing_verb_lists_the_verbs(capsys: pytest.CaptureFixture[str]):
@@ -100,27 +137,33 @@ def test_a_missing_verb_lists_the_verbs(capsys: pytest.CaptureFixture[str]):
         main(["slot"])
     assert caught.value.code == 0
     out = capsys.readouterr().out
-    assert "logs <name>" in out
-    assert "Read the container log" in out
-    assert "deploys <name>" in out
+    assert "logs" not in out
+    assert "deploys <name>" not in out
+    assert "show <name>" in out
 
 
 def test_half_a_command_prints_its_flags(capsys: pytest.CaptureFixture[str]):
     with pytest.raises(SystemExit) as caught:
-        main(["slot", "logs"])
+        main(["deploys"])
     assert caught.value.code == 2
     err = capsys.readouterr().err
-    assert "yard slot logs <name>" in err
+    assert "yard deploys <name>" in err
+    with pytest.raises(SystemExit) as caught:
+        main(["podman", "logs"])
+    assert caught.value.code == 2
+    err = capsys.readouterr().err
+    assert "yard podman logs <container>" in err
     assert "--follow" in err
-    assert "Keep reading" in err
 
 
 def test_help_flag_on_a_command(capsys: pytest.CaptureFixture[str]):
     with pytest.raises(SystemExit) as caught:
-        main(["help", "slot", "logs"])
+        main(["help", "logs"])
     assert caught.value.code == 0
     out = capsys.readouterr().out
-    assert "yard slot logs <name>" in out
+    assert "yard logs" in out
+    assert "--slot <name>" in out
+    assert "--role <name>" in out
     assert "--tail <n>" in out
 
 
@@ -128,12 +171,6 @@ def test_records_stay_short():
     secret = format_record('{"name":"ci","token":"yard-secret","parent":"admin"}')
     assert secret == "ci\nyard-secret\n"
     assert "parent" not in secret
-    settings = format_record(
-        '{"domain":"yard.example.com","email":"","self_repo":"","self_ref":"main","self_image":""}'
-    )
-    assert "yard.example.com" in settings
-    assert "ghcr.io/bobowski/yard:latest" in settings
-    assert "self_repo" not in settings
     assert format_record('{"name":"heldso","created":"t"}') == "heldso\n"
 
 
@@ -154,6 +191,14 @@ def test_deploy_list_drops_the_repeated_columns():
         ]
     )
     assert text.splitlines()[0].split() == ["id", "status", "rev", "took", "when"]
+    built = (datetime.now(UTC) - timedelta(hours=3) + timedelta(seconds=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    split = format_deploys(
+        [{"id": 4, "status": "ok", "sha": "dfa7dd027e8bd735", "started": started, "built": built, "ended": ended}]
+    )
+    header = split.splitlines()[0].split()
+    assert header == ["id", "status", "rev", "build", "start", "took", "when"]
+    assert "15s" in split
+    assert "4s" in split
     assert "dfa7dd0" in text
     assert "dfa7dd027e8b" not in text
     assert "honorata" not in text
@@ -321,7 +366,22 @@ def test_color_marks_only_a_slot_that_needs_attention():
                 }
             ]
         )
-        == "yard slot logs shop"
+        == "yard logs --slot shop"
+    )
+    assert (
+        slot_hint(
+            [
+                {
+                    "slot": "shop",
+                    "container": "shop",
+                    "state": "running",
+                    "status": "Up 2 hours",
+                    "health": "healthy",
+                    "build": "failed 19s",
+                }
+            ]
+        )
+        == "yard deploys shop"
     )
     assert slot_hint([{"slot": "honorata", "container": "honorata", "state": "running", "status": "Up 1 minute"}]) == ""
 
@@ -331,7 +391,7 @@ def test_login_keeps_url_and_token(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr("app.cli.config_path", lambda: path)
     main(["login", "--url", "yard.bobowski.dev", "--token", "secret"])
     assert path.read_text() == '{\n  "url": "https://yard.bobowski.dev",\n  "token": "secret"\n}\n'
-    assert capsys.readouterr().out.strip() == "https://yard.bobowski.dev\n" + str(path)
+    assert capsys.readouterr().out == f"logged in\nhost    https://yard.bobowski.dev\nsaved   {path}\n"
     with pytest.raises(SystemExit):
         main(["login"])
 
@@ -376,14 +436,16 @@ def test_init_creates_the_repo_and_slot(
     main(["--text", "init", "--domain", "heldso.example.com"])
     text = capsys.readouterr().out
     assert "repo    heldso" in text
-    assert "remote  https://yard.example.com/git/heldso.git" in text
-    assert "commit, then" in text
+    assert "url     https://yard.example.com/git/heldso.git" in text
+    assert "ref     main" in text
+    assert "The slot follows main." in text
+    assert "Commit first." in text
     assert "git push -u yard main" in text
     assert calls[0][0:2] == ("POST", "/api/v1/repos")
     assert calls[1] == (
         "POST",
         "/api/v1/slots",
-        {"SLOT_NAME": "heldso", "SLOT_REPO": "heldso", "SLOT_BRANCH": "main", "SLOT_DOMAIN": "heldso.example.com"},
+        {"SLOT_NAME": "heldso", "SLOT_REPO": "heldso", "REF": "main", "DOMAIN": "heldso.example.com"},
     )
     assert not any("push" in cmd for cmd in seen)
     assert (root / ".git").exists()
@@ -419,7 +481,7 @@ def test_init_keeps_an_existing_repo(
     assert calls[1] == (
         "POST",
         "/api/v1/slots",
-        {"SLOT_NAME": "heldso", "SLOT_REPO": "heldso", "SLOT_BRANCH": "main", "SLOT_INTERVAL": "5m"},
+        {"SLOT_NAME": "heldso", "SLOT_REPO": "heldso", "REF": "main", "SLOT_INTERVAL": "5m"},
     )
     assert not any(cmd[0] == "git" and "init" in cmd for cmd in seen)
     assert not (root / "app" / ".git").exists()
@@ -443,11 +505,124 @@ def test_init_can_split_the_repo_and_the_slot(
     assert calls[1][2] == {
         "SLOT_NAME": "heldso",
         "SLOT_REPO": "heldso-docs",
-        "SLOT_BRANCH": "main",
-        "SLOT_DOMAIN": "heldso.example.com",
+        "REF": "main",
+        "DOMAIN": "heldso.example.com",
     }
     remote = subprocess.run(["git", "remote", "get-url", "yard"], cwd=root, capture_output=True, text=True, check=True)
     assert remote.stdout.strip() == "https://yard.example.com/git/heldso-docs.git"
+
+
+def test_init_from_a_github_address(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    root = tmp_path / "empty"
+    root.mkdir()
+    monkeypatch.chdir(root)
+    calls, fake = _init_api(repo_body='{"name":"heldso","created":"t","ref":"main"}')
+    monkeypatch.setattr("app.cli._load", lambda _opt: Client("https://yard.example.com", "secret"))
+    monkeypatch.setattr("app.cli._api_try", fake)
+    main(
+        [
+            "--text",
+            "init",
+            "--remote",
+            "https://user:secret@github.com/Org/Heldso.git",
+            "--domain",
+            "heldso.example.com",
+        ]
+    )
+    text = capsys.readouterr().out
+    assert "repo    heldso" in text
+    assert "url     https://yard.example.com/git/heldso.git" in text
+    assert "remote  origin https://github.com/Org/Heldso.git" in text
+    assert "secret" not in text
+    assert "ref     origin/main" in text
+    assert "The slot follows origin/main." in text
+    assert "git push" not in text
+    assert calls[0][2] == {
+        "name": "heldso",
+        "force": False,
+        "origin": "https://user:secret@github.com/Org/Heldso.git",
+    }
+    assert calls[1][2]["REF"] == "origin/main"
+    assert not (root / ".git").exists()
+
+
+def test_init_from_uses_the_requested_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    root = tmp_path / "empty"
+    root.mkdir()
+    monkeypatch.chdir(root)
+    calls, fake = _init_api(repo_body='{"name":"heldso","created":"t","ref":"main"}')
+    monkeypatch.setattr("app.cli._load", lambda _opt: Client("https://yard.example.com", "secret"))
+    monkeypatch.setattr("app.cli._api_try", fake)
+    main(["init", "--remote", "https://github.com/org/heldso", "--every", "5m", "--ref", "feature"])
+    body = json.loads(capsys.readouterr().out)
+    assert body["ref"] == "origin/feature"
+    assert calls[1][2]["REF"] == "origin/feature"
+    assert not (root / ".git").exists()
+
+
+def test_origin_name_comes_from_the_address():
+    assert origin_name("https://github.com/Org/Heldso.git") == "heldso"
+    with pytest.raises(YardError) as caught:
+        check_origin("git@github.com:org/heldso.git")
+    assert caught.value.code == "bad_origin"
+
+
+def test_track_origin_fetches_the_remote_branch(tmp_path: Path):
+    source = tmp_path / "src"
+    source.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(source)], check=True, capture_output=True)
+    (source / "README").write_text("hi\n")
+    subprocess.run(["git", "-C", str(source), "add", "README"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(source), "-c", "user.email=test@example.com", "-c", "user.name=test", "commit", "-m", "init"],
+        check=True,
+        capture_output=True,
+    )
+    bare = tmp_path / "heldso.git"
+    subprocess.run(["git", "init", "--bare", "--initial-branch=main", str(bare)], check=True, capture_output=True)
+
+    async def check() -> tuple[str, str]:
+        ref = await track_origin(bare, str(source))
+        sha = subprocess.run(
+            ["git", "-C", str(bare), "rev-parse", "refs/remotes/origin/main"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return ref, sha.stdout.strip()
+
+    ref, sha = asyncio.run(check())
+    assert ref == "main"
+    assert len(sha) == 40
+
+
+def test_create_repo_rejects_a_bad_origin(tmp_path: Path):
+    store = Store.open(tmp_path / "data")
+    yard = Yard(
+        Config(
+            root=tmp_path,
+            caddy_sock=None,
+            podman_sock="",
+            podman_bin="podman",
+            hook_url="http://127.0.0.1:8000",
+            domain="",
+            skip_deploy=True,
+            boot=False,
+            remote=False,
+        ),
+        store,
+    )
+    try:
+        with pytest.raises(YardError) as caught:
+            asyncio.run(yard.create_repo("heldso", False, "git@github.com:org/heldso.git"))
+        assert caught.value.code == "bad_origin"
+        assert not (tmp_path / "repos" / "heldso.git").exists()
+    finally:
+        store.close()
 
 
 def test_init_needs_a_domain_or_an_interval(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -481,31 +656,20 @@ def test_split_args_keeps_the_name_before_flags():
 
 
 def test_parse_slot_sets():
-    sets = parse_slot_sets(["--set", "SLOT_DOMAIN", "heldso.com", "--set", "API_TOKEN=secret", "--set", "OLD="])
-    assert sets == [("SLOT_DOMAIN", "heldso.com"), ("API_TOKEN", "secret"), ("OLD", "")]
+    sets = parse_slot_sets(["--set", "DOMAIN", "heldso.com", "--set", "API_TOKEN=secret", "--set", "OLD="])
+    assert sets == [("DOMAIN", "heldso.com"), ("API_TOKEN", "secret"), ("OLD", "")]
     with pytest.raises(ValueError):
         parse_slot_sets(["--domain", "heldso.com"])
 
 
 def test_slot_patch_removes_empty():
     patch = slot_patch(
-        {"SLOT_DOMAIN": "heldso.com", "API_TOKEN": "secret"},
+        {"DOMAIN": "heldso.com", "API_TOKEN": "secret"},
         {"API_TOKEN": "secret", "PORT": "9000"},
     )
-    assert patch["SLOT_DOMAIN"] == ""
+    assert patch["DOMAIN"] == ""
     assert patch["PORT"] == "9000"
     assert "API_TOKEN" not in patch
-
-
-def test_judge_swap():
-    done, ok, _message = judge_swap("ready", True)
-    assert done and ok
-    done, _ok, _message = judge_swap("ready", False)
-    assert not done
-    done, ok, message = judge_swap("rolled_back", True)
-    assert done and not ok and message
-    done, _ok, _message = judge_swap("swapping", False)
-    assert not done
 
 
 def test_hook_url_uses_localhost_for_every_interface():
@@ -537,27 +701,31 @@ def test_page_log_rows_honors_the_window():
     assert nxt == "2026-10-05T12:00:01Z"
 
 
-def test_update_pulls_the_registry_image(tmp_path: Path):
-    log = tmp_path / "podman.log"
-    binary = tmp_path / "podman"
-    binary.write_text(
-        "#!/bin/sh\n"
-        f"printf '%s\\n' \"$*\" >> {log}\n"
-        'case "$*" in\n'
-        "  inspect*) printf '%s\\n' sha256:previous ;;\n"
-        "esac\n"
-        "exit 0\n"
+def test_a_fetch_ref_deploys_the_origin_slot(tmp_path: Path):
+    source = tmp_path / "src"
+    source.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(source)], check=True, capture_output=True)
+    (source / "README").write_text("hi\n")
+    subprocess.run(["git", "-C", str(source), "add", "README"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(source), "-c", "user.email=test@example.com", "-c", "user.name=test", "commit", "-m", "init"],
+        check=True,
+        capture_output=True,
     )
-    binary.chmod(0o755)
+    repo = tmp_path / "repos" / "heldso.git"
+    repo.parent.mkdir()
+    subprocess.run(["git", "init", "--bare", str(repo)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(source)], check=True, capture_output=True)
     store = Store.open(tmp_path / "data")
-    store.set_meta("self_image", "ghcr.io/bobowski/yard:latest")
+    store.create_repo("heldso")
+    store.create_slot("heldso", "heldso", "origin/main", "", "", "")
+    store.create_slot("local", "heldso", "main", "", "", "")
     yard = Yard(
         Config(
             root=tmp_path,
             caddy_sock=None,
             podman_sock="",
-            podman_bin=str(binary),
-            public_port=8000,
+            podman_bin="podman",
             hook_url="http://127.0.0.1:8000",
             domain="",
             skip_deploy=True,
@@ -566,252 +734,581 @@ def test_update_pulls_the_registry_image(tmp_path: Path):
         ),
         store,
     )
-
-    async def check() -> None:
-        body = await yard.update_yard()
-        assert isinstance(body, dict)
-        assert body["image"] == "ghcr.io/bobowski/yard:latest"
-        assert body["status"] == "swapping"
-        assert body["log"] == "pull ghcr.io/bobowski/yard:latest"
-        text = log.read_text()
-        assert text.splitlines()[0].startswith("inspect ")
-        assert text.index("tag sha256:previous localhost/yard:previous") < text.index(
-            "pull ghcr.io/bobowski/yard:latest"
+    try:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "fetch",
+                "--depth",
+                "1",
+                "origin",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+            check=True,
+            capture_output=True,
         )
-        assert "stop -t 10 yard" in text
-        assert store.meta("swap_status") == "swapping"
-        assert store.meta("swap_id")
-
-    try:
-        asyncio.run(check())
+        sha = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "refs/remotes/origin/main"],
+            text=True,
+        ).strip()
+        status, text = asyncio.run(yard.hook_push("heldso", sha, "refs/remotes/origin/main"))
+        assert status == 200
+        assert "slot heldso: deploy skipped" in text
+        assert "local" not in text
+        status, skipped = asyncio.run(yard.hook_push("heldso", sha, "refs/tags/v1"))
+        assert status == 200
+        assert skipped.startswith("skip ")
+        deploy_id = store.begin_deploy("heldso", sha)
+        store.finish_deploy(deploy_id, "ok")
+        status, current = asyncio.run(yard.hook_push("heldso", sha, "refs/remotes/origin/main"))
+        assert status == 200
+        assert "slot heldso: current" in current
     finally:
         store.close()
 
 
-def test_update_stops_when_the_running_image_cannot_be_saved(tmp_path: Path):
-    log = tmp_path / "podman.log"
-    binary = tmp_path / "podman"
-    binary.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexit 1\n")
-    binary.chmod(0o755)
-    store = Store.open(tmp_path / "data")
-    yard = Yard(
+def _yard(tmp_path: Path, store: Store, domain: str) -> Yard:
+    return Yard(
         Config(
             root=tmp_path,
             caddy_sock=None,
             podman_sock="",
-            podman_bin=str(binary),
-            public_port=8000,
+            podman_bin="podman",
             hook_url="http://127.0.0.1:8000",
-            domain="",
+            domain=domain,
             skip_deploy=True,
             boot=False,
             remote=False,
         ),
         store,
     )
+
+
+def test_boot_records_the_yard_slot(tmp_path: Path):
+    store = Store.open(tmp_path / "data")
+    yard = _yard(tmp_path, store, "yard.example.com")
     try:
+        yard._ensure_host_slot()
+        with pytest.raises(YardError):
+            store.slot("yard")
+        (tmp_path / "repos" / "yard.git").mkdir(parents=True)
+        yard._ensure_host_slot()
+        slot = store.slot("yard")
+        assert slot.repo == "yard"
+        assert slot.ref == "origin/main"
+        assert slot.domain == "yard.example.com"
+        assert store.last_deploy("yard") is None
+        yard._ensure_host_slot()
+        assert store.slot("yard").domain == "yard.example.com"
+    finally:
+        store.close()
+
+
+def test_a_yard_upgrade_keeps_the_host_env(tmp_path: Path):
+    paths = Paths(tmp_path)
+    env_path = paths.run_dir("yard") / "compose.env"
+    env_path.parent.mkdir(parents=True)
+    env_path.write_text(
+        "YARD_PODMAN_SOCK=/run/user/1/podman/podman.sock\n"
+        "YARD_PUBLIC_PORT=8000\n"
+        "YARD_CADDY_SOCK=/srv/yard/run/caddy.sock\n"
+        "YARD_BOOT=1\n"
+        "YARD_DOMAIN=yard.example.com\n"
+        "CONTAINER_HOST=unix:///run/user/1/podman/podman.sock\n"
+        "PROXY_PORT=8443\n"
+        "IMAGE=localhost/yard:old\n"
+    )
+    checkout = tmp_path / "checkout"
+    (checkout / "ops").mkdir(parents=True)
+    (checkout / "ops" / "compose.yml").write_text("services: {}\n")
+    slot = Slot("yard", "yard", "origin/main", "", "yard.example.com", "localhost/yard:old", "", {}, "")
+    compose, written = _apply_env(paths, slot, checkout, "localhost/yard:new", "newsha")
+    env = parse_env(written.read_text())
+    assert compose == checkout / "ops" / "compose.yml"
+    assert env["IMAGE"] == "localhost/yard:new"
+    assert env["PREVIOUS"] == "localhost/yard:old"
+    assert env["CHECKOUT"] == str(checkout)
+    assert env["YARD_PODMAN_SOCK"] == "/run/user/1/podman/podman.sock"
+    assert env["YARD_DOMAIN"] == "yard.example.com"
+    assert env["CONTAINER_HOST"] == "unix:///run/user/1/podman/podman.sock"
+    assert env["YARD_CADDY_SOCK"] == "/srv/yard/run/caddy.sock"
+    assert env["YARD_PUBLIC_PORT"] == "8000"
+    assert env["YARD_BOOT"] == "1"
+    assert env["PROXY_PORT"] == "8443"
+    app_env = parse_env((written.parent / "app.env").read_text())
+    assert "CONTAINER_HOST" not in app_env
+    assert "YARD_DOMAIN" not in app_env
+
+
+def test_the_new_yard_process_claims_its_upgrade(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SHA", "abc")
+    monkeypatch.setenv("IMAGE", "localhost/yard:abc")
+    store = Store.open(tmp_path / "data")
+    yard = _yard(tmp_path, store, "yard.example.com")
+    try:
+        (tmp_path / "repos" / "yard.git").mkdir(parents=True)
+        yard._ensure_host_slot()
+        deploy_id = store.begin_deploy("yard", "abc")
+        yard._claim_yard_deploy()
+        store.interrupt_deploys()
+        last = store.last_deploy("yard")
+        assert last is not None
+        assert last.id == deploy_id
+        assert last.status == "ok"
+        assert last.sha == "abc"
+        assert store.slot("yard").live_image == "localhost/yard:abc"
+    finally:
+        store.close()
+
+
+def test_the_first_boot_records_the_installed_revision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SHA", "abc")
+    monkeypatch.setenv("IMAGE", "localhost/yard:abc")
+    store = Store.open(tmp_path / "data")
+    yard = _yard(tmp_path, store, "yard.example.com")
+    try:
+        (tmp_path / "repos" / "yard.git").mkdir(parents=True)
+        yard._ensure_host_slot()
+        assert store.last_deploy("yard") is None
+        yard._claim_yard_deploy()
+        last = store.last_deploy("yard")
+        assert last is not None
+        assert last.status == "ok"
+        assert last.sha == "abc"
+        assert store.slot("yard").live_image == "localhost/yard:abc"
+    finally:
+        store.close()
+
+
+def test_a_yard_upgrade_stays_running_until_the_new_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    store = Store.open(tmp_path / "data")
+    yard = _yard(tmp_path, store, "yard.example.com")
+
+    async def fake_deploy(*_args, **_kwargs):
+        return Result("localhost/yard:abc", "started\n", pending=True)
+
+    monkeypatch.setattr("app.yard.deploy_slot", fake_deploy)
+    try:
+        (tmp_path / "repos" / "yard.git").mkdir(parents=True)
+        yard._ensure_host_slot()
+        out = asyncio.run(yard.deploy_once("yard", "abc"))
+        assert out.error == ""
+        assert "upgrading localhost/yard:abc" in out.text
+        last = store.last_deploy("yard")
+        assert last is not None
+        assert last.status == "running"
+        assert last.sha == "abc"
+        assert store.slot("yard").live_image == ""
+    finally:
+        store.close()
+
+
+def test_repo_git_reads_and_a_deleted_branch_drops_the_slot(tmp_path: Path):
+    store = Store.open(tmp_path / "data")
+    yard = _yard(tmp_path, store, "")
+    try:
+        asyncio.run(yard.create_repo("heldso", False, ""))
+        bare = tmp_path / "repos" / "heldso.git"
+        allow = subprocess.check_output(
+            ["git", "-C", str(bare), "config", "--get", "uploadpack.allowFilter"],
+            text=True,
+        )
+        assert allow.strip() == "true"
+        tree = subprocess.check_output(["git", "-C", str(bare), "hash-object", "-t", "tree", "--stdin"], input=b"")
+        commit = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(bare),
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=test",
+                "commit-tree",
+                tree.decode().strip(),
+                "-m",
+                "init",
+            ],
+            text=True,
+        )
+        sha = commit.strip()
+        subprocess.check_call(["git", "-C", str(bare), "update-ref", "refs/heads/main", sha])
+        store.create_slot("heldso", "heldso", "main", "", "", "")
+        body = asyncio.run(yard.git_repo("heldso", ["log", "-1", "--oneline"]))
+        assert sha[:7] in str(body["output"])
         with pytest.raises(YardError) as caught:
-            asyncio.run(yard.update_yard())
-        assert caught.value.code == "swap_failed"
-        assert store.meta("swap_status") == "failed"
-        assert "pull " not in log.read_text()
+            asyncio.run(yard.git_repo("heldso", ["fetch"]))
+        assert caught.value.code == "git_failed"
+        gone = asyncio.run(yard.git_repo("heldso", ["branch", "-D", "main"]))
+        assert "slot heldso removed" in str(gone["output"])
+        with pytest.raises(YardError):
+            store.slot("heldso")
     finally:
         store.close()
 
 
-def test_swap_boot_ignores_the_registry_tag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    config = Config(
-        root=tmp_path,
-        caddy_sock=None,
-        podman_sock="",
-        podman_bin="podman",
-        public_port=8000,
-        hook_url="http://127.0.0.1:8000",
-        domain="",
-        skip_deploy=True,
-        boot=False,
-        remote=False,
-    )
-    store = Store.open(config.data_dir)
-    yard = Yard(config, store)
-    store.set_meta("swap_status", "swapping")
-    store.set_meta("swap_id", "abc")
-    store.set_meta("swap_image", "ghcr.io/bobowski/yard:latest")
-    monkeypatch.setenv("YARD_IMAGE", "ghcr.io/bobowski/yard:latest")
-    monkeypatch.delenv("YARD_SWAP_ACK", raising=False)
-    monkeypatch.delenv("YARD_SWAP_ID", raising=False)
-    try:
-        yard._note_swap_boot()
-        assert store.meta("swap_status") == "swapping"
-        monkeypatch.setenv("YARD_SWAP_ACK", "1")
-        monkeypatch.setenv("YARD_SWAP_ID", "other")
-        yard._note_swap_boot()
-        assert store.meta("swap_status") == "swapping"
-        monkeypatch.setenv("YARD_SWAP_ID", "abc")
-        yard._note_swap_boot()
-        assert store.meta("swap_status") == "ready"
-    finally:
-        store.close()
-
-
-def test_swap_boot_reads_a_matching_restore_result(tmp_path: Path):
-    config = Config(
-        root=tmp_path,
-        caddy_sock=None,
-        podman_sock="",
-        podman_bin="podman",
-        public_port=8000,
-        hook_url="http://127.0.0.1:8000",
-        domain="",
-        skip_deploy=True,
-        boot=False,
-        remote=False,
-    )
-    store = Store.open(config.data_dir)
-    yard = Yard(config, store)
-    store.set_meta("swap_status", "swapping")
-    store.set_meta("swap_id", "abc")
-    result = config.data_dir / "swap.result"
-    try:
-        result.write_text("rolled_back nope\n")
-        yard._note_swap_boot()
-        assert store.meta("swap_status") == "swapping"
-        assert not result.exists()
-        result.write_text("rolled_back abc\n")
-        yard._note_swap_boot()
-        assert store.meta("swap_status") == "rolled_back"
-        assert not result.exists()
-    finally:
-        store.close()
-
-
-_FAKE_PODMAN = """#!/usr/bin/env python3
+_FAKE_COMPOSE = """#!/usr/bin/env python3
 import os
 import sys
 
-log = os.environ["PODMAN_LOG"]
+log = os.environ["COMPOSE_LOG"]
 args = sys.argv[1:]
 line = " ".join(args)
 with open(log, "a") as handle:
     handle.write(line + "\\n")
-mode = os.environ.get("PODMAN_MODE", "unhealthy")
-if "exec" in args and "yard-next" in args:
-    raise SystemExit(0 if mode in {"published-fails", "ready"} else 1)
-if "exec" in args:
-    raise SystemExit(0 if mode == "ready" else 1)
-if "--name" in args:
-    name = args[args.index("--name") + 1]
-    if name == "yard-next" and mode == "next-fails":
+if "config" in args and "--services" in args:
+    text = os.environ.get("COMPOSE_SERVICES", "")
+    if text and not text.endswith("\\n"):
+        text += "\\n"
+    sys.stdout.write(text)
+    raise SystemExit(0)
+if "config" in args:
+    sys.stdout.write(os.environ.get("COMPOSE_CONFIG", ""))
+    raise SystemExit(0)
+mode = os.environ.get("COMPOSE_MODE", "ok")
+count_path = os.environ.get("COMPOSE_COUNT", "")
+if "build" in args and "up" not in args and mode == "build-fails":
+    raise SystemExit(1)
+if "up" in args and mode == "start-fails":
+    count = 0
+    if count_path and os.path.exists(count_path):
+        count = int(open(count_path).read() or "0")
+    if count_path:
+        open(count_path, "w").write(str(count + 1))
+    if count == 0:
         raise SystemExit(1)
-    if name == "yard" and mode == "published-fails":
-        raise SystemExit(1)
-if args[:3] == ["--remote", "container", "exists"]:
-    body = open(log).read()
-    raise SystemExit(0 if "rename yard yard-old" in body else 1)
-if "inspect" in args and os.environ.get("PODMAN_STATUS"):
-    print(os.environ["PODMAN_STATUS"])
 raise SystemExit(0)
 """
 
 
-def _run_swap(tmp_path: Path, mode: str, status: str = "") -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+def _run_up(
+    tmp_path: Path,
+    mode: str,
+    command: str = "up",
+    extra: str = "",
+    config: str = "",
+    shared: bool = False,
+    text: str = "",
+    shell: dict[str, str] | None = None,
+) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    podman_log = tmp_path / "podman.log"
-    fake = bin_dir / "podman"
-    fake.write_text(_FAKE_PODMAN)
+    compose_log = tmp_path / "compose.log"
+    fake = bin_dir / "docker-compose"
+    fake.write_text(_FAKE_COMPOSE)
     fake.chmod(0o755)
     root = tmp_path / "root"
-    (root / "data" / "yard").mkdir(parents=True)
+    data = root / "data" / "yard"
+    data.mkdir(parents=True)
+    envfile = data / "compose.env"
+    envfile.write_text(text or ("IMAGE=localhost/yard:new\nPREVIOUS=localhost/yard:old\n" + extra))
+    compose = tmp_path / "compose.yml"
+    compose.write_text("services: {}\n")
+    script = Path(__file__).resolve().parents[1] / "ops" / "apply" / "apply.sh"
     env = os.environ.copy()
     env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
-    env["PODMAN_LOG"] = str(podman_log)
-    env["PODMAN_MODE"] = mode
-    if status:
-        env["PODMAN_STATUS"] = status
-    env["YARD_IMAGE"] = "ghcr.io/bobowski/yard:latest"
-    env["YARD_ROOT"] = str(root)
-    env["YARD_PODMAN_SOCK"] = "/sock"
-    env["YARD_CADDY_SOCK"] = "/caddy.sock"
-    env["YARD_PUBLIC_PORT"] = "8000"
-    env["YARD_DOMAIN"] = "yard.example"
-    env["YARD_SELF_IMAGE"] = "ghcr.io/bobowski/yard:latest"
-    env["YARD_SWAP_ID"] = "abc"
-    env["YARD_SWAP_WAIT"] = "2"
-    env["YARD_SWAP_TRIES"] = "1"
-    env["YARD_SWAP_DELAY"] = "0"
-    done = subprocess.run(["sh", "-c", _SWAP], env=env, capture_output=True, text=True)
-    return done, podman_log, root
+    env["COMPOSE_LOG"] = str(compose_log)
+    env["COMPOSE_COUNT"] = str(tmp_path / "count")
+    env["COMPOSE_MODE"] = mode
+    env["DOCKER_HOST"] = "unix:///sock"
+    env["COMPOSE_PROJECT_NAME"] = "yard"
+    env["COMPOSE_FILE"] = str(compose)
+    env["COMPOSE_ENV_FILE"] = str(envfile)
+    env["COMPOSE_SERVICES"] = "app\ncaddy"
+    env["COMPOSE_CONFIG"] = config
+    env["YARD_SLOT"] = "heldso"
+    env["YARD_SHA"] = "abc123"
+    if shared:
+        env["YARD_DEFAULT_COMPOSE"] = "1"
+    if shell:
+        env.update(shell)
+    for line in (text or extra).splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key == "DATA_DIR":
+            env["DATA_DIR"] = value
+    env["SERVICE"] = "app"
+    done = subprocess.run([str(script), command], env=env, capture_output=True, text=True)
+    return done, compose_log, envfile
 
 
-def test_swap_script_parses():
-    subprocess.run(["sh", "-n", "-c", _SWAP], check=True)
-    assert "sleep 2" not in _SWAP
-
-
-def test_swap_script_keeps_the_stopped_container_when_the_new_image_exits(tmp_path: Path):
-    done, log, root = _run_swap(tmp_path, "unhealthy", "exited")
+def test_up_leaves_the_env_file_when_the_build_fails(tmp_path: Path):
+    done, log, envfile = _run_up(tmp_path, "build-fails")
     assert done.returncode == 1, done.stderr
-    lines = log.read_text().splitlines()
-    assert "--remote stop -t 10 yard" in lines
-    assert "--remote start yard" in lines
-    assert "--remote rm -f yard" not in lines
-    assert "--remote rename yard yard-old" not in lines
-    assert (root / "data" / "yard" / "swap.result").read_text() == "rolled_back abc\n"
+    assert "build" in log.read_text()
+    assert " up " not in f" {log.read_text()} "
+    assert "IMAGE=localhost/yard:new" in envfile.read_text()
 
 
-def test_swap_script_restores_when_the_new_container_does_not_start(tmp_path: Path):
-    done, log, _root = _run_swap(tmp_path, "next-fails")
+def test_up_stops_when_the_start_fails(tmp_path: Path):
+    done, log, envfile = _run_up(tmp_path, "start-fails")
     assert done.returncode == 1, done.stderr
-    lines = log.read_text().splitlines()
-    assert "--remote rm -f yard" not in lines
-    assert "--remote start yard" in lines
+    text = log.read_text()
+    assert text.index(" build") < text.index(" up ")
+    assert text.count(" up ") == 1
+    assert done.stdout.startswith("built ")
+    assert "revert " not in done.stdout
+    assert "IMAGE=localhost/yard:new" in envfile.read_text()
 
 
-def test_swap_script_restores_the_renamed_container_when_publish_fails(tmp_path: Path):
-    done, log, root = _run_swap(tmp_path, "published-fails")
-    assert done.returncode == 1, done.stderr
-    lines = log.read_text().splitlines()
-    assert lines.index("--remote rename yard yard-old") < lines.index("--remote rm -f yard")
-    assert "--remote start yard" in lines
-    assert (root / "data" / "yard" / "swap.result").read_text() == "rolled_back abc\n"
+def test_revert_starts_the_previous_image(tmp_path: Path):
+    done, log, envfile = _run_up(
+        tmp_path,
+        "ok",
+        "revert",
+        text="IMAGE=localhost/yard:old\nSHA=old\nPREVIOUS=localhost/yard:old\n",
+        shell={"IMAGE": "localhost/yard:old"},
+    )
+    assert done.returncode == 0, done.stderr + done.stdout
+    assert done.stdout == "revert localhost/yard:old\n"
+    assert log.read_text().count(" up ") == 1
+    assert "IMAGE=localhost/yard:old" in envfile.read_text()
+    assert "SHA=old" in envfile.read_text()
+    labels = (envfile.parent / "labels.yml").read_text()
+    assert 'yard.role: "app"' in labels
+    assert 'yard.sha: "abc123"' in labels
 
 
-def test_swap_script_removes_the_old_container_only_after_health(tmp_path: Path):
-    done, log, root = _run_swap(tmp_path, "ready")
+def test_up_starts_the_new_image_after_the_build(tmp_path: Path):
+    done, log, envfile = _run_up(tmp_path, "ok")
     assert done.returncode == 0, done.stderr + done.stdout
     text = log.read_text()
-    assert text.index("--remote rename yard yard-old") < text.index("--name yard --network")
-    assert text.index("--name yard --network") < text.index("--remote rm -f yard-old")
-    assert "--remote start yard" not in text.splitlines()
-    next_line = next(line for line in text.splitlines() if "--name yard-next" in line)
-    yard_line = next(line for line in text.splitlines() if "--name yard --network" in line)
-    assert "YARD_SWAP_ACK" not in next_line
-    assert "--group-add" not in next_line
-    assert "-p" not in next_line
-    assert "YARD_SWAP_ACK=1" in yard_line
-    assert "--group-add" not in yard_line
-    assert "127.0.0.1:8000:8000" in yard_line
-    assert "YARD_DOMAIN=yard.example" in yard_line
-    assert not (root / "data" / "yard" / "swap.result").exists()
-    assert "ready" in (root / "data" / "yard" / "swap.log").read_text()
+    assert text.index(" build") < text.index(" up ")
+    assert done.stdout.startswith("built ")
+    assert "IMAGE=localhost/yard:new" in envfile.read_text()
+    labels = (envfile.parent / "labels.yml").read_text()
+    assert 'yard.slot: "heldso"' in labels
+    assert labels.count('yard.sha: "abc123"') == 1
+    assert 'yard.service: "caddy"' in labels
 
 
-def test_a_missing_image_is_absent(tmp_path: Path):
-    absent = tmp_path / "absent"
-    absent.write_text("#!/bin/sh\nexit 1\n")
-    absent.chmod(0o755)
-    dead = tmp_path / "dead"
-    dead.write_text("#!/bin/sh\nexit 2\n")
-    dead.chmod(0o755)
+def test_up_binds_the_slot_directory_when_the_service_does_not(tmp_path: Path):
+    config = """services:
+  app:
+    image: app
+  caddy:
+    volumes:
+      - type: bind
+        source: /srv/yard/data/caddy/lib
+        target: /data
+"""
+    done, log, envfile = _run_up(
+        tmp_path,
+        "ok",
+        extra="DATA_DIR=/srv/yard/data/heldso\n",
+        config=config,
+    )
+    assert done.returncode == 0, done.stderr + done.stdout
+    text = (envfile.parent / "data.yml").read_text()
+    assert '"/srv/yard/data/heldso:/data"' in text
+    assert "caddy:" not in text
+    assert "data.yml" in log.read_text()
 
-    async def check() -> None:
-        assert await Podman(str(absent)).image_exists("localhost/yard:missing") is False
-        with pytest.raises(YardError) as caught:
-            await Podman(str(dead)).image_exists("localhost/yard:missing")
-        assert caught.value.exit_code == 2
 
-    asyncio.run(check())
+def test_a_job_binds_the_slot_directory(tmp_path: Path):
+    done, log, envfile = _run_up(
+        tmp_path,
+        "ok",
+        "job",
+        extra="DATA_DIR=/srv/yard/data/heldso\n",
+    )
+    assert done.returncode == 0, done.stderr + done.stdout
+    text = (envfile.parent / "data.yml").read_text()
+    assert '"/srv/yard/data/heldso:/data"' in text
+    assert "data.yml" in log.read_text()
+    assert "yard.role=job" in log.read_text()
+
+
+def test_a_failed_build_keeps_the_live_image(tmp_path: Path):
+    paths = Paths(tmp_path)
+    env_path = paths.run_dir("heldso") / "compose.env"
+    env_path.parent.mkdir(parents=True)
+    env_path.write_text("IMAGE=localhost/heldso:new\nSHA=new\nDATA_DIR=/srv/yard/data/heldso\nTOKEN=s\n")
+    slot = Slot("heldso", "heldso", "main", "", "", "localhost/heldso:old", "", {}, "")
+    lines = asyncio.run(
+        _revert_after_start(Podman(), paths, slot, "localhost/heldso:new", Path("compose.yml"), env_path, "")
+    )
+    env = parse_env(env_path.read_text())
+    assert lines == ["kept localhost/heldso:old"]
+    assert env["IMAGE"] == "localhost/heldso:old"
+    assert env["SHA"] == "old"
+    assert env["DATA_DIR"] == "/srv/yard/data/heldso"
+    assert env["TOKEN"] == "s"
+
+
+def test_revert_writes_the_live_image_before_compose(tmp_path: Path):
+    paths = Paths(tmp_path)
+    env_path = paths.run_dir("heldso") / "compose.env"
+    env_path.parent.mkdir(parents=True)
+    env_path.write_text("IMAGE=localhost/heldso:new\nSHA=new\n")
+    (env_path.parent / "apply.built").write_text("2026-10-09T00:00:00Z\n")
+    slot = Slot("heldso", "heldso", "main", "", "", "localhost/heldso:old", "", {}, "")
+    seen: dict[str, str] = {}
+
+    class _Capture(Podman):
+        async def run(self, *args, env=None, program="", timeout=None):
+            seen["image"] = (env or {}).get("YARD_IMAGE", "")
+            seen["sha"] = (env or {}).get("YARD_SHA", "")
+            return "revert localhost/heldso:old\n"
+
+    lines = asyncio.run(
+        _revert_after_start(_Capture(), paths, slot, "localhost/heldso:new", Path("compose.yml"), env_path, "")
+    )
+    assert seen == {"image": "localhost/heldso:old", "sha": "old"}
+    assert lines[0] == "rollback localhost/heldso:old"
+
+
+def test_run_args_reads_the_image_and_the_data_directory(tmp_path: Path):
+    env_path = tmp_path / "compose.env"
+    env_path.write_text("IMAGE=localhost/heldso:abc\nDATA_DIR=/srv/yard/data/heldso\n")
+    _args, env = run_args(
+        root="/srv/yard",
+        sock="/sock",
+        project="heldso",
+        compose="/c.yml",
+        env_file=str(env_path),
+        command="revert",
+        slot="heldso",
+        sha="old",
+    )
+    assert env["YARD_IMAGE"] == "localhost/heldso:abc"
+    assert env["YARD_DATA_DIR"] == "/srv/yard/data/heldso"
+    assert env["YARD_SHA"] == "old"
+
+
+def test_apply_env_mounts_the_host_data_directory(tmp_path: Path):
+    checkout = tmp_path / "src"
+    checkout.mkdir()
+    (checkout / "Containerfile").write_text("FROM scratch\n")
+    slot = Slot("heldso", "heldso", "main", "", "heldso.example.com", "", "", {"TOKEN": "s"}, "")
+    compose, env_path = _apply_env(Paths(tmp_path), slot, checkout, "localhost/heldso:abc", "abc")
+    data = tmp_path / "data" / "heldso"
+    assert data.is_dir()
+    assert env_path == tmp_path / "run" / "heldso" / "compose.env"
+    env = parse_env(env_path.read_text())
+    assert env["DATA_DIR"] == str(data)
+    assert env["SLOT_DATA_DIR"] == "/data"
+    assert compose == Path(DEFAULT_COMPOSE)
+    assert not (checkout / ".yard-compose.yml").exists()
+    template = Path(__file__).resolve().parents[1] / "ops" / "apply" / "default.compose.yml"
+    assert "${DATA_DIR}:/data" in template.read_text()
+    assert DEFAULT_COMPOSE.endswith(template.name)
+    app_env = parse_env((env_path.parent / "app.env").read_text())
+    assert app_env["SLOT_DATA_DIR"] == "/data"
+    assert "DATA_DIR" not in app_env
+    assert app_env["TOKEN"] == "s"
+    assert not (data / "compose.env").exists()
+
+
+def test_default_compose_skips_the_overlay(tmp_path: Path):
+    done, log, envfile = _run_up(tmp_path, "ok", shared=True)
+    assert done.returncode == 0, done.stderr + done.stdout
+    text = log.read_text()
+    assert "config" not in text
+    assert " build" in text
+    assert not (envfile.parent / "labels.yml").exists()
+    assert not (envfile.parent / "data.yml").exists()
+
+
+def test_a_job_run_keeps_the_project_name(tmp_path: Path):
+    done, log, _envfile = _run_up(tmp_path, "ok", "job")
+    assert done.returncode == 0, done.stderr + done.stdout
+    text = log.read_text()
+    assert " run " in f" {text} "
+    assert "--rm=false" in text
+    assert "-p yard" in text
+    assert "--name" not in text
+    assert "yard.role=job" in text
+    assert "yard.slot=heldso" in text
+    assert "yard.sha=abc123" in text
+    assert "yard.service=app" in text
+
+
+def test_a_deploy_container_has_labels_and_no_name():
+    spec = apply_compose().read_text()
+    assert "image: localhost/yard-apply:5.3.1" in spec
+    assert "dockerfile: Containerfile" in spec
+    assert "context: ." in spec
+    assert "${YARD_PODMAN_SOCK}:/run/podman/podman.sock" in spec
+    assert "${YARD_ROOT}:${YARD_ROOT}" in spec
+    assert "yard.role:" in spec
+    assert "DATA_DIR: ${YARD_DATA_DIR:-}" in spec
+    assert "IMAGE: ${YARD_IMAGE:-}" in spec
+    assert "container_name" not in spec
+    args, env = run_args(
+        root="/srv/yard",
+        sock="",
+        project="heldso",
+        compose="/c.yml",
+        env_file="/e",
+        command="up",
+        slot="heldso",
+        sha="abc",
+    )
+    text = " ".join(args)
+    assert text.endswith("apply up")
+    assert "run -d" not in text
+    assert "--rm=false" in text
+    detached, _detached_env = run_args(
+        root="/srv/yard",
+        sock="",
+        project="yard",
+        compose="/c.yml",
+        env_file="/e",
+        command="up",
+        slot="yard",
+        sha="abc",
+        detach=True,
+    )
+    assert "run -d -T" in " ".join(detached)
+    assert "--name" not in text
+    assert "yard.role" not in text
+    assert env["YARD_ROLE"] == "deploy"
+    assert env["YARD_SLOT"] == "heldso"
+    assert env["YARD_SHA"] == "abc"
+    assert env["YARD_PROJECT"] == "heldso"
+    assert env["YARD_COMPOSE"] == "/c.yml"
+    assert env["YARD_DEFAULT_COMPOSE"] == ""
+    _shared_args, shared = run_args(
+        root="/srv/yard",
+        sock="",
+        project="heldso",
+        compose=DEFAULT_COMPOSE,
+        env_file="/e",
+        command="up",
+        slot="heldso",
+        sha="abc",
+    )
+    assert shared["YARD_DEFAULT_COMPOSE"] == "1"
+    _revert_args, revert = run_args(
+        root="/srv/yard",
+        sock="",
+        project="heldso",
+        compose="/c.yml",
+        env_file="/e",
+        command="revert",
+        slot="heldso",
+        sha="old",
+    )
+    assert "--rm=false" in " ".join(_revert_args)
+    assert revert["YARD_ROLE"] == "revert"
+    assert revert["YARD_SHA"] == "old"
+    job_args, job = run_args(
+        root="/srv/yard",
+        sock="",
+        project="heldso",
+        compose="/c.yml",
+        env_file="/e",
+        command="job",
+        slot="heldso",
+        sha="abc",
+    )
+    assert "--rm" in job_args
+    assert "--rm=false" not in job_args
+    assert job["YARD_ROLE"] == ""
+    assert job["YARD_PROJECT"] == "heldso"
+    assert job["YARD_SHA"] == "abc"
 
 
 def test_parse_stats_and_ps():
@@ -819,7 +1316,7 @@ def test_parse_stats_and_ps():
     assert samples["heldso"].cpu == "1.5%"
     assert samples["heldso"].mem == "20MB / 1GB"
     assert ps_args() == ["ps", "-a", "--format", "json"]
-    assert stats_args(["caddy"]) == ["stats", "--no-stream", "--format", "json", "caddy"]
+    assert stats_args() == ["stats", "--no-stream", "--format", "json"]
     assert inspect_args("heldso") == ["inspect", "heldso"]
     with pytest.raises(YardError):
         inspect_args("../caddy")
@@ -838,16 +1335,16 @@ def test_parse_stats_and_ps():
 
 
 def test_latest_run_for_a_job_slot():
-    raw = """[
-        {"Id":"new","Names":["backup"],"State":"running","Labels":{"yard.slot":"backup"},"Created":"2026-10-06T10:00:00Z"},
-        {"Id":"web","Names":["heldso"],"State":"running","Created":"2026-10-06T08:00:00Z"}
+    marked = """[
+        {"Id":"run","Names":["backup-run"],"Labels":{"yard.slot":"backup","yard.role":"job"}},
+        {"Id":"build","Names":["build"],"Labels":{"yard.slot":"backup","yard.role":"deploy"}}
     ]"""
-    item = latest_for_slot(parse_ps(raw), "backup")
-    assert item is not None
-    assert item.name == "backup"
-    assert item.running
-    assert item.slot == "backup"
-    assert ids_for_slot(raw, "backup") == ["new"]
+    assert ids_for_slot(marked, "backup", "job") == ["run"]
+    parsed = parse_ps(marked)
+    assert parsed["backup-run"].role == "job"
+    assert log_hit(parsed["backup-run"], slot="backup", role="job", sha="")
+    assert not log_hit(parsed["build"], slot="backup", role="app", sha="")
+    assert log_hit(parsed["build"], slot="backup", role="deploy", sha="")
     rows = parse_inspect('[{"Id":"new","State":{"Running":false,"FinishedAt":"2026-10-06T10:05:00Z"}}]')
     assert len(rows) == 1
     assert rows[0].finished is not None
@@ -868,6 +1365,7 @@ def test_slot_rows_keep_stopped_containers():
             started=_unix(10),
         ),
         "caddy": Listed(name="caddy", state="running", running=True),
+        "heldso-build": Listed(name="heldso-build", slot="heldso", role="deploy", state="exited"),
     }
     raw = '[{"name":"heldso","cpu_percent":"1%","mem_usage":"20MB"}]'
     samples = {"heldso": parse_stats(raw)["heldso"]}
@@ -953,83 +1451,189 @@ def test_job_due_and_plan():
     assert plan_job(every, image, [RunState("c1", False, finished=now - timedelta(minutes=5))], now).start
 
 
-def test_tag_and_containerfile(tmp_path: Path):
+def test_a_job_wake_keeps_the_running_job_and_the_newest_finish():
+    running = """[
+        {"Id":"run","Names":["backup-run"],"State":"running","StartedAt":1710000000,
+         "Labels":{"yard.slot":"backup","yard.role":"job"}}
+    ]"""
+    finished = """[
+        {"Id":"old","Names":["backup-old"],"State":"exited","ExitedAt":1710000100,
+         "Labels":{"yard.slot":"backup","yard.role":"job"}},
+        {"Id":"new","Names":["backup-new"],"State":"exited","ExitedAt":1710000200,
+         "Labels":{"yard.slot":"backup","yard.role":"job"}}
+    ]"""
+    states = job_states(running, finished)
+    assert [state.id for state in states] == ["run", "new"]
+    assert states[0].running
+    assert not states[1].running
+    assert states[1].finished == datetime.fromtimestamp(1710000200, UTC)
+
+
+def test_a_slot_list_reads_each_repo_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "README").write_text("one\n")
+    _git(source, "init", "-b", "main")
+    _git(source, "add", ".")
+    _git(source, "-c", "user.email=test@example.com", "-c", "user.name=test", "commit", "-m", "init")
+    sha = subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    repo = tmp_path / "repos" / "app.git"
+    repo.parent.mkdir()
+    subprocess.run(["git", "clone", "--bare", str(source), str(repo)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "update-ref", "refs/remotes/origin/main", sha], check=True)
+    store = Store.open(tmp_path / "db")
+    yard = _yard(tmp_path, store, "")
+    calls: list[tuple[str, ...]] = []
+
+    async def spy(*args: str, timeout: float | None = None, env: dict[str, str] | None = None) -> str:
+        calls.append(args)
+        return await run_cmd(*args, timeout=timeout, env=env)
+
+    monkeypatch.setattr("app.yard.run_cmd", spy)
+    web = Slot("web", "app", "main", "", "", "localhost/app:old", "", {}, "")
+    mirror = Slot("mirror", "app", "origin/main", "", "", "", "", {}, "")
+    try:
+        facts = asyncio.run(yard.slot_facts([web, mirror]))
+    finally:
+        store.close()
+    assert [args for args in calls if "for-each-ref" in args]
+    assert sum("for-each-ref" in args for args in calls) == 1
+    assert facts["web"][1] == sha
+    assert facts["mirror"][1] == sha
+
+
+def test_a_slot_list_sizes_each_data_directory_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    store = Store.open(tmp_path / "db")
+    yard = _yard(tmp_path, store, "")
+    store.create_repo("app")
+    store.create_slot("heldso", "app", "main", "", "", "")
+    store.create_slot("other", "app", "main", "", "", "")
+    (tmp_path / "data" / "heldso").mkdir(parents=True)
+    (tmp_path / "data" / "other").mkdir(parents=True)
+    calls: list[Path] = []
+
+    def counting(path: Path) -> int:
+        calls.append(path)
+        return 10
+
+    monkeypatch.setattr("app.yard.dir_size", counting)
+
+    class _Podman:
+        async def run(
+            self,
+            *args: str,
+            timeout: float | None = None,
+            env: dict[str, str] | None = None,
+            program: str = "",
+        ) -> str:
+            if args and args[0] == "ps":
+                return """[
+                    {"Id":"a","Names":["heldso-app"],"State":"running","Labels":{"yard.slot":"heldso","yard.role":"app"}},
+                    {"Id":"b","Names":["heldso-extra"],"State":"running","Labels":{"yard.slot":"heldso","yard.role":"app"}},
+                    {"Id":"c","Names":["other-app"],"State":"running","Labels":{"yard.slot":"other","yard.role":"app"}}
+                ]"""
+            if args and args[0] == "info":
+                return '{"host":{"cpus":2,"memTotal":1000},"store":{"graphRootAllocated":1000}}'
+            return "[]"
+
+    yard.podman = _Podman()
+    try:
+        rows = asyncio.run(yard.list_rows(False))
+    finally:
+        store.close()
+    assert calls == [tmp_path / "data" / "heldso", tmp_path / "data" / "other"]
+    sized = [row for row in rows if row["slot"] in {"heldso", "other"}]
+    assert len(sized) == 3
+    assert all(row["data"] == "10B" for row in sized)
+
+
+def test_checkout_extracts_one_tree(tmp_path: Path):
+    source = tmp_path / "src"
+    app = source / "projects" / "app"
+    app.mkdir(parents=True)
+    (app / "Containerfile").write_text("FROM scratch\n")
+    (source / "README").write_text("one\n")
+    _git(source, "init", "-b", "main")
+    _git(source, "add", ".")
+    _git(source, "-c", "user.email=test@example.com", "-c", "user.name=test", "commit", "-m", "init")
+    sha = subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (source / "README").write_text("two\n")
+    _git(source, "add", "README")
+    _git(source, "-c", "user.email=test@example.com", "-c", "user.name=test", "commit", "-m", "next")
+    repo = tmp_path / "repos" / "app.git"
+    repo.parent.mkdir()
+    subprocess.run(["git", "clone", "--bare", str(source), str(repo)], check=True, capture_output=True)
+    paths = Paths(tmp_path)
+    out = asyncio.run(prepare_checkout(paths, "app", "projects/app", sha))
+    assert (out / "Containerfile").read_text() == "FROM scratch\n"
+    assert not (out / "README").exists()
+    assert not (out / ".git").exists()
+    (out / "keep.txt").write_text("stay\n")
+    again = asyncio.run(prepare_checkout(paths, "app", "projects/app", sha))
+    assert again == out
+    assert (again / "keep.txt").read_text() == "stay\n"
+    assert (out.parent / f".{out.name}.ready").is_file()
+    missing = paths.build("app", "projects/missing", sha)
+    with pytest.raises(RuntimeError, match="not in the repo"):
+        asyncio.run(prepare_checkout(paths, "app", "projects/missing", sha))
+    assert not (missing.parent / f".{missing.name}.ready").exists()
+
+
+def _git(directory: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(directory), *args], check=True, capture_output=True)
+
+
+def test_image_tag_includes_the_directory():
     assert image_tag("mono", "", "abc") == "localhost/mono:abc"
     assert image_tag("mono", "projects/Mono_App", "abc") == "localhost/mono-projects-mono-app:abc"
     paths = Paths(Path("/srv/yard"))
     assert paths.build("mono", "", "abc") != paths.build("mono", "projects/a", "abc")
-    (tmp_path / "shared" / "lib").mkdir(parents=True)
-    (tmp_path / "shared" / "lib" / "x.py").write_text("")
-    (tmp_path / "projects" / "mono").mkdir(parents=True)
-    (tmp_path / "projects" / "mono" / "pyproject.toml").write_text("[project]\n")
-    (tmp_path / "projects" / "custom").mkdir()
-    (tmp_path / "projects" / "custom" / "Containerfile").write_text("FROM scratch\n")
-    with pytest.raises(RuntimeError, match="no Containerfile"):
-        containerfile(tmp_path, "projects/mono")
-    file, context = containerfile(tmp_path, "projects/custom")
-    assert file == tmp_path / "projects" / "custom" / "Containerfile"
-    assert context == tmp_path / "projects" / "custom"
-    ops = tmp_path / "projects" / "opsapp" / "ops"
-    ops.mkdir(parents=True)
-    (ops / "Containerfile").write_text("FROM scratch\n")
-    (tmp_path / "projects" / "opsapp" / "pyproject.toml").write_text("[project]\n")
-    file, context = containerfile(tmp_path, "projects/opsapp")
-    assert file == ops / "Containerfile"
-    assert context == tmp_path / "projects" / "opsapp"
-    with pytest.raises(RuntimeError, match="not in the repo"):
-        containerfile(tmp_path, "projects/missing")
-    with pytest.raises(RuntimeError, match="repo root"):
-        containerfile(tmp_path, "")
-
-
-def test_slot_env_overrides_yard():
-    env = {"SLOT_DATA_DIR": "/elsewhere", "SESSION_SECRET": "s", "STARIO_PORT": "9000"}
-    text = "\n".join(slot_env("shop", env))
-    for want in (
-        "SLOT_NAME=shop",
-        "SLOT_DATA_DIR=/elsewhere",
-        "STARIO_PORT=9000",
-        "SESSION_SECRET=s",
-        "STARIO_HOST=0.0.0.0",
-    ):
-        assert want in text
-    assert not any(line.startswith("DATA_DIR=") for line in text.splitlines())
 
 
 def test_caddy_document():
-    text = caddy_document(Path("/srv/yard/run/caddy.sock"), "a@example.com", []).decode()
+    text = caddy_document(Path("/srv/yard/run/caddy.sock"), []).decode()
     heldso = Slot("heldso", "", "", "", "heldso.example.com", "", "", {}, "")
     plain = Slot("plain", "", "", "", "", "", "", {}, "")
-    body = caddy_document(
-        Path("/srv/yard/run/caddy.sock"),
-        "a@example.com",
-        routes_from([heldso, plain]),
-    ).decode()
+    body = caddy_document(Path("/srv/yard/run/caddy.sock"), routes_from([heldso, plain])).decode()
     assert yard_route("") is None
     route = yard_route("yard.example.com")
     assert route is not None
     assert route.host == "yard.example.com"
     assert route.dial == "yard:8000"
     assert '"dial": "heldso:8000"' in body
+    assert '"lb_try_duration": "10s"' in body
+    assert '"lb_try_interval": "250ms"' in body
     for part in (
         '"listen": "unix//srv/yard/run/caddy.sock|0600"',
         '"https_port": 8443',
         '":8443"',
         '"disable_redirects": true',
         '"disabled": true',
-        '"email": "a@example.com"',
     ):
         assert part in text or part in body
-    args = " ".join(caddy_run_args(Path("/srv/yard"), Path("/srv/yard/run/caddy.sock")))
+    spec = (Path(__file__).resolve().parents[1] / "ops" / "compose.yml").read_text()
     for part in (
-        "-p 8443:8443",
-        "-v /srv/yard/data/caddy:/config/caddy",
-        "-v /srv/yard/data/caddy/lib:/data",
-        "-v /srv/yard/run:/srv/yard/run",
-        "run --resume",
-        "--log-driver journald",
+        "container_name: caddy",
+        "${YARD_ROOT}/data/caddy:/config/caddy",
+        "${YARD_ROOT}/data/caddy/lib:/data",
+        "${YARD_ROOT}/run:${YARD_ROOT}/run",
+        'command: ["run", "--resume"]',
+        "yard.role: app",
+        "yard.slot: yard",
+        "yard.service: caddy",
+        "${PROXY_PORT:-8443}:${PROXY_PORT:-8443}",
     ):
-        assert part in args
+        assert part in spec
 
 
 def _unix(seconds: int) -> datetime:

@@ -18,10 +18,19 @@ from typing import NoReturn, TypedDict
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 from app import package_version
-from app.config import YARD_IMAGE
 from app.errors import YardError, explain
-from app.rows import format_span, mem_used, parse_time, slot_label
-from app.store import check_domain, check_name, check_ref, check_slot_name, clean_dir, parse_every
+from app.rows import format_span, parse_time, slot_label
+from app.store import (
+    check_domain,
+    check_name,
+    check_origin,
+    check_ref,
+    check_slot_name,
+    clean_dir,
+    origin_name,
+    parse_every,
+    public_origin,
+)
 from app.text import Block, ExpLabel, format_blocks, format_values, name_ok, parse_blocks, parse_env
 
 _SUMMARY = "Push a repo. Yard builds the image and serves the app."
@@ -57,85 +66,130 @@ _ROOT: dict[str, dict[str, _Help]] = {
             {
                 "--domain <host>": "Public host for the app",
                 "--every <interval>": "Run the slot on a timer, for example 5m",
+                "--remote <url>": "Clone this HTTP repo on the host. The slot follows origin/main.",
                 "--name <name>": "Repo name and slot name",
                 "--repo <name>": "Repo name",
                 "--slot <name>": "Slot name",
-                "--ref <branch>": "Branch. The default is main",
+                "--ref <name>": (
+                    "Ref the slot follows. The default is main. With --remote, the default is the remote HEAD."
+                ),
                 "--dir <path>": "Directory inside the repo",
+            },
+        ),
+        "clone": _h(
+            "clone <repo>",
+            "Clone one branch from the host. The depth is 1.",
+            {
+                "--lazy": "Download a file when you open it",
+                "--full": "Clone the whole history",
             },
         ),
     },
     "daily": {
-        "slot": _h("slot <command>", "Show, log, and edit apps"),
-        "update": _h("update", "Pull the image and replace this Yard after the new one answers"),
-        "rollback": _h("rollback", "Start the previous image and wait until it answers"),
-    },
-    "more": {
-        "repo": _h("repo <command>", "Create, clone, and link repos"),
-        "token": _h("token <command>", "Create and revoke tokens"),
-        "exp": _h("exp <command>", "Keep experiment notes"),
-        "settings": _h(
-            "settings",
-            "Show or set the public host, the email, and the image",
+        "slot": _h("slot <command>", "Show and edit apps"),
+        "logs": _h(
+            "logs",
+            "Read container logs. No filter reads role app.",
             {
-                "--domain <host>": "Public host for Yard",
-                "--email <addr>": "Address for the certificate",
-                "--self-repo <name>": "Build Yard from a repo on this host",
-                "--self-ref <branch>": "Branch for that repo",
-                "--self-image": "Return to ghcr.io/bobowski/yard:latest",
+                "--slot <name>": "Match yard.slot",
+                "--role <name>": "Match yard.role. app, deploy, revert, or job",
+                "--service <name>": "Match yard.service",
+                "--sha <rev>": "Match yard.sha",
+                "--tail <n>": "Lines to read. The default is 200",
+                "--follow": "Keep reading one container",
+                "--cursor <value>": "Continue from an earlier page",
             },
         ),
+        "deploys": _h(
+            "deploys <name> [<id>]",
+            "Show builds for one slot. The times are the image build, the start, and the total.",
+        ),
+        "deploy": _h("deploy <name>", "Build the ref this slot follows"),
+        "git": _h(
+            "git <name> <command>",
+            "Run one allowed git command in the bare repo.",
+            {
+                "log": "Read commits",
+                "show": "Read one commit",
+                "rev-parse": "Print a revision",
+                "ls-tree": "List a tree",
+                "cat-file": "Print an object",
+                "for-each-ref": "List refs",
+                "branch": "List branches, or delete one with -d or -D",
+                "remote": "Show remotes, or set-url origin",
+                "fetch": "Fetch origin. A slot on origin/<branch> deploys when the tip moves.",
+                "gc": "Pack the repo",
+            },
+        ),
+    },
+    "more": {
+        "repo": _h("repo <command>", "Create and link repos"),
+        "token": _h("token <command>", "Create and revoke tokens"),
+        "exp": _h("exp <command>", "Keep experiment notes"),
+        "podman": _h("podman <command>", "Read one container by name"),
     },
 }
 
 _GROUPS: dict[str, _Group] = {
     "repo": {
-        "summary": "Create, clone, and link repos.",
+        "summary": "Create and link repos.",
         "commands": {
             "list": _h("list", "List repos"),
-            "new": _h("new <name>", "Create a repo", {"--force": "Replace a leftover directory"}),
+            "new": _h(
+                "new <name>",
+                "Create a repo. --remote clones that address on the host.",
+                {
+                    "--remote <url>": "HTTP git address. Slots can follow origin/main.",
+                    "--force": "Replace a leftover directory",
+                },
+            ),
             "rm": _h("rm <name>", "Remove a repo and its files"),
-            "clone": _h("clone <repo>", "Clone a repo into a new directory"),
             "link": _h("link <repo>", "Add the yard remote to this directory"),
         },
     },
     "slot": {
-        "summary": "Show, log, and edit apps.",
+        "summary": "Show and edit apps.",
         "commands": {
             "list": _h(
                 "list",
                 "Show each app, how long it has been up, and the revision",
                 {"--running": "Hide stopped apps"},
             ),
-            "logs": _h(
-                "logs <name>",
-                "Read the container log",
-                {
-                    "--tail <n>": "Lines to read. The default is 200",
-                    "--follow": "Keep reading",
-                    "--container <name>": "Read one run",
-                    "--cursor <value>": "Continue from an earlier page",
-                },
-            ),
             "new": _h(
                 "new <name> --repo <repo>",
-                "Create a slot for one repo and one branch",
+                "Create a slot for one repo and one ref",
                 {
                     "--repo <repo>": "Repo name",
-                    "--ref <branch>": "Branch. The default is main",
+                    "--ref <name>": "Ref the slot follows. The default is main",
                     "--domain <host>": "Public host for the app",
                     "--every <interval>": "Run the slot on a timer, for example 5m",
                     "--dir <path>": "Directory inside the repo",
                 },
             ),
-            "show": _h("show <name>", "Print the slot as NAME=value lines"),
+            "show": _h(
+                "show <name>",
+                "Print the slot env. Comments name what Yard sets and what the container receives.",
+            ),
             "edit": _h(
                 "edit <name>",
                 "Change the slot file, or set one key",
                 {"--set KEY VALUE": "Set one key. An empty value removes it"},
             ),
             "rm": _h("rm <name>", "Remove a slot"),
-            "deploys": _h("deploys <name> [<id>]", "Show builds for one slot. An id shows one build and its log"),
+        },
+    },
+    "podman": {
+        "summary": "Read one container by name.",
+        "commands": {
+            "logs": _h(
+                "logs <container>",
+                "Read one container. The name is the Podman name.",
+                {
+                    "--tail <n>": "Lines to read. The default is 200",
+                    "--follow": "Keep reading",
+                    "--cursor <value>": "Continue from an earlier page",
+                },
+            ),
             "inspect": _h("inspect <container>", "Show the state and the image of one container"),
         },
     },
@@ -200,7 +254,7 @@ def main(argv: list[str] | None = None) -> None:
     if not opt.rest:
         _emit(_root_text(full=False), error=False)
     command, *rest = opt.rest
-    if command in {"login", "init", "update", "rollback", "settings"} and _asked(rest):
+    if command in {"login", "init", "clone", "git", "logs", "deploy", "deploys"} and _asked(rest):
         _show_cmd(command)
     if command == "exp":
         _exp(opt, rest)
@@ -208,18 +262,24 @@ def main(argv: list[str] | None = None) -> None:
         _login(opt, rest)
     elif command == "init":
         _init(opt, rest)
+    elif command == "clone":
+        _clone(opt, rest)
+    elif command == "git":
+        _git_repo(opt, rest)
+    elif command == "logs":
+        _logs(opt, rest)
+    elif command == "deploys":
+        _deploys(opt, rest)
+    elif command == "deploy":
+        _deploy(opt, rest)
+    elif command == "podman":
+        _podman(opt, rest)
     elif command == "repo":
         _repo(opt, rest)
     elif command == "slot":
         _slot(opt, rest)
     elif command == "token":
         _token(opt, rest)
-    elif command == "settings":
-        _settings(opt, rest)
-    elif command == "rollback":
-        _update(opt, "rollback")
-    elif command == "update":
-        _update(opt)
     else:
         _emit(_root_text(full=False), error=True)
 
@@ -311,8 +371,9 @@ def _login(opt: Opt, args: list[str]) -> None:
     path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     path.write_text(json.dumps({"url": url, "token": token}, indent=2) + "\n")
     path.chmod(0o600)
-    print(url)
-    print(path)
+    print("logged in")
+    print(f"{'host'.ljust(6)}  {url}")
+    print(f"{'saved'.ljust(6)}  {path}")
 
 
 def _init(opt: Opt, args: list[str]) -> None:
@@ -320,17 +381,21 @@ def _init(opt: Opt, args: list[str]) -> None:
     parser.add_argument("--name", default="")
     parser.add_argument("--repo", default="")
     parser.add_argument("--slot", default="")
-    parser.add_argument("--ref", default="main")
+    parser.add_argument("--ref", default="")
     parser.add_argument("--domain", default="")
     parser.add_argument("--dir", default="")
     parser.add_argument("--every", default="")
+    parser.add_argument("--remote", dest="origin", default="")
     parsed = parser.parse_args(args)
     domain = parsed.domain.strip()
     every = parsed.every.strip()
     if not domain and not every:
         _show_cmd("init", error=True)
+    origin = parsed.origin.strip()
     try:
-        ref = parsed.ref.strip()
+        if origin:
+            origin = check_origin(origin)
+        ref = parsed.ref.strip() or "main"
         check_ref(ref)
         if domain:
             check_domain(domain)
@@ -348,20 +413,31 @@ def _init(opt: Opt, args: list[str]) -> None:
         _fail(exc)
 
     client = _load(opt)
-    top = _git_top()
-    folder = Path(top or Path.cwd()).name
+    top = "" if origin else _git_top()
+    folder = origin_name(origin) if origin else Path(top or Path.cwd()).name
     shared = parsed.name.strip()
-    repo = _checked(parsed.repo.strip() or shared or folder, bool(parsed.repo.strip() or shared), check_name)
-    slot_name = _checked(parsed.slot.strip() or shared or folder, bool(parsed.slot.strip() or shared), check_slot_name)
-    directory = top or _make_git(ref)
-    created = _ensure_repo(client, repo)
+    explicit = bool(parsed.repo.strip() or shared or origin)
+    repo = _checked(parsed.repo.strip() or shared or folder, explicit, check_name)
+    slot_name = _checked(parsed.slot.strip() or shared or folder, explicit, check_slot_name)
+    created, recorded = _ensure_repo(client, repo, origin)
     remote = f"{client.url}/git/{repo}.git"
-    _link_dir(directory, remote, client.token)
+    if origin:
+        branch = parsed.ref.strip() or str(recorded.get("ref") or "main")
+        if not branch.startswith("origin/"):
+            branch = f"origin/{branch}"
+        try:
+            check_ref(branch)
+        except YardError as exc:
+            _fail(exc)
+    else:
+        branch = ref
+        directory = top or _make_git(branch)
+        _link_dir(directory, remote, client.token)
 
     # The remote is already in git. The slot is what the next push builds.
-    body: dict[str, str] = {"SLOT_NAME": slot_name, "SLOT_REPO": repo, "SLOT_BRANCH": ref}
+    body: dict[str, str] = {"SLOT_NAME": slot_name, "SLOT_REPO": repo, "REF": branch}
     if domain:
-        body["SLOT_DOMAIN"] = domain
+        body["DOMAIN"] = domain
     if directory_key:
         body["SLOT_DIRECTORY"] = directory_key
     if interval:
@@ -372,14 +448,49 @@ def _init(opt: Opt, args: list[str]) -> None:
     except json.JSONDecodeError:
         slot = {"raw": slot_text}
 
-    push = f"git push -u yard {ref}"
+    url = f"{client.url}/git/{repo}.git"
+    rows = [("repo", repo), ("url", url), ("slot", slot_name), ("ref", branch)]
+    if domain:
+        rows.append(("domain", domain))
+    if directory_key:
+        rows.append(("dir", directory_key))
+    if interval:
+        rows.append(("every", interval))
+    if origin:
+        shown = public_origin(origin)
+        rows.insert(2, ("remote", f"origin {shown}"))
+        if as_json(opt):
+            print(
+                json.dumps(
+                    {
+                        "name": slot_name,
+                        "repo": repo,
+                        "url": url,
+                        "remote": shown,
+                        "ref": branch,
+                        "created": created,
+                        "slot": slot,
+                    },
+                )
+            )
+            return
+        _print_setup(
+            "created a repo on the host and a slot",
+            rows,
+            ["The host repo has origin set to that remote.", *_follow_note(repo, branch)],
+        )
+        return
+
+    push = f"git push -u yard {branch}"
     if as_json(opt):
         print(
             json.dumps(
                 {
                     "name": slot_name,
                     "repo": repo,
+                    "url": url,
                     "remote": remote,
+                    "ref": branch,
                     "created": created,
                     "slot": slot,
                     "push": push,
@@ -387,13 +498,34 @@ def _init(opt: Opt, args: list[str]) -> None:
             )
         )
         return
-    print(f"{'repo'.ljust(6)}  {repo}")
-    print(f"{'slot'.ljust(6)}  {slot_name}")
-    print(f"{'remote'.ljust(6)}  {remote}")
-    print()
+    note = _follow_note(repo, branch)
     if not _head_ok(directory):
-        print("commit, then")
-    print(push)
+        note = ["Commit first.", *note]
+    note.append(push)
+    _print_setup("created a repo and a slot", rows, note)
+
+
+def _print_setup(title: str, rows: list[tuple[str, str]], note: list[str]) -> None:
+    print(title)
+    print()
+    for key, value in rows:
+        if value:
+            print(f"{key.ljust(6)}  {value}")
+    print()
+    for line in note:
+        print(line)
+
+
+def _follow_note(repo: str, branch: str) -> list[str]:
+    if branch.startswith("origin/"):
+        return [
+            f"The slot follows {branch}.",
+            f"Run yard git {repo} fetch. A new tip deploys this slot.",
+        ]
+    return [
+        f"The slot follows {branch}.",
+        "Push this ref. Yard builds the image and starts the container.",
+    ]
 
 
 def _checked(name: str, explicit: bool, check: Callable[[str], None]) -> str:
@@ -426,12 +558,19 @@ def _head_ok(directory: str) -> bool:
     return proc.returncode == 0
 
 
-def _ensure_repo(client: Client, name: str) -> bool:
-    status, text = _api_try(client, "POST", "/api/v1/repos", {"name": name, "force": False})
+def _ensure_repo(client: Client, name: str, origin: str = "") -> tuple[bool, dict[str, object]]:
+    payload: dict[str, object] = {"name": name, "force": False}
+    if origin:
+        payload["origin"] = origin
+    status, text = _api_try(client, "POST", "/api/v1/repos", payload)
     if status < 300:
-        return True
-    if status == 409 and _error_code(text) == "exists":
-        return False
+        try:
+            body = json.loads(text)
+        except json.JSONDecodeError:
+            body = {}
+        return True, body if isinstance(body, dict) else {}
+    if status == 409 and _error_code(text) == "exists" and not origin:
+        return False, {}
     _die(text if _json else explain(text))
 
 
@@ -457,19 +596,62 @@ def _repo(opt: Opt, args: list[str]) -> None:
         if len(args) < 2:
             _show_cmd("new", "repo", error=True)
         parser = argparse.ArgumentParser(add_help=False, prog="yard repo new")
+        parser.add_argument("--remote", dest="origin", default="")
         parser.add_argument("--force", action="store_true")
         parsed = parser.parse_args(args[2:])
-        _show(opt, _api(client, "POST", "/api/v1/repos", {"name": args[1], "force": parsed.force}), "raw")
+        body: dict[str, object] = {"name": args[1], "force": parsed.force}
+        origin = parsed.origin.strip()
+        if origin:
+            try:
+                body["origin"] = check_origin(origin)
+            except YardError as exc:
+                _fail(exc)
+        raw = _api(client, "POST", "/api/v1/repos", body)
+        if as_json(opt):
+            print(raw)
+            return
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            print(raw)
+            return
+        if not isinstance(data, dict):
+            print(raw)
+            return
+        name = str(data.get("name") or args[1])
+        ref = str(data.get("ref") or "")
+        branch = f"origin/{ref or 'main'}" if origin else ""
+        rows = [("repo", name), ("url", f"{client.url}/git/{name}.git")]
+        if origin:
+            rows.extend((("remote", f"origin {public_origin(origin)}"), ("ref", branch)))
+        note = (
+            [
+                "The host repo has origin set to that remote.",
+                f"Run yard git {name} fetch. A new tip deploys a slot on {branch}.",
+            ]
+            if origin
+            else ["Push a branch to that URL.", "A slot on that branch deploys."]
+        )
+        _print_setup("created a repo on the host", rows, note)
     elif args[0] == "rm":
         if len(args) < 2:
             _show_cmd("rm", "repo", error=True)
         _show(opt, _api(client, "DELETE", "/api/v1/repos/" + args[1], None), "raw")
-    elif args[0] == "clone":
-        _clone(opt, args[1:])
     elif args[0] == "link":
         _link(opt, args[1:])
     else:
         _emit(_group_text("repo", args[0]), error=True)
+
+
+def _git_repo(opt: Opt, args: list[str]) -> None:
+    if len(args) < 2:
+        _show_cmd("git", error=bool(args))
+    client = _load(opt)
+    _show(
+        opt,
+        _api(client, "POST", "/api/v1/repos/" + quote(args[0]) + "/git", {"args": args[1:]}),
+        "git",
+    )
 
 
 def _slot(opt: Opt, args: list[str]) -> None:
@@ -486,18 +668,6 @@ def _slot(opt: Opt, args: list[str]) -> None:
         if len(args) < 2:
             _show_cmd("show", "slot", error=True)
         _slot_show(opt, client, args[1])
-    elif command == "logs":
-        _logs(opt, args[1:])
-    elif command == "deploys":
-        _deploys(opt, args[1:])
-    elif command == "inspect":
-        if len(args) != 2 or args[1].startswith("-"):
-            _show_cmd("inspect", "slot", error=True)
-        body = _api(client, "GET", "/api/v1/containers/" + quote(args[1]), None)
-        if as_json(opt):
-            print(body)
-        else:
-            print(format_inspect(body, color=_color_on()), end="")
     elif command == "edit":
         _slot_edit(opt, client, args[1:])
     elif command == "new":
@@ -551,14 +721,40 @@ def _slot_new(opt: Opt, client: Client, args: list[str]) -> None:
     parsed = parser.parse_args(args[2:])
     if not parsed.repo:
         _show_cmd("new", "slot", error=True)
-    body = {"SLOT_NAME": args[1], "SLOT_REPO": parsed.repo, "SLOT_BRANCH": parsed.ref}
+    body = {"SLOT_NAME": args[1], "SLOT_REPO": parsed.repo, "REF": parsed.ref}
     if parsed.domain:
-        body["SLOT_DOMAIN"] = parsed.domain
+        body["DOMAIN"] = parsed.domain
     if parsed.dir:
         body["SLOT_DIRECTORY"] = parsed.dir
     if parsed.every:
         body["SLOT_INTERVAL"] = parsed.every
-    _show(opt, _api(client, "POST", "/api/v1/slots", body), "raw")
+    raw = _api(client, "POST", "/api/v1/slots", body)
+    if as_json(opt):
+        print(raw)
+        return
+    try:
+        wrap = json.loads(raw)
+    except json.JSONDecodeError:
+        print(raw)
+        return
+    values = wrap.get("values") if isinstance(wrap, dict) else None
+    if not isinstance(values, dict):
+        print(raw)
+        return
+    repo_name = str(values.get("SLOT_REPO") or "")
+    branch = str(values.get("REF") or "main")
+    _print_setup(
+        "created a slot",
+        [
+            ("repo", repo_name),
+            ("url", f"{client.url}/git/{repo_name}.git"),
+            ("slot", str(values.get("SLOT_NAME") or "")),
+            ("ref", branch),
+            ("domain", str(values.get("DOMAIN") or "")),
+            ("every", str(values.get("SLOT_INTERVAL") or "")),
+        ],
+        _follow_note(repo_name, branch),
+    )
 
 
 def parse_slot_sets(args: list[str]) -> list[tuple[str, str]]:
@@ -618,6 +814,9 @@ def _slot_put(opt: Opt, client: Client, name: str, patch: dict[str, str]) -> Non
     if not isinstance(values, dict):
         _die(body)
     print(format_values({str(key): str(value) for key, value in values.items()}), end="")
+    note = wrap.get("deploy")
+    if isinstance(note, dict) and note.get("message"):
+        print(str(note["message"]))
 
 
 def _token(opt: Opt, args: list[str]) -> None:
@@ -642,7 +841,7 @@ def _token(opt: Opt, args: list[str]) -> None:
 
 def _deploys(opt: Opt, args: list[str]) -> None:
     if not args or args[0].startswith("-"):
-        _show_cmd("deploys", "slot", error=True)
+        _show_cmd("deploys", error=True)
     name = quote(args[0])
     client = _load(opt)
     if len(args) >= 2 and not args[1].startswith("-"):
@@ -651,76 +850,120 @@ def _deploys(opt: Opt, args: list[str]) -> None:
     _show(opt, _api(client, "GET", f"/api/v1/slots/{name}/deploys", None), "deploys")
 
 
+def _deploy(opt: Opt, args: list[str]) -> None:
+    if len(args) != 1 or args[0].startswith("-"):
+        _show_cmd("deploy", error=True)
+    client = _load(opt)
+    body = _api(client, "POST", "/api/v1/slots/" + quote(args[0]) + "/deploy", {})
+    if as_json(opt):
+        print(body)
+        return
+    try:
+        note = json.loads(body)
+    except json.JSONDecodeError:
+        print(body)
+        return
+    if isinstance(note, dict) and note.get("message"):
+        print(str(note["message"]))
+        return
+    print(body)
+
+
 def _logs(opt: Opt, args: list[str]) -> None:
-    parser = argparse.ArgumentParser(add_help=False, prog="yard slot logs")
+    parser = argparse.ArgumentParser(add_help=False, prog="yard logs")
+    parser.add_argument("--slot", default="")
+    parser.add_argument("--role", default="")
+    parser.add_argument("--service", default="")
+    parser.add_argument("--sha", default="")
     parser.add_argument("--tail", type=int, default=200)
     parser.add_argument("--follow", action="store_true")
     parser.add_argument("--cursor", default="")
-    parser.add_argument("--container", default="")
-    parser.add_argument("name", nargs="?")
-    if args and not args[0].startswith("-"):
-        name = args[0]
+    parsed = parser.parse_args(args)
+    _show_logs_query(
+        opt,
+        "/api/v1/logs",
+        {
+            "slot": parsed.slot,
+            "role": parsed.role,
+            "service": parsed.service,
+            "sha": parsed.sha,
+            "tail": str(parsed.tail),
+            "cursor": parsed.cursor,
+        },
+        parsed.follow,
+    )
+
+
+def _podman(opt: Opt, args: list[str]) -> None:
+    args = _take_help("podman", args)
+    command = args[0]
+    if command == "inspect":
+        if len(args) != 2 or args[1].startswith("-"):
+            _show_cmd("inspect", "podman", error=True)
+        body = _api(_load(opt), "GET", "/api/v1/containers/" + quote(args[1]), None)
+        if as_json(opt):
+            print(body)
+        else:
+            print(format_inspect(body, color=_color_on()), end="")
+        return
+    if command == "logs":
+        parser = argparse.ArgumentParser(add_help=False, prog="yard podman logs")
+        parser.add_argument("--tail", type=int, default=200)
+        parser.add_argument("--follow", action="store_true")
+        parser.add_argument("--cursor", default="")
+        parser.add_argument("container", nargs="?")
         parsed = parser.parse_args(args[1:])
-        if parsed.name:
-            _show_cmd("logs", "slot", error=True)
-    else:
-        parsed = parser.parse_args(args)
-        name = parsed.name or ""
-    if not name:
-        _show_cmd("logs", "slot", error=True)
-    query = {"tail": str(parsed.tail)}
-    if parsed.cursor:
-        query["cursor"] = parsed.cursor
-    if parsed.container:
-        query["container"] = parsed.container
-    path = "/api/v1/slots/" + quote(name) + "/logs?" + urlencode(query)
-    client = _load(opt)
-    if parsed.follow:
-        query["follow"] = "1"
-        _stream(client, "/api/v1/slots/" + quote(name) + "/logs?" + urlencode(query))
+        if not parsed.container:
+            _show_cmd("logs", "podman", error=True)
+        _show_logs_query(
+            opt,
+            "/api/v1/containers/" + quote(parsed.container) + "/logs",
+            {"tail": str(parsed.tail), "cursor": parsed.cursor},
+            parsed.follow,
+        )
         return
-    _show(opt, _api(client, "GET", path, None), "logs")
+    _emit(_group_text("podman", command), error=True)
 
 
-def _settings(opt: Opt, args: list[str]) -> None:
-    parser = argparse.ArgumentParser(add_help=False, prog="yard settings")
-    parser.add_argument("--domain", default=argparse.SUPPRESS)
-    parser.add_argument("--email", default=argparse.SUPPRESS)
-    parser.add_argument("--self-repo", default=argparse.SUPPRESS)
-    parser.add_argument("--self-ref", default=argparse.SUPPRESS)
-    parser.add_argument("--self-image", action="store_true")
-    parsed = vars(parser.parse_args(args))
-    body = {}
-    if "domain" in parsed:
-        body["domain"] = parsed["domain"]
-    if "email" in parsed:
-        body["email"] = parsed["email"]
-    if "self-repo" in parsed:
-        body["self_repo"] = parsed["self-repo"]
-    if "self-ref" in parsed:
-        body["self_ref"] = parsed["self-ref"]
-    if parsed.get("self-image"):
-        body["self_image"] = YARD_IMAGE
+def _show_logs_query(opt: Opt, path: str, query: dict[str, str], follow: bool) -> None:
+    picked = {key: value for key, value in query.items() if value}
     client = _load(opt)
-    if not body:
-        _show(opt, _api(client, "GET", "/api/v1/settings", None), "raw")
+    if follow:
+        picked["follow"] = "1"
+        _stream(client, path + "?" + urlencode(picked))
         return
-    _show(opt, _api(client, "PUT", "/api/v1/settings", body), "raw")
+    _show(opt, _api(client, "GET", path + "?" + urlencode(picked), None), "logs")
+
+
+def clone_git_args(*, full: bool, lazy: bool) -> list[str]:
+    args = ["clone"]
+    if not full:
+        args.extend(["--depth", "1", "--single-branch"])
+    if lazy:
+        args.append("--filter=blob:none")
+    return args
 
 
 def _clone(opt: Opt, args: list[str]) -> None:
-    if not args:
-        _show_cmd("clone", "repo", error=True)
+    parser = argparse.ArgumentParser(add_help=False, prog="yard clone")
+    parser.add_argument("--lazy", action="store_true")
+    parser.add_argument("--full", action="store_true")
+    parser.add_argument("name", nargs="?")
+    parsed = parser.parse_args(args)
+    if not parsed.name:
+        _show_cmd("clone", error=True)
     client = _load(opt)
-    remote = f"{client.url}/git/{args[0]}.git"
+    remote = f"{client.url}/git/{parsed.name}.git"
     with tempfile.TemporaryDirectory(prefix="yard-cred") as tmp:
         cred = Path(tmp) / "cred"
         cred.write_text(_with_token(remote, client.token) + "\n")
         cred.chmod(0o600)
-        _git([], ["-c", f"credential.helper=store --file {cred}", "clone", remote, args[0]])
-    _git([args[0]], ["remote", "set-url", "origin", remote])
-    _link_dir(args[0], remote, client.token)
-    print(args[0])
+        command = ["-c", f"credential.helper=store --file {cred}", *clone_git_args(full=parsed.full, lazy=parsed.lazy)]
+        command.extend([remote, parsed.name])
+        _git([], command)
+    _git([parsed.name], ["remote", "set-url", "origin", remote])
+    _link_dir(parsed.name, remote, client.token)
+    print(parsed.name)
 
 
 def _link(opt: Opt, args: list[str]) -> None:
@@ -950,6 +1193,9 @@ def _show(opt: Opt, body: str, kind: str) -> None:
     if kind == "logs":
         _show_logs(body)
         return
+    if kind == "git":
+        _show_git(body)
+        return
     try:
         rows = json.loads(body)
     except json.JSONDecodeError:
@@ -971,6 +1217,19 @@ def _show(opt: Opt, body: str, kind: str) -> None:
         print(format_tokens(rows, color=_color_on()), end="")
     else:
         print(body)
+
+
+def _show_git(body: str) -> None:
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        print(body)
+        return
+    if not isinstance(data, dict):
+        print(body)
+        return
+    text = str(data.get("output") or "")
+    print(text, end="" if text.endswith("\n") or not text else "\n")
 
 
 def _show_logs(body: str) -> None:
@@ -1141,7 +1400,7 @@ def _slot_cells(row: dict) -> list[str]:
     mark = _build_mark(str(row.get("build") or ""))
     if mark:
         state = f"{state} · {mark}" if state else mark
-    mem = mem_used(str(row.get("mem") or ""))
+    mem = str(row.get("mem") or "").split("/", 1)[0].strip()
     return [
         slot_label(str(row.get("slot") or ""), str(row.get("container") or "")),
         state,
@@ -1255,12 +1514,17 @@ def _measure(text: str) -> str:
 
 
 def slot_hint(rows: list) -> str:
+    down = ""
     for row in rows:
         if not isinstance(row, dict) or str(row.get("slot") or "") == "total":
             continue
-        if _needs_logs(_slot_state(row)):
-            return "yard slot logs " + slot_label(str(row.get("slot") or ""), str(row.get("container") or ""))
-    return ""
+        slot = str(row.get("slot") or "")
+        build = str(row.get("build") or "")
+        if slot and build.split(" ", 1)[0] == "failed":
+            return f"yard deploys {slot}"
+        if slot and not down and _needs_logs(_slot_state(row)):
+            down = f"yard logs --slot {slot}"
+    return down
 
 
 def _print_rows(rows: list) -> None:
@@ -1278,7 +1542,10 @@ def format_deploys(rows: list, *, color: bool = False) -> str:
     for row in rows:
         if not isinstance(row, dict):
             continue
-        took = format_span(str(row.get("started") or ""), str(row.get("ended") or ""))
+        started = str(row.get("started") or "")
+        ended = str(row.get("ended") or "")
+        built = str(row.get("built") or "")
+        took = format_span(started, ended)
         show_took = show_took or bool(took)
         body.append(
             [
@@ -1286,12 +1553,18 @@ def format_deploys(rows: list, *, color: bool = False) -> str:
                 str(row.get("status") or ""),
                 str(row.get("sha") or "")[:7],
                 took,
-                _when(str(row.get("started") or "")),
+                _when(started),
+                format_span(started, built),
+                format_span(built, ended),
             ]
         )
 
+    show_build = any(str(row[5] or "") for row in body)
     headers = ["id", "status", "rev"]
     indexes = [0, 1, 2]
+    if show_build:
+        headers.extend(("build", "start"))
+        indexes.extend((5, 6))
     if show_took:
         headers.append("took")
         indexes.append(3)
@@ -1299,8 +1572,9 @@ def format_deploys(rows: list, *, color: bool = False) -> str:
     indexes.append(4)
     picked = [[row[index] for index in indexes] for row in body]
     right = {0, len(headers) - 1}
-    if show_took:
-        right.add(headers.index("took"))
+    for name in ("build", "start", "took"):
+        if name in headers:
+            right.add(headers.index(name))
     return _render(headers, picked, right, color=color, paint=_paint_deploy)
 
 
@@ -1310,13 +1584,18 @@ def _print_deploy(row: dict) -> None:
     status = str(row.get("status") or "")
     if _color_on():
         status = _ansi(status, _deploy_attention(status))
-    parts = [f"deploy {row.get('id')}", str(row.get("slot") or ""), sha, status, _when(str(row.get("started") or ""))]
+    started = str(row.get("started") or "")
+    built_at = str(row.get("built") or "")
+    parts = [f"deploy {row.get('id')}", str(row.get("slot") or ""), sha, status, _when(started)]
+    build = format_span(started, built_at)
+    start = format_span(built_at, str(row.get("ended") or ""))
+    if build:
+        parts.append(f"build {build}")
+    if start:
+        parts.append(f"start {start}")
     if took:
         parts.append(took)
     print("  ".join(part for part in parts if part))
-    log_text = str(row.get("log") or "").strip()
-    if log_text:
-        print(f"\n{log_text}")
 
 
 def _object(body: str) -> dict[str, str]:
@@ -1409,28 +1688,11 @@ def format_record(body: str) -> str:
         name = str(data.get("name") or "")
         secret = str(data.get("token") or "")
         return f"{name}\n{secret}\n" if name else f"{secret}\n"
-    if "domain" in data and "self_image" in data:
-        return format_settings(data)
     if "name" in data and set(data) <= {"name", "created"}:
         return f"{data['name']}\n"
 
-    # The swap answer is for the wait, not for this screen.
-    if "image" in data and "status" in data:
-        return ""
     lines = [f"{key}  {value}" for key, value in data.items() if value not in ("", None, [], {})]
     return ("\n".join(lines) + "\n") if lines else ""
-
-
-def format_settings(data: dict) -> str:
-    repo = str(data.get("self_repo") or "")
-    pairs = [("domain", str(data.get("domain") or "")), ("email", str(data.get("email") or ""))]
-    if repo:
-        pairs.append(("repo", repo))
-        pairs.append(("ref", str(data.get("self_ref") or "main")))
-    else:
-        pairs.append(("image", str(data.get("self_image") or "") or YARD_IMAGE))
-    width = max(len(key) for key, _value in pairs)
-    return "".join(f"{key.ljust(width)}  {value}".rstrip() + "\n" for key, value in pairs)
 
 
 def _when(stamp: str) -> str:
@@ -1494,6 +1756,11 @@ def _root_text(*, full: bool) -> str:
         "",
         "  yard init --domain <host>",
         "  git push -u yard main",
+        "  yard logs --slot <name>",
+        "  yard deploy <name>",
+        "  yard git <repo> fetch",
+        "  yard init --remote https://github.com/org/app --domain <host>",
+        "  yard clone <repo>",
         "",
     ]
     for title, rows in _ROOT.items():
@@ -1581,102 +1848,6 @@ def _route_help(args: list[str]) -> NoReturn:
     if _lookup(None, group):
         _show_cmd(group)
     _emit(_root_text(full=True), error=True)
-
-
-def _settings_image(client: Client) -> bool:
-    try:
-        status, body = _api_try(client, "GET", "/api/v1/settings", None)
-    except OSError:
-        return True
-    if status >= 300:
-        return True
-    try:
-        settings = json.loads(body)
-    except json.JSONDecodeError:
-        return False
-    return not settings.get("self_repo")
-
-
-def _update(opt: Opt, action: str = "update") -> None:
-    client = _load(opt)
-    if action == "rollback":
-        print("starting the previous image", file=sys.stderr)
-    elif _settings_image(client):
-        print("pulling the image from the registry", file=sys.stderr)
-    else:
-        print("building the image from the repo this Yard holds", file=sys.stderr)
-
-    # The process can exit while the swap container takes its place.
-    try:
-        status, body = _api_try(client, "POST", "/api/v1/yard", {"action": action})
-    except OSError as exc:
-        print(f"the connection closed ({exc}). Checking the swap.", file=sys.stderr)
-        status, body = 0, ""
-    else:
-        if status >= 300:
-            _die(body if _json else explain(body))
-        if as_json(opt):
-            print(body)
-        print("swap started. Waiting until Yard answers.", file=sys.stderr)
-    _wait_swap(client, 180)
-
-
-def _wait_swap(client: Client, limit: float) -> None:
-    import time
-
-    deadline = time.monotonic() + limit
-    last = ""
-    while time.monotonic() < deadline:
-        health = _health_ok(client)
-        try:
-            status, body = _api_try(client, "GET", "/api/v1/yard", None)
-        except OSError:
-            status, body = 0, ""
-        if status and status < 300:
-            try:
-                swap = json.loads(body)
-            except json.JSONDecodeError:
-                swap = {}
-            current = str(swap.get("status") or "")
-            if current and current != last:
-                print(f"swap status: {current}", file=sys.stderr)
-                last = current
-            done, ok, message = judge_swap(current, health)
-            if done:
-                if ok:
-                    print(f"Yard is up on {swap.get('image')}.")
-                    return
-                _die(message)
-        time.sleep(1)
-
-    # The last status says how far the swap got before this wait gave up.
-    if last in {"building", "pulling"}:
-        _die("Yard is still on the previous process. The update stopped before the swap. Run yard update again.")
-    if last == "swapping":
-        _die("The swap started but Yard did not report ready. Read /srv/yard/data/yard/swap.log on the host.")
-    _die(f"Yard did not confirm the swap (last status {last}). Read /srv/yard/data/yard/swap.log on the host.")
-
-
-def judge_swap(status: str, health_ok: bool) -> tuple[bool, bool, str]:
-    if status == "ready":
-        if not health_ok:
-            return False, False, ""
-        return True, True, ""
-    if status == "rolled_back":
-        return True, False, "The swap failed and Yard is running the previous image."
-    if status == "failed":
-        return True, False, "The update failed before the swap finished. Run yard update again."
-    return False, False, ""
-
-
-def _health_ok(client: Client) -> bool:
-    request = urllib.request.Request(client.url + "/health")
-    try:
-        with urllib.request.urlopen(request, timeout=3) as response:
-            response.read()
-            return response.status == 200
-    except Exception:
-        return False
 
 
 def _api(client: Client, method: str, path: str, body: object) -> str:

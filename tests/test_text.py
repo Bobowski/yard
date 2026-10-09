@@ -40,9 +40,9 @@ def test_slot_file_round_trip():
     text = format_values(slot_values(slot))
     for line in (
         "SLOT_NAME=heldso",
-        "SLOT_BRANCH=main",
+        "REF=main",
         "SLOT_INTERVAL=5m",
-        "DEPLOY_SHA=abc",
+        "SHA=abc",
         "PORT=9000",
         "API_TOKEN=secret",
     ):
@@ -61,7 +61,7 @@ def test_slot_file_keeps_read_only_keys():
     slot = Slot("heldso", "heldso", "main", "", "", "", "", {}, "")
     text = format_values(slot_values(slot))
     text = text.replace("SLOT_REPO=heldso", "SLOT_REPO=other", 1)
-    text = text.replace("SLOT_DOMAIN=", "SLOT_DOMAIN=app.example.com", 1)
+    text = text.replace("DOMAIN=", "DOMAIN=app.example.com", 1)
     text = text.replace("SLOT_INTERVAL=", "SLOT_INTERVAL=off", 1)
     edit = apply_values(slot, parse_env(text))
     assert edit.warn == ["SLOT_REPO stays heldso"]
@@ -69,14 +69,16 @@ def test_slot_file_keeps_read_only_keys():
     assert edit.every == "off"
 
 
-def test_slot_file_leaves_app_names_alone():
+def test_slot_file_sets_ref_and_domain():
     slot = Slot("heldso", "heldso", "main", "", "heldso.example.com", "", "", {}, "")
-    text = format_values(slot_values(slot)) + "DOMAIN=internal\nREF=other\n"
+    text = format_values(slot_values(slot))
+    text = text.replace("REF=main", "REF=release", 1)
+    text = text.replace("DOMAIN=heldso.example.com", "DOMAIN=app.example.com", 1)
+    text += "API_URL=https://x\n"
     edit = apply_values(slot, parse_env(text))
-    assert edit.domain is None
-    assert edit.ref is None
-    assert edit.env["DOMAIN"] == "internal"
-    assert edit.env["REF"] == "other"
+    assert edit.ref == "release"
+    assert edit.domain == "app.example.com"
+    assert edit.env["API_URL"] == "https://x"
 
 
 def test_parse_blocks_round_trip():

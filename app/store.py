@@ -11,8 +11,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import NoReturn
+from urllib.parse import urlsplit, urlunsplit
 
-from app.config import YARD_IMAGE
 from app.errors import YardError
 
 _NAME = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
@@ -38,13 +38,13 @@ def token_hash(plain: str) -> str:
 
 
 def check_name(name: str) -> None:
-    if name == "yard" or name.startswith("yard-"):
+    if name.startswith("yard-"):
         raise YardError(
             400,
             "bad_name",
             "name must be a short lowercase word",
             context={"name": name},
-            help_text="yard and yard-* are reserved for this host.",
+            help_text="yard-* is reserved for this host.",
             example="heldso",
         )
     if not _NAME.fullmatch(name):
@@ -83,6 +83,42 @@ def check_ref(ref: str) -> None:
         )
 
 
+def check_origin(url: str) -> str:
+    url = url.strip()
+    if any(ch in url for ch in " \t\r\n"):
+        _bad_origin(url)
+    parts = urlsplit(url)
+    if parts.scheme not in {"http", "https"} or not parts.hostname or not parts.path.strip("/"):
+        _bad_origin(url)
+    return url
+
+
+def origin_name(url: str) -> str:
+    name = urlsplit(check_origin(url)).path.rstrip("/").rsplit("/", 1)[-1]
+    if name.endswith(".git"):
+        name = name[:-4]
+    return name.lower()
+
+
+def public_origin(url: str) -> str:
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, host, parts.path, "", ""))
+
+
+def _bad_origin(url: str) -> NoReturn:
+    raise YardError(
+        400,
+        "bad_origin",
+        "remote must be an http or https git address",
+        context={"remote": url.split("@")[-1]},
+        help_text="Pass the GitHub address. Yard clones it on the host.",
+        example="https://github.com/org/heldso",
+    )
+
+
 def check_domain(domain: str) -> None:
     if not domain:
         return
@@ -94,20 +130,6 @@ def check_domain(domain: str) -> None:
             context={"domain": domain},
             help_text="Use a lowercase hostname. One domain belongs to one slot.",
             example="heldso.example.com",
-        )
-
-
-def check_image(image: str) -> None:
-    if not image:
-        return
-    if image != YARD_IMAGE:
-        raise YardError(
-            400,
-            "bad_image",
-            f"image must be {YARD_IMAGE}",
-            context={"image": image},
-            help_text="That is the published image. To build from a repo, set self_repo and leave the image empty.",
-            example=f"yard settings --self-image {YARD_IMAGE}",
         )
 
 
@@ -159,9 +181,14 @@ def parse_duration(text: str) -> float:
     return total
 
 
-def _domain_taken(domain: str, *, host: bool) -> NoReturn:
-    reason = "The Yard host keeps that domain." if host else "One domain belongs to one slot."
-    raise YardError(409, "domain_taken", "domain already in use", context={"domain": domain}, help_text=reason)
+def _domain_taken(domain: str) -> NoReturn:
+    raise YardError(
+        409,
+        "domain_taken",
+        "domain already in use",
+        context={"domain": domain},
+        help_text="One domain belongs to one slot.",
+    )
 
 
 def _unknown_token(name: str) -> NoReturn:
@@ -239,22 +266,11 @@ class Token:
 class Deploy:
     id: int
     slot: str
-    repo: str
     sha: str
-    image: str
     status: str
-    log: str
     started: str
+    built: str
     ended: str
-
-
-@dataclass(slots=True)
-class Settings:
-    domain: str
-    email: str
-    self_repo: str
-    self_ref: str
-    self_image: str
 
 
 @dataclass(slots=True)
@@ -287,20 +303,16 @@ class Store:
         db.execute("PRAGMA busy_timeout=5000")
         db.execute("PRAGMA foreign_keys=ON")
         store = cls(db)
-        store._migrate()
+        store._schema()
         return store
 
     def close(self) -> None:
         with self._lock:
             self._db.close()
 
-    def _migrate(self) -> None:
+    def _schema(self) -> None:
         self._db.executescript(
             """
-            CREATE TABLE IF NOT EXISTS meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS repos (
                 name TEXT PRIMARY KEY,
                 created TEXT NOT NULL
@@ -326,12 +338,10 @@ class Store:
             CREATE TABLE IF NOT EXISTS deploys (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 slot TEXT NOT NULL,
-                repo TEXT NOT NULL DEFAULT '',
-                sha TEXT NOT NULL DEFAULT '',
-                image TEXT NOT NULL,
+                sha TEXT NOT NULL,
                 status TEXT NOT NULL,
-                log TEXT NOT NULL DEFAULT '',
                 started TEXT NOT NULL,
+                built TEXT NOT NULL DEFAULT '',
                 ended TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS experiments (
@@ -349,22 +359,6 @@ class Store:
             CREATE INDEX IF NOT EXISTS exp_labels_exp ON exp_labels(exp_id);
             """
         )
-
-        # The column arrived after the first schema. A later boot already has it.
-        try:
-            self._db.execute("ALTER TABLE slots ADD COLUMN every TEXT NOT NULL DEFAULT ''")
-        except sqlite3.OperationalError as exc:
-            if "duplicate column" not in str(exc).lower():
-                raise
-
-        self._db.execute("DROP INDEX IF EXISTS slots_port")
-        self._db.execute("DROP INDEX IF EXISTS deploy_steps_deploy")
-        self._db.execute("DROP TABLE IF EXISTS deploy_steps")
-        self._db.execute("DROP TABLE IF EXISTS events")
-
-        columns = {row[1] for row in self._db.execute("PRAGMA table_info(slots)")}
-        if "host_port" in columns:
-            self._db.execute("ALTER TABLE slots DROP COLUMN host_port")
         self._db.execute("CREATE UNIQUE INDEX IF NOT EXISTS slots_domain ON slots(domain) WHERE domain != ''")
         self._db.commit()
 
@@ -385,16 +379,6 @@ class Store:
                 self._db.rollback()
                 _raise_integrity(exc)
             return cur
-
-    def meta(self, key: str) -> str:
-        row = self._one("SELECT value FROM meta WHERE key = ?", (key,))
-        return "" if row is None else str(row["value"])
-
-    def set_meta(self, key: str, value: str) -> None:
-        self._write(
-            "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, value),
-        )
 
     def list_repos(self) -> list[Repo]:
         rows = self._all("SELECT name, created FROM repos ORDER BY name")
@@ -528,11 +512,9 @@ class Store:
         check_domain(domain)
         if not domain:
             return
-        if domain == self.meta("domain"):
-            _domain_taken(domain, host=True)
         row = self._one("SELECT name FROM slots WHERE domain = ? AND name != ?", (domain, except_name))
         if row is not None:
-            _domain_taken(domain, host=False)
+            _domain_taken(domain)
 
     def create_token(self, name: str, parent: str) -> str:
         check_name(name)
@@ -615,20 +597,20 @@ class Store:
             name = str(row["parent"])
         return True
 
-    def begin_deploy(self, slot: str, repo: str, sha: str) -> int:
+    def begin_deploy(self, slot: str, sha: str) -> int:
         cur = self._write(
             """
-            INSERT INTO deploys (slot, repo, sha, image, status, log, started, ended)
-            VALUES (?, ?, ?, '', 'running', '', ?, '')
+            INSERT INTO deploys (slot, sha, status, started)
+            VALUES (?, ?, 'running', ?)
             """,
-            (slot, repo, sha, now_nano()),
+            (slot, sha, now_nano()),
         )
         return int(cur.lastrowid or 0)
 
-    def finish_deploy(self, deploy_id: int, status: str, image: str, log: str) -> None:
+    def finish_deploy(self, deploy_id: int, status: str, built: str = "") -> None:
         self._write(
-            "UPDATE deploys SET status = ?, image = ?, log = ?, ended = ? WHERE id = ?",
-            (status, image, log, now_nano(), deploy_id),
+            "UPDATE deploys SET status = ?, built = ?, ended = ? WHERE id = ?",
+            (status, built, now_nano(), deploy_id),
         )
 
     def interrupt_deploys(self) -> None:
@@ -636,7 +618,7 @@ class Store:
 
     def deploy(self, deploy_id: int) -> Deploy:
         row = self._one(
-            "SELECT id, slot, repo, sha, image, status, log, started, ended FROM deploys WHERE id = ?",
+            "SELECT id, slot, sha, status, started, built, ended FROM deploys WHERE id = ?",
             (deploy_id,),
         )
         if row is None:
@@ -645,7 +627,7 @@ class Store:
                 "not_found",
                 "deploy does not exist",
                 context={"id": deploy_id},
-                help_text="Run yard slot deploys <name> to see the ids.",
+                help_text="Run yard deploys <name> to see the ids.",
             )
         return self._deploy(row)
 
@@ -654,7 +636,7 @@ class Store:
             limit = 20
         rows = self._all(
             """
-            SELECT id, slot, repo, sha, image, status, log, started, ended FROM deploys
+            SELECT id, slot, sha, status, started, built, ended FROM deploys
             WHERE slot = ?
             ORDER BY id DESC LIMIT ?
             """,
@@ -665,56 +647,12 @@ class Store:
     def last_deploy(self, slot: str) -> Deploy | None:
         row = self._one(
             """
-            SELECT id, slot, repo, sha, image, status, log, started, ended
+            SELECT id, slot, sha, status, started, built, ended
             FROM deploys WHERE slot = ? ORDER BY id DESC LIMIT 1
             """,
             (slot,),
         )
         return None if row is None else self._deploy(row)
-
-    def settings(self) -> Settings:
-        ref = self.meta("self_ref") or "main"
-        return Settings(self.meta("domain"), self.meta("email"), self.meta("self_repo"), ref, self.meta("self_image"))
-
-    def save_settings(self, incoming: Settings) -> None:
-        if incoming.domain:
-            check_domain(incoming.domain)
-            if self._one("SELECT name FROM slots WHERE domain = ?", (incoming.domain,)) is not None:
-                _domain_taken(incoming.domain, host=False)
-        if incoming.self_image and incoming.self_repo:
-            raise YardError(
-                400,
-                "one_source",
-                "set self_image or self_repo",
-                help_text=(
-                    "A repo and an image cannot both be the source. An empty value returns to the published image."
-                ),
-                example="yard settings --self-repo yard",
-            )
-        if incoming.self_image:
-            check_image(incoming.self_image)
-        if incoming.self_repo:
-            check_name(incoming.self_repo)
-            self.repo(incoming.self_repo)
-
-        ref = incoming.self_ref or "main"
-        check_ref(ref)
-        pairs = (
-            ("domain", incoming.domain),
-            ("email", incoming.email),
-            ("self_repo", incoming.self_repo),
-            ("self_ref", ref),
-            ("self_image", incoming.self_image),
-        )
-        sql = "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
-        with self._lock:
-            try:
-                for key, value in pairs:
-                    self._db.execute(sql, (key, value))
-                self._db.commit()
-            except sqlite3.IntegrityError as exc:
-                self._db.rollback()
-                _raise_integrity(exc)
 
     def list_experiments(self) -> list[Experiment]:
         rows = self._all("SELECT id, title, body, created, updated FROM experiments ORDER BY id DESC")
@@ -829,12 +767,10 @@ class Store:
         return Deploy(
             int(row["id"]),
             str(row["slot"]),
-            str(row["repo"]),
             str(row["sha"]),
-            str(row["image"]),
             str(row["status"]),
-            str(row["log"]),
             str(row["started"]),
+            str(row["built"] or ""),
             str(row["ended"]),
         )
 

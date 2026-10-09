@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -13,6 +14,9 @@ class Listed:
     id: str = ""
     name: str = ""
     slot: str = ""
+    service: str = ""
+    role: str = ""
+    sha: str = ""
     state: str = ""
     status: str = ""
     health: str = ""
@@ -64,10 +68,22 @@ class Podman:
         head.extend(args)
         return head
 
-    async def run(self, *args: str, timeout: float | None = 20) -> str:
+    async def run(
+        self,
+        *args: str,
+        timeout: float | None = 20,
+        env: dict[str, str] | None = None,
+        program: str = "",
+    ) -> str:
+        cmd = [program, *args] if program else self._args(args)
+        merged = os.environ.copy()
+        if env:
+            merged.update(env)
+        name = program or "podman"
         try:
             proc = await asyncio.create_subprocess_exec(
-                *self._args(args),
+                *cmd,
+                env=merged if env or program else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -75,8 +91,8 @@ class Podman:
             raise YardError(
                 502,
                 "podman",
-                f"podman {' '.join(args)}: {exc}",
-                help_text="The podman command has to be on PATH.",
+                f"{name} {' '.join(args)}: {exc}",
+                help_text=f"The {name} command has to be on PATH.",
             ) from exc
         try:
             if timeout is None:
@@ -88,7 +104,7 @@ class Podman:
             raise YardError(
                 502,
                 "podman",
-                f"podman {' '.join(args)}: timed out",
+                f"{name} {' '.join(args)}: timed out",
                 help_text="The command did not finish. The container may still be starting.",
             ) from exc
         text = ((out or b"") + (err or b"")).decode(errors="replace").strip()
@@ -96,7 +112,7 @@ class Podman:
             raise YardError(
                 502,
                 "podman",
-                f"podman {' '.join(args)}: {text}",
+                f"{name} {' '.join(args)}: {text}",
                 exit_code=proc.returncode,
                 help_text="Yard talks to Podman through the socket on this host.",
             )
@@ -123,21 +139,6 @@ class Podman:
         except YardError:
             await self.run("network", "create", name, timeout=20)
 
-    async def build(self, tag: str, context: str, file: str) -> None:
-        await self.run("build", "-t", tag, "-f", file, context, timeout=None)
-
-    async def pull(self, image: str) -> None:
-        await self.run("pull", image, timeout=None)
-
-    async def image_exists(self, tag: str) -> bool:
-        try:
-            await self.run("image", "exists", tag, timeout=20)
-        except YardError as exc:
-            if exc.exit_code == 1:
-                return False
-            raise
-        return True
-
     async def remove(self, name: str) -> None:
         await self.run("rm", "-f", name, timeout=20)
 
@@ -146,20 +147,8 @@ def ps_args() -> list[str]:
     return ["ps", "-a", "--format", "json"]
 
 
-def stats_args(names: list[str] | None = None) -> list[str]:
-    args = ["stats", "--no-stream", "--format", "json"]
-    for name in names or []:
-        if not ok_name(name):
-            raise YardError(
-                400,
-                "bad_args",
-                "bad container name",
-                context={"name": name},
-                help_text="Start with a letter or digit. Then use letters, digits, and . _ -",
-                example="heldso",
-            )
-        args.append(name)
-    return args
+def stats_args() -> list[str]:
+    return ["stats", "--no-stream", "--format", "json"]
 
 
 def inspect_args(name: str) -> list[str]:
@@ -236,6 +225,9 @@ def parse_ps(raw: str) -> dict[str, Listed]:
             id=_str(row, "Id", "ID", "id"),
             name=names[0],
             slot=_label(row, "yard.slot"),
+            service=_label(row, "yard.service"),
+            role=_label(row, "yard.role"),
+            sha=_label(row, "yard.sha"),
             state=_str(row, "State", "state"),
             status=status,
             health=health,
@@ -249,25 +241,20 @@ def parse_ps(raw: str) -> dict[str, Listed]:
     return found
 
 
-def latest_for_slot(listed: dict[str, Listed], slot: str) -> Listed | None:
-    best: Listed | None = None
-    best_at = datetime.min.replace(tzinfo=UTC)
-    for item in listed.values():
-        if item.name != slot and item.slot != slot:
-            continue
-        created = item.created or datetime.min.replace(tzinfo=UTC)
-        if best is None or created > best_at or (created == best_at and item.running):
-            best = item
-            best_at = created
-    return best
-
-
-def ids_for_slot(raw: str, slot: str) -> list[str]:
+def ids_for_slot(raw: str, slot: str, role: str) -> list[str]:
     listed = parse_ps(raw)
-    labeled = [item.id for item in listed.values() if item.slot == slot and item.id]
-    if labeled:
-        return labeled
-    return [item.id for item in listed.values() if item.id]
+    return [item.id for item in listed.values() if item.id and item.slot == slot and item.role == role]
+
+
+def log_hit(item: Listed, *, slot: str, role: str, sha: str) -> bool:
+    """One container matches the labels. An empty role means app."""
+    if item.role != (role or "app"):
+        return False
+    if slot and item.slot != slot and item.name != slot:
+        return False
+    if sha and not item.sha.startswith(sha):
+        return False
+    return True
 
 
 def parse_inspect(raw: str) -> list[Inspected]:

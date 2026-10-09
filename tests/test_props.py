@@ -6,7 +6,7 @@ import pytest
 from hypothesis import example, given
 from hypothesis import strategies as st
 
-from app.cli import judge_swap, parse_slot_sets, slot_patch, split_args
+from app.cli import parse_slot_sets, slot_patch, split_args
 from app.errors import YardError
 from app.machine import JOB_RETRY, RunState, image_tag, job_due, plan_job, routes_from, slug, yard_route
 from app.podman import format_stamp, page_log_rows, page_logs
@@ -77,6 +77,7 @@ def _set_args(pairs: list[tuple[str, str]]) -> list[str]:
 
 
 @example("heldso")
+@example("yard")
 @example("a")
 @example("a-")
 @given(repo_names())
@@ -85,13 +86,13 @@ def test_repo_names_pass(name: str) -> None:
 
 
 @example("heldso")
+@example("yard")
 @given(slot_names())
 def test_slot_names_pass(name: str) -> None:
     check_slot_name(name)
 
 
 @example("")
-@example("yard")
 @example("yard-sampler")
 @example("Heldso")
 @given(bad_repos())
@@ -303,10 +304,10 @@ def test_slot_repo_key_stays(name: str) -> None:
     assert edit.ref is None
 
 
-@example({"SLOT_DOMAIN": "heldso.com", "API_TOKEN": "secret"}, {"API_TOKEN": "secret", "PORT": "9000"})
+@example({"DOMAIN": "heldso.com", "API_TOKEN": "secret"}, {"API_TOKEN": "secret", "PORT": "9000"})
 @given(
-    st.dictionaries(env_keys() | st.sampled_from(["SLOT_DOMAIN", "SLOT_BRANCH", "PORT"]), env_values(), max_size=5),
-    st.dictionaries(env_keys() | st.sampled_from(["SLOT_DOMAIN", "SLOT_BRANCH", "PORT"]), env_values(), max_size=5),
+    st.dictionaries(env_keys() | st.sampled_from(["DOMAIN", "REF", "PORT"]), env_values(), max_size=5),
+    st.dictionaries(env_keys() | st.sampled_from(["DOMAIN", "REF", "PORT"]), env_values(), max_size=5),
 )
 def test_slot_patch_writes_only_the_changes(before: dict[str, str], after: dict[str, str]) -> None:
     patch = slot_patch(before, after)
@@ -320,7 +321,7 @@ def test_slot_patch_writes_only_the_changes(before: dict[str, str], after: dict[
             assert patch[key] == ""
 
 
-@example([("SLOT_DOMAIN", "heldso.com"), ("API_TOKEN", "secret"), ("OLD", "")])
+@example([("DOMAIN", "heldso.com"), ("API_TOKEN", "secret"), ("OLD", "")])
 @given(st.lists(st.tuples(env_keys(), env_values()), min_size=1, max_size=4))
 def test_slot_sets_round_trip(pairs: list[tuple[str, str]]) -> None:
     assert parse_slot_sets(_set_args(pairs)) == pairs
@@ -348,24 +349,6 @@ def test_url_flag_consumes_the_next_word(url: str, words_in: list[str]) -> None:
     opt = split_args(["--url", url, *words_in])
     assert opt.url == url
     assert opt.rest == words_in
-
-
-@example("ready", True)
-@example("ready", False)
-@example("rolled_back", True)
-@example("failed", False)
-@example("swapping", False)
-@given(st.text(alphabet="abcdefghijklmnopqrstuvwxyz_", max_size=12), st.booleans())
-def test_judge_swap(status: str, health: bool) -> None:
-    done, ok, message = judge_swap(status, health)
-    if status == "ready" and health:
-        assert (done, ok) == (True, True)
-    elif status == "ready":
-        assert done is False
-    elif status in {"rolled_back", "failed"}:
-        assert done is True and ok is False and message
-    else:
-        assert done is False and ok is False
 
 
 @example("heldso")

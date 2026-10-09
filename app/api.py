@@ -32,9 +32,15 @@ def register_api(app: App, yard: Yard) -> None:
         body = await _object(c)
         name = body.get("name", "")
         force = body.get("force", False)
-        if not isinstance(name, str) or not isinstance(force, bool):
-            raise YardError(400, "bad_json", "bad json", help_text="name is a string. force is true or false.")
-        responses.json(w, await yard.create_repo(name, force))
+        origin = body.get("origin", "")
+        if not isinstance(name, str) or not isinstance(force, bool) or not isinstance(origin, str):
+            raise YardError(
+                400,
+                "bad_json",
+                "bad json",
+                help_text="name is a string. force is true or false. origin is an http address.",
+            )
+        responses.json(w, await yard.create_repo(name, force, origin))
 
     async def repos_delete(c: Context, w: Writer) -> None:
         name = c.match.params["name"]
@@ -42,7 +48,22 @@ def register_api(app: App, yard: Yard) -> None:
         responses.json(w, {"name": name})
 
     app.add(Route("GET /api/v1/repos"), repos_list, middleware=auth)
+
+    async def repos_git(c: Context, w: Writer) -> None:
+        body = await _object(c)
+        args = body.get("args")
+        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+            raise YardError(
+                400,
+                "bad_json",
+                "bad json",
+                help_text="args is a list of strings.",
+                example='{"args": ["log", "-1"]}',
+            )
+        responses.json(w, await yard.git_repo(c.match.params["name"], args))
+
     app.add(Route("POST /api/v1/repos"), repos_create, middleware=auth)
+    app.add(Route("POST /api/v1/repos/{name}/git"), repos_git, middleware=auth)
     app.add(Route("DELETE /api/v1/repos/{name}"), repos_delete, middleware=auth)
 
     async def slots_list(c: Context, w: Writer) -> None:
@@ -58,8 +79,11 @@ def register_api(app: App, yard: Yard) -> None:
     async def slots_put(c: Context, w: Writer) -> None:
         name = c.match.params["name"]
         edit = apply_slot_keys(yard.store.slot(name), _string_map(await _object(c)))
-        slot = await yard.update_slot(name, edit)
-        responses.json(w, cast(JsonValue, {"values": slot_values(slot), "warnings": edit.warn}))
+        slot, note = await yard.update_slot(name, edit)
+        body: dict[str, JsonValue] = {"values": slot_values(slot), "warnings": edit.warn}
+        if note is not None:
+            body["deploy"] = note
+        responses.json(w, cast(JsonValue, body))
 
     async def slots_delete(c: Context, w: Writer) -> None:
         name = c.match.params["name"]
@@ -67,24 +91,25 @@ def register_api(app: App, yard: Yard) -> None:
         responses.json(w, {"name": name})
 
     async def logs(c: Context, w: Writer) -> None:
-        name = c.match.params["name"]
-        tail_text = c.req.query.get("tail") or "200"
-        if not tail_text.isdigit() or int(tail_text) < 1:
-            raise YardError(
-                400,
-                "bad_tail",
-                "tail must be a positive number",
-                help_text="tail is how many log lines to read.",
-                example="200",
-            )
-        tail = int(tail_text)
-        cursor = c.req.query.get("cursor") or ""
-        container = c.req.query.get("container") or ""
+        slot, role, service, sha, tail, cursor = _log_filters(c)
         if c.req.query.get("follow") == "1":
-            await _follow(yard, w, name, tail, cursor, container)
+            await _follow(yard, w, slot, role, service, sha, tail, cursor)
             return
+        responses.json(w, await yard.log_page(slot, role, service, sha, tail, cursor))
 
-        responses.json(w, await yard.log_page(name, tail, cursor, container))
+    async def container_logs(c: Context, w: Writer) -> None:
+        name = c.match.params["name"]
+        tail, cursor = _tail(c), c.req.query.get("cursor") or ""
+        if c.req.query.get("follow") == "1":
+            inspect_args(name)
+            await _stream_logs(yard, w, _follow_args(name, tail, cursor))
+            return
+        responses.json(w, await yard.container_log_page(name, tail, cursor))
+
+    async def slot_deploy(c: Context, w: Writer) -> None:
+        name = c.match.params["name"]
+        note = await yard.deploy_existing(yard.store.slot(name))
+        responses.json(w, cast(JsonValue, note))
 
     async def deploys(c: Context, w: Writer) -> None:
         name = c.match.params["name"]
@@ -102,7 +127,7 @@ def register_api(app: App, yard: Yard) -> None:
                 400,
                 "bad_id",
                 "deploy id must be a number",
-                help_text="The id is the number from yard slot deploys <name>.",
+                help_text="The id is the number from yard deploys <name>.",
             )
 
         row = yard.store.deploy(int(raw))
@@ -121,29 +146,12 @@ def register_api(app: App, yard: Yard) -> None:
     app.add(Route("GET /api/v1/slots/{name}"), slots_get, middleware=auth)
     app.add(Route("PUT /api/v1/slots/{name}"), slots_put, middleware=auth)
     app.add(Route("DELETE /api/v1/slots/{name}"), slots_delete, middleware=auth)
-    app.add(Route("GET /api/v1/slots/{name}/logs"), logs, middleware=auth)
+    app.add(Route("POST /api/v1/slots/{name}/deploy"), slot_deploy, middleware=auth)
+    app.add(Route("GET /api/v1/logs"), logs, middleware=auth)
+    app.add(Route("GET /api/v1/containers/{name}/logs"), container_logs, middleware=auth)
     app.add(Route("GET /api/v1/slots/{name}/deploys"), deploys, middleware=auth)
     app.add(Route("GET /api/v1/slots/{name}/deploys/{id}"), deploy, middleware=auth)
     app.add(Route("GET /api/v1/containers/{name}"), inspect, middleware=auth)
-
-    async def settings_get(_c: Context, w: Writer) -> None:
-        responses.json(w, asdict(yard.store.settings()))
-
-    async def settings_put(c: Context, w: Writer) -> None:
-        body = await _object(c)
-        responses.json(
-            w,
-            await yard.save_settings(
-                _optional(body, "domain"),
-                _optional(body, "email"),
-                _optional(body, "self_repo"),
-                _optional(body, "self_ref"),
-                _optional(body, "self_image"),
-            ),
-        )
-
-    app.add(Route("GET /api/v1/settings"), settings_get, middleware=auth)
-    app.add(Route("PUT /api/v1/settings"), settings_put, middleware=auth)
 
     async def tokens_list(_c: Context, w: Writer) -> None:
         responses.json(w, [asdict(token) for token in yard.store.list_tokens()])
@@ -197,41 +205,42 @@ def register_api(app: App, yard: Yard) -> None:
 
     async def hook(c: Context, w: Writer) -> None:
         body = await _object(c)
-        repo, old, new, ref = body.get("repo", ""), body.get("old", ""), body.get("new", ""), body.get("ref", "")
-        if not all(isinstance(item, str) for item in (repo, old, new, ref)):
+        repo, new, ref = body.get("repo", ""), body.get("new", ""), body.get("ref", "")
+        if not all(isinstance(item, str) for item in (repo, new, ref)):
             raise YardError(
                 400,
                 "bad_json",
                 "bad json",
-                help_text="repo, old, new, and ref are strings.",
+                help_text="repo, new, and ref are strings.",
             )
-        status, text = await yard.hook_push(repo, old, new, ref)
+        status, text = await yard.hook_push(repo, new, ref)
         responses.text(w, text, status)
 
-    async def yard_post(c: Context, w: Writer) -> None:
-        action = (await _object(c)).get("action", "")
-        if not isinstance(action, str):
-            raise YardError(400, "bad_json", "bad json", help_text="action is a string.")
-        if action == "rollback":
-            await yard.rollback()
-            responses.json(w, {"image": "localhost/yard:previous", "container": "yard-swap"})
-            return
-        if action not in {"", "update"}:
-            raise YardError(
-                400,
-                "bad_action",
-                "action is update or rollback",
-                help_text="Omit action to update.",
-                example='{"action": "rollback"}',
-            )
-        responses.json(w, await yard.update_yard())
+    app.add(Route("POST /api/v1/hooks/push"), hook, middleware=(_local(), *auth))
 
-    async def yard_get(_c: Context, w: Writer) -> None:
-        responses.json(w, yard.swap_status())
 
-    app.add(Route("POST /api/v1/hooks/push"), hook, middleware=auth)
-    app.add(Route("POST /api/v1/yard"), yard_post, middleware=auth)
-    app.add(Route("GET /api/v1/yard"), yard_get, middleware=auth)
+def _local() -> Middleware:
+    def middleware(handler: Handler) -> Handler:
+        async def wrapped(c: Context, w: Writer) -> None:
+            if c.req.host not in {"127.0.0.1", "localhost", "::1"}:
+                responses.json(
+                    w,
+                    {
+                        "error": YardError(
+                            403,
+                            "local_only",
+                            "the hook accepts a request from this host",
+                            help_text="The git hook calls 127.0.0.1.",
+                        ).payload()
+                    },
+                    403,
+                )
+                return
+            await handler(c, w)
+
+        return wrapped
+
+    return middleware
 
 
 def _bearer(yard: Yard) -> Middleware:
@@ -277,13 +286,70 @@ def _bearer(yard: Yard) -> Middleware:
     return middleware
 
 
-async def _follow(yard: Yard, w: Writer, name: str, tail: int, cursor: str, container: str) -> None:
-    yard.store.slot(name)
-    target = container or await yard.log_target(name)
+def _tail(c: Context) -> int:
+    text = c.req.query.get("tail") or "200"
+    if not text.isdigit() or int(text) < 1:
+        raise YardError(
+            400,
+            "bad_tail",
+            "tail must be a positive number",
+            help_text="tail is how many log lines to read.",
+            example="200",
+        )
+    return int(text)
+
+
+def _log_filters(c: Context) -> tuple[str, str, str, str, int, str]:
+    role = c.req.query.get("role") or ""
+    if role and role not in {"app", "deploy", "revert", "job"}:
+        raise YardError(
+            400,
+            "bad_role",
+            "role must be app, deploy, revert, or job",
+            help_text="An empty role reads app.",
+            example="yard logs --role deploy",
+        )
+    return (
+        c.req.query.get("slot") or "",
+        role,
+        c.req.query.get("service") or "",
+        c.req.query.get("sha") or "",
+        _tail(c),
+        c.req.query.get("cursor") or "",
+    )
+
+
+async def _follow(
+    yard: Yard,
+    w: Writer,
+    slot: str,
+    role: str,
+    service: str,
+    sha: str,
+    tail: int,
+    cursor: str,
+) -> None:
+    targets = await yard.log_targets(slot, role, service, sha)
+    if len(targets) != 1:
+        raise YardError(
+            400,
+            "many_services",
+            "name one container to follow" if targets else "no container matches",
+            help_text="Add --slot, --service, or --sha until one container matches.",
+            example="yard logs --slot heldso --follow",
+        )
+    await _stream_logs(yard, w, _follow_args(targets[0][1], tail, cursor))
+
+
+def _follow_args(name: str, tail: int, cursor: str) -> list[str]:
     args = ["logs", "--follow", "--tail", str(tail)]
     if cursor:
         args.extend(("--since", cursor))
-    args.append(target)
+    args.append(name)
+    return args
+
+
+async def _stream_logs(yard: Yard, w: Writer, args: list[str]) -> None:
     proc = await yard.podman.popen(*args)
     w.headers.set("content-type", "text/plain; charset=utf-8")
     w.write_headers(200)
@@ -316,15 +382,6 @@ def _string_map(body: dict) -> dict[str, str]:
             raise YardError(400, "bad_json", "bad json", help_text="Every slot field is a string.")
         found[key] = value
     return found
-
-
-def _optional(body: dict, key: str) -> str | None:
-    if key not in body:
-        return None
-    value = body[key]
-    if not isinstance(value, str):
-        raise YardError(400, "bad_json", "bad json", help_text=f"{key} is a string.")
-    return value
 
 
 def _one_exp(yard: Yard, raw: str) -> Experiment:

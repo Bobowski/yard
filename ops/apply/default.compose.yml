@@ -1,0 +1,29 @@
+# A repo that has a Containerfile and no compose file.
+services:
+  app:
+    build:
+      context: ${CHECKOUT}
+      dockerfile: ${DOCKERFILE:-Containerfile}
+    image: ${IMAGE}
+    pull_policy: never
+    restart: ${RESTART:-always}
+    networks:
+      yard:
+        aliases:
+          - ${SLOT_NAME}
+    labels:
+      yard.role: app
+      yard.slot: ${SLOT_NAME}
+      yard.service: app
+      yard.sha: ${SHA:-}
+    volumes:
+      - ${DATA_DIR}:/data
+    env_file:
+      - ${APP_ENV}
+    expose:
+      - "${PORT:-8000}"
+
+networks:
+  yard:
+    external: true
+    name: yard

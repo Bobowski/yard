@@ -18,3 +18,7 @@ async def yard(tmp_path, monkeypatch):
 
 def auth(token: str) -> dict[str, str]:
     return {"authorization": f"Bearer {token}"}
+
+
+def local(token: str) -> dict[str, str]:
+    return {"authorization": f"Bearer {token}", "host": "127.0.0.1"}

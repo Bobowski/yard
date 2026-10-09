@@ -4,8 +4,6 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-YARD_IMAGE = "ghcr.io/bobowski/yard:latest"
-
 
 def hook_url(host: str, port: str) -> str:
     if host in {"0.0.0.0", "::"}:
@@ -19,7 +17,6 @@ class Config:
     caddy_sock: Path | None
     podman_sock: str
     podman_bin: str
-    public_port: int
     hook_url: str
     domain: str
     skip_deploy: bool
@@ -45,13 +42,11 @@ class Config:
             sock = str(root / "run" / "caddy.sock")
         podman_sock = os.environ.get("YARD_PODMAN_SOCK", "")
         remote = bool(podman_sock or os.environ.get("CONTAINER_HOST"))
-        public = os.environ.get("YARD_PUBLIC_PORT") or port
         return cls(
             root=root,
             caddy_sock=Path(sock) if sock else None,
             podman_sock=podman_sock,
             podman_bin=os.environ.get("YARD_PODMAN_BIN", "podman"),
-            public_port=int(public),
             hook_url=os.environ.get("YARD_HOOK_URL") or hook_url(host, port),
             domain=os.environ.get("YARD_DOMAIN", ""),
             skip_deploy=os.environ.get("YARD_SKIP_DEPLOY", "") == "1",

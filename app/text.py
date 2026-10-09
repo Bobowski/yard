@@ -9,21 +9,21 @@ from app.store import Slot
 ORDER = [
     "SLOT_NAME",
     "SLOT_REPO",
-    "SLOT_BRANCH",
-    "SLOT_DIRECTORY",
-    "SLOT_DOMAIN",
-    "SLOT_INTERVAL",
-    "DEPLOY_SHA",
-    "DEPLOY_IMAGE",
     "SLOT_DATA_DIR",
+    "SHA",
+    "IMAGE",
+    "REF",
+    "SLOT_DIRECTORY",
+    "DOMAIN",
+    "SLOT_INTERVAL",
     "PORT",
     "PYTHONUNBUFFERED",
     "STARIO_HOST",
     "STARIO_PORT",
     "STARIO_TRACER",
 ]
-READONLY = {"SLOT_NAME", "SLOT_REPO", "DEPLOY_SHA", "DEPLOY_IMAGE", "SLOT_DATA_DIR"}
-FIELDS = {"SLOT_BRANCH", "SLOT_DIRECTORY", "SLOT_DOMAIN", "SLOT_INTERVAL"}
+READONLY = {"SLOT_NAME", "SLOT_REPO", "SHA", "IMAGE", "SLOT_DATA_DIR"}
+FIELDS = {"REF", "SLOT_DIRECTORY", "DOMAIN", "SLOT_INTERVAL"}
 _BASE = (
     ("SLOT_DATA_DIR", "/data"),
     ("PORT", "8000"),
@@ -53,22 +53,6 @@ def image_sha(image: str) -> str:
     return tail if head and tail else ""
 
 
-def slot_env(name: str, env: dict[str, str] | None = None) -> list[str]:
-    env = env or {}
-    out: list[str] = []
-    used = {"SLOT_NAME"}
-    if "SLOT_NAME" in env:
-        out.append(f"SLOT_NAME={env['SLOT_NAME']}")
-    else:
-        out.append(f"SLOT_NAME={name}")
-    for key, value in _BASE:
-        out.append(f"{key}={env[key]}" if key in env else f"{key}={value}")
-        used.add(key)
-    for key in sorted(set(env) - used):
-        out.append(f"{key}={env[key]}")
-    return out
-
-
 def process_defaults(name: str) -> dict[str, str]:
     return {"SLOT_NAME": name, **dict(_BASE)}
 
@@ -79,24 +63,52 @@ def slot_values(slot: Slot) -> dict[str, str]:
         {
             "SLOT_NAME": slot.name,
             "SLOT_REPO": slot.repo,
-            "SLOT_BRANCH": slot.ref,
+            "REF": slot.ref,
             "SLOT_DIRECTORY": slot.directory,
-            "SLOT_DOMAIN": slot.domain,
+            "DOMAIN": slot.domain,
             "SLOT_INTERVAL": slot.every,
-            "DEPLOY_SHA": image_sha(slot.live_image),
-            "DEPLOY_IMAGE": slot.live_image,
+            "SHA": image_sha(slot.live_image),
+            "IMAGE": slot.live_image,
         }
     )
     for key, value in slot.env.items():
-        if key.startswith(("SLOT_", "DEPLOY_")) or key in READONLY:
+        if key.startswith("SLOT_") or key in READONLY or key in FIELDS:
             continue
         values[key] = value
     return values
 
 
 def format_values(values: dict[str, str]) -> str:
-    lines = [f"{key}={values.get(key, '')}" for key in ORDER]
-    lines.extend(f"{key}={values[key]}" for key in sorted(set(values) - set(ORDER)))
+    """NAME=value lines. A # line says who sets that group. The container receives every name."""
+    groups = (
+        ("# Identity. Yard sets these.", ("SLOT_NAME", "SLOT_REPO", "SLOT_DATA_DIR")),
+        ("# This deploy. Yard sets these.", ("SHA", "IMAGE")),
+        (
+            "# Configuration. Edit these. The slot follows REF.",
+            ("REF", "SLOT_DIRECTORY", "DOMAIN", "SLOT_INTERVAL"),
+        ),
+    )
+    lines: list[str] = []
+    used: set[str] = set()
+    for title, keys in groups:
+        present = [key for key in keys if key in values]
+        if not present:
+            continue
+        if lines:
+            lines.append("")
+        lines.append(title)
+        for key in present:
+            lines.append(f"{key}={values.get(key, '')}")
+            used.add(key)
+    rest = [key for key in ORDER if key in values and key not in used]
+    rest.extend(key for key in sorted(set(values) - set(ORDER)) if key not in used)
+    if rest:
+        if not any(line.startswith("# Configuration") for line in lines):
+            if lines:
+                lines.append("")
+            lines.append("# Configuration. Edit these. The container receives these names.")
+        for key in rest:
+            lines.append(f"{key}={values[key]}")
     return "\n".join(lines) + "\n"
 
 
@@ -106,7 +118,7 @@ def _env_error(message: str) -> YardError:
         "bad_key",
         message,
         help_text="A line is NAME=value. A # line is a comment.",
-        example="SLOT_DOMAIN=heldso.example.com",
+        example="DOMAIN=heldso.example.com",
     )
 
 
@@ -179,20 +191,20 @@ def apply_values(slot: Slot, parsed: dict[str, str]) -> SlotEdit:
         if key in parsed and parsed[key] != current.get(key, ""):
             edit.warn.append(f"{key} stays {current.get(key, '')}")
 
-    edit.ref = _changed(parsed, "SLOT_BRANCH", slot.ref, keep_empty=True)
+    edit.ref = _changed(parsed, "REF", slot.ref, keep_empty=True)
     edit.directory = _changed(parsed, "SLOT_DIRECTORY", slot.directory, keep_empty=False)
-    edit.domain = _changed(parsed, "SLOT_DOMAIN", slot.domain, keep_empty=False)
+    edit.domain = _changed(parsed, "DOMAIN", slot.domain, keep_empty=False)
     edit.every = _changed(parsed, "SLOT_INTERVAL", slot.every, keep_empty=False)
 
     # Anything else is an environment value for the container.
     defaults = process_defaults(slot.name)
     unknown: list[str] = []
     for key, value in parsed.items():
-        if key.startswith(("SLOT_", "DEPLOY_")):
-            if key not in READONLY and key not in FIELDS:
+        if key in READONLY or key in FIELDS or key.startswith("SLOT_"):
+            if key.startswith("SLOT_") and key not in READONLY and key not in FIELDS:
                 unknown.append(key)
             continue
-        if key in READONLY or defaults.get(key) == value:
+        if defaults.get(key) == value:
             continue
         edit.env[key] = value
     for key in sorted(unknown):

@@ -54,6 +54,8 @@ def slot_rows(
     by_slot: dict[str, list[Listed]] = {}
     other: list[Listed] = []
     for item in listed.values():
+        if item.role in {"deploy", "revert"}:
+            continue
         if item.slot:
             slot = item.slot
         elif item.name in names:
@@ -124,11 +126,6 @@ def slot_label(slot: str, container: str) -> str:
     if slot and container and slot != container:
         return f"{slot} ({container})"
     return slot or container
-
-
-def mem_used(text: str) -> str:
-    used = text.split("/", 1)[0].strip()
-    return used
 
 
 def build_label(status: str, started: str, ended: str) -> str:
@@ -229,7 +226,7 @@ def total_row(rows: list[SlotRow], cpus: int, mem_limit: int, disk_limit: int) -
         if percent is not None:
             cpu += percent
             cpu_seen = True
-        used = parse_size(mem_used(row.mem)) if row.mem else None
+        used = parse_size(row.mem.split("/", 1)[0].strip()) if row.mem else None
         if used is not None:
             mem += used
             mem_seen = True

@@ -4,26 +4,27 @@ import asyncio
 import base64
 import logging
 import os
-import secrets
 import shutil
 import subprocess
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import stario.responses as responses
 from stario import App, Context, Writer
 from stario.responses import JsonValue
 
-from app.config import YARD_IMAGE, Config
+from app.apply import run_args
+from app.config import Config
 from app.errors import YardError
+from app.gitcmd import prepare_git
 from app.machine import (
     JOB_RETRY,
     Paths,
     Result,
     RunState,
     _post_unix,
-    build_image,
     caddy_document,
     deploy_slot,
     ensure_caddy,
@@ -35,20 +36,20 @@ from app.machine import (
 )
 from app.podman import (
     HostUse,
+    Listed,
     Podman,
-    ids_for_slot,
-    latest_for_slot,
+    inspect_args,
+    log_hit,
     page_logs,
     parse_info,
-    parse_inspect,
     parse_ps,
     parse_stats,
     ps_args,
     stats_args,
 )
 from app.rows import build_label, dir_size, disk_capacity, format_bytes, slot_rows, total_row
-from app.store import Slot, Store, check_name, parse_duration
-from app.text import SlotEdit, apply_slot_keys, image_sha
+from app.store import Slot, Store, check_name, check_origin, parse_duration, public_origin
+from app.text import SlotEdit, apply_slot_keys, image_sha, parse_env
 
 log = logging.getLogger("yard")
 
@@ -90,16 +91,23 @@ class Yard:
         self._job_lock = asyncio.Lock()
         self._watch = False
         self._app: App | None = None
+        self._partial: set[str] = set()
 
     async def boot(self, app: App) -> None:
         self._app = app
-        self._note_swap_boot()
-
-        # A deploy left running by the previous process cannot finish.
+        try:
+            self._ensure_host_slot()
+        except YardError as exc:
+            log.warning("host slot: %s", exc)
+        try:
+            self._claim_yard_deploy()
+        except YardError as exc:
+            log.warning("yard deploy: %s", exc)
         try:
             self.store.interrupt_deploys()
         except YardError as exc:
             log.warning("deploys: %s", exc)
+        self._install_hooks()
 
         try:
             await self.podman.ensure_network("yard")
@@ -107,11 +115,72 @@ class Yard:
             log.warning("network: %s", exc)
         if self.config.caddy_sock is not None:
             try:
-                await ensure_caddy(self.podman, self.config.root, self.config.caddy_sock)
+                await ensure_caddy(self.config.root, self.config.caddy_sock)
             except Exception as exc:
                 log.warning("caddy: %s", exc)
         await self.push_caddy()
         await self.start_jobs()
+
+    def _install_hooks(self) -> None:
+        repos = self.paths.root / "repos"
+        if not repos.is_dir():
+            return
+        for path in repos.iterdir():
+            if not path.is_dir() or not path.name.endswith(".git"):
+                continue
+            try:
+                self._install_hook(path, path.name.removesuffix(".git"))
+            except OSError as exc:
+                log.warning("hook: %s", exc)
+
+    def _install_hook(self, directory: Path, name: str) -> None:
+        _write_hook(
+            directory / "hooks" / "reference-transaction",
+            name,
+            self.config.token_file,
+            self.config.hook_url,
+        )
+
+    def _ensure_host_slot(self) -> None:
+        domain = self.config.domain
+        if not domain or not self.paths.repo("yard").exists():
+            return
+        try:
+            self.store.repo("yard")
+        except YardError as exc:
+            if exc.code != "not_found":
+                raise
+            self.store.create_repo("yard")
+        try:
+            slot = self.store.slot("yard")
+        except YardError as exc:
+            if exc.code != "not_found":
+                raise
+            self.store.create_slot("yard", "yard", "origin/main", domain, "", "")
+            return
+        if slot.domain != domain:
+            self.store.patch_slot(slot.name, None, domain, None, None, slot.env)
+
+    def _claim_yard_deploy(self) -> None:
+        """The new yard process records the upgrade that replaced the previous process."""
+        sha = os.environ.get("SHA", "").strip()
+        image = os.environ.get("IMAGE", "").strip()
+        if not sha or not image:
+            return
+        try:
+            self.store.slot("yard")
+        except YardError as exc:
+            if exc.code != "not_found":
+                raise
+            return
+        last = self.store.last_deploy("yard")
+        if last is not None and last.status == "running" and last.sha == sha:
+            self.store.set_image("yard", image)
+            self.store.finish_deploy(last.id, "ok", "")
+            return
+        if last is None:
+            self.store.set_image("yard", image)
+            self.store.finish_deploy(self.store.begin_deploy("yard", sha), "ok", "")
 
     async def aclose(self) -> None:
         self._watch = False
@@ -123,9 +192,11 @@ class Yard:
         self._jobs.clear()
         self.store.close()
 
-    async def create_repo(self, name: str, force: bool) -> JsonValue:
+    async def create_repo(self, name: str, force: bool, origin: str = "") -> JsonValue:
         name = name.strip()
         check_name(name)
+        if origin:
+            origin = check_origin(origin)
         async with self._repo_lock:
             try:
                 self.store.repo(name)
@@ -168,6 +239,7 @@ class Yard:
             directory.parent.mkdir(parents=True, exist_ok=True)
             try:
                 await run_cmd("git", "init", "--bare", "--initial-branch=main", str(directory))
+                await self._allow_partial(directory)
             except RuntimeError as exc:
                 raise YardError(
                     500,
@@ -177,13 +249,30 @@ class Yard:
                     help_text="If that directory is still there, finish the create with --force.",
                     example=f"yard repo new {name} --force",
                 ) from exc
+            ref = ""
+            if origin:
+                try:
+                    ref = await track_origin(directory, origin)
+                except YardError:
+                    shutil.rmtree(directory, ignore_errors=True)
+                    raise
+                except RuntimeError as exc:
+                    shutil.rmtree(directory, ignore_errors=True)
+                    raise YardError(
+                        500,
+                        "git_fetch",
+                        f"Yard could not fetch {public_origin(origin)}: {_hide_secret(origin, str(exc))}",
+                        context={"name": name},
+                        help_text="The address has to be a git repo that this host can read.",
+                        example="yard init --remote https://github.com/org/heldso --domain heldso.example.com",
+                    ) from exc
             try:
-                _write_hook(directory / "hooks" / "post-receive", name, self.config.token_file, self.config.hook_url)
+                self._install_hook(directory, name)
             except OSError as exc:
                 raise YardError(
                     500,
                     "hook_failed",
-                    f"Yard could not write the receive hook ({exc}).",
+                    f"Yard could not write the reference hook ({exc}).",
                     help_text="Finish the create with --force after the directory can be written.",
                     example=f"yard repo new {name} --force",
                 ) from exc
@@ -201,7 +290,10 @@ class Yard:
                     example=f"yard repo new {name} --force",
                 ) from exc
             repo = self.store.repo(name)
-        return {"name": repo.name, "created": repo.created}
+        body: JsonValue = {"name": repo.name, "created": repo.created}
+        if ref:
+            body["ref"] = ref
+        return body
 
     def delete_repo(self, name: str) -> None:
         self.store.delete_repo(name)
@@ -223,8 +315,8 @@ class Yard:
         slot = self.store.create_slot(
             name,
             repo,
-            keys.get("SLOT_BRANCH", "").strip(),
-            keys.get("SLOT_DOMAIN", "").strip(),
+            keys.get("REF", "").strip(),
+            keys.get("DOMAIN", "").strip(),
             keys.get("SLOT_DIRECTORY", "").strip(),
             keys.get("SLOT_INTERVAL", "").strip(),
         )
@@ -247,29 +339,52 @@ class Yard:
             await self.sync_job(slot.name)
         return slot, edit.warn, note
 
-    async def update_slot(self, name: str, edit: SlotEdit) -> Slot:
+    async def update_slot(self, name: str, edit: SlotEdit) -> tuple[Slot, JsonValue | None]:
+        before = self.store.slot(name)
         slot = self.store.patch_slot(name, edit.ref, edit.domain, edit.directory, edit.every, edit.env)
-        if slot.every:
-            try:
-                await self.podman.remove(slot.name)
-            except YardError:
-                pass
+        if slot.every and not before.every:
+            await self._project(name, "down")
         await self.push_caddy()
         await self.sync_job(slot.name)
-        return slot
+        # A new ref, directory, or env value is a new container. Domain and the timer are not.
+        if edit.ref is not None or edit.directory is not None or edit.env != before.env:
+            return slot, await self.deploy_existing(slot)
+        return slot, None
 
-    async def delete_slot(self, name: str) -> None:
+    async def _project(self, name: str, command: str) -> None:
+        env_path = self.paths.run_dir(name) / "compose.env"
+        if not env_path.is_file():
+            return
         try:
-            await self.podman.run("inspect", "--type", "container", name, timeout=5)
+            compose = parse_env(env_path.read_text()).get("COMPOSE_FILE", "")
+        except YardError:
+            return
+        if not compose:
+            return
+        try:
+            args, env = run_args(
+                root=str(self.paths.root),
+                sock=self.config.podman_sock,
+                project=name,
+                compose=compose,
+                env_file=str(env_path),
+                command=command,
+                slot=name,
+            )
+            await self.podman.run(*args, env=env, program="docker-compose", timeout=None)
         except YardError:
             pass
-        else:
-            await self.podman.remove(name)
+
+    async def delete_slot(self, name: str) -> None:
+        await self._project(name, "purge")
 
         self.store.delete_slot(name)
         data = self.paths.data(name)
         if data.exists():
             shutil.rmtree(data)
+        run = self.paths.run_dir(name)
+        if run.exists():
+            shutil.rmtree(run)
 
         await self.push_caddy()
         await self.sync_job(name)
@@ -284,13 +399,17 @@ class Yard:
         rows = slot_rows(slots, listed, samples, running_only=running_only)
 
         facts = await self.slot_facts(slots)
+        sizes: dict[Path, str] = {}
         for row in rows:
             sha, expected, build = facts.get(row.slot, ("", "", ""))
             row.sha, row.expected, row.build = sha, expected, build
             name = row.slot or row.container
-            path = self.paths.data(name) if name else None
-            if path is not None and path.is_dir():
-                row.data = format_bytes(dir_size(path))
+            if not name:
+                continue
+            path = self.paths.data(name)
+            if path not in sizes:
+                sizes[path] = format_bytes(dir_size(path)) if path.is_dir() else ""
+            row.data = sizes[path]
 
         host = await self.host_use()
         rows.append(total_row(rows, host.cpus, host.mem, host.disk))
@@ -307,19 +426,46 @@ class Yard:
         return host
 
     async def slot_facts(self, slots: list[Slot]) -> dict[str, tuple[str, str, str]]:
+        tips: dict[str, dict[str, str]] = {}
         facts: dict[str, tuple[str, str, str]] = {}
         for slot in slots:
-            expected = ""
-            try:
-                sha, found = await resolve_ref(self.paths.repo(slot.repo), slot.ref)
-            except Exception:
-                sha, found = "", False
-            if found:
-                expected = sha
+            if slot.repo not in tips:
+                tips[slot.repo] = await self._ref_tips(slot.repo)
+            expected = tips[slot.repo].get(slot.ref, "")
             last = self.store.last_deploy(slot.name)
             build = "" if last is None else build_label(last.status, last.started, last.ended)
             facts[slot.name] = (image_sha(slot.live_image), expected, build)
         return facts
+
+    async def _ref_tips(self, repo: str) -> dict[str, str]:
+        """One ref list for the repo. The key is the slot ref."""
+        directory = self.paths.repo(repo)
+        if not directory.is_dir():
+            return {}
+        try:
+            text = await run_cmd(
+                "git",
+                "-C",
+                str(directory),
+                "for-each-ref",
+                "--format=%(objectname) %(refname)",
+                "refs/heads",
+                "refs/remotes/origin",
+            )
+        except RuntimeError:
+            return {}
+        found: dict[str, str] = {}
+        for line in text.splitlines():
+            sha, sep, name = line.partition(" ")
+            if not sep or not sha:
+                continue
+            if name.startswith("refs/heads/"):
+                found[name.removeprefix("refs/heads/")] = sha
+            elif name.startswith("refs/remotes/origin/") and not name.endswith("/HEAD"):
+                short = name.removeprefix("refs/remotes/origin/")
+                if short:
+                    found[f"origin/{short}"] = sha
+        return found
 
     async def deploy_existing(self, slot: Slot) -> JsonValue:
         try:
@@ -399,8 +545,13 @@ class Yard:
             slot = self.store.slot(name)
         except YardError as exc:
             return Outcome(f"{name}: {exc}\n", str(exc))
-        deploy_id = self.store.begin_deploy(slot.name, slot.repo, sha)
-        result = await deploy_slot(self.podman, self.paths, slot, sha)
+        deploy_id = self.store.begin_deploy(slot.name, sha)
+        built_path = self.paths.run_dir(slot.name) / "apply.built"
+        built_path.unlink(missing_ok=True)
+        result = await deploy_slot(self.podman, self.paths, slot, sha, self.config.podman_sock)
+        if result.pending:
+            return Outcome(f"slot {slot.name}: upgrading {result.image}\n{result.log}\n", "")
+        built = built_path.read_text().strip() if built_path.is_file() else ""
         status = "failed" if result.error else "ok"
         error = result.error
 
@@ -413,7 +564,7 @@ class Yard:
                 status = "failed"
                 result = Result(result.image, result.log + f"{exc}\n", error)
         try:
-            self.store.finish_deploy(deploy_id, status, result.image, result.log)
+            self.store.finish_deploy(deploy_id, status, built)
         except YardError as exc:
             result = Result(result.image, result.log + f"{exc}\n", error or str(exc))
             status = "failed"
@@ -423,48 +574,130 @@ class Yard:
         await self.sync_job(slot.name)
         return Outcome(f"slot {slot.name}: {status} {result.image}\n{result.log}\n", error)
 
-    async def log_page(self, name: str, tail: int, cursor: str, container: str) -> JsonValue:
-        self.store.slot(name)
-        target = container or await self.log_target(name)
-        args = ["logs", "--timestamps"]
-        if cursor:
-            args.extend(("--since", cursor))
-        else:
-            args.extend(("--tail", str(tail)))
-        args.append(target)
-        text, nxt, more = page_logs(await self.podman.run(*args), cursor, tail)
-        return {"log": text, "cursor": nxt, "more": more}
+    async def log_page(
+        self,
+        slot: str,
+        role: str,
+        service: str,
+        sha: str,
+        tail: int,
+        cursor: str,
+    ) -> JsonValue:
+        targets = await self.log_targets(slot, role, service, sha)
+        return await self._log_text(targets, tail, cursor)
 
-    async def log_target(self, slot: str) -> str:
-        item = latest_for_slot(parse_ps(await self.podman.run(*ps_args())), slot)
-        if item is None or not item.name:
-            return slot
-        return item.name
+    async def container_log_page(self, name: str, tail: int, cursor: str) -> JsonValue:
+        inspect_args(name)
+        return await self._log_text([("", name)], tail, cursor)
 
-    async def hook_push(self, repo: str, old: str, new: str, ref: str) -> tuple[int, str]:
-        del old
-        branch = ref.removeprefix("refs/heads/")
-        if branch == ref or not branch:
+    async def _log_text(self, targets: list[tuple[str, str]], tail: int, cursor: str) -> JsonValue:
+        if not targets:
+            return {"log": "", "cursor": "", "more": False}
+        chunks: list[str] = []
+        nxt = ""
+        more = False
+        for label, container in targets:
+            args = ["logs", "--timestamps"]
+            if cursor and len(targets) == 1:
+                args.extend(("--since", cursor))
+            else:
+                args.extend(("--tail", str(tail)))
+            args.append(container)
+            text, one_next, one_more = page_logs(await self.podman.run(*args), cursor, tail)
+            if len(targets) > 1 and text:
+                text = "".join(f"{label}  {line}\n" for line in text.splitlines() if line)
+            chunks.append(text)
+            if len(targets) == 1:
+                nxt, more = one_next, one_more
+        return {"log": "".join(chunks), "cursor": nxt, "more": more}
+
+    async def log_targets(self, slot: str, role: str, service: str, sha: str) -> list[tuple[str, str]]:
+        if slot:
+            self.store.slot(slot)
+        listed = parse_ps(await self.podman.run(*ps_args()))
+        found: list[tuple[str, str]] = []
+        for item in listed.values():
+            if not log_hit(item, slot=slot, role=role, sha=sha):
+                continue
+            label = item.service or item.name
+            if service and label != service:
+                continue
+            shown = label
+            if not slot and item.slot and shown and item.slot != shown:
+                shown = f"{item.slot}/{shown}"
+            found.append((shown or item.name, item.name))
+        found.sort()
+        if service and not found:
+            where = slot or "this host"
+            raise YardError(
+                404,
+                "no_service",
+                f"service {service} is not in {where}",
+                help_text="The service name is the name in the compose file.",
+                example="yard logs --slot heldso --service app",
+            )
+        return found
+
+    async def git_repo(self, name: str, args: list[str]) -> JsonValue:
+        self.store.repo(name)
+        directory = self.paths.repo(name)
+        if not directory.exists():
+            raise YardError(
+                404,
+                "not_found",
+                f"repo {name} is not on this host",
+                help_text="Create the repo, then run the git command.",
+                example=f"yard repo new {name}",
+            )
+        call = prepare_git(args)
+        env = os.environ.copy()
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        try:
+            text = await run_cmd("git", "-C", str(directory), *call.argv, timeout=60, env=env)
+        except RuntimeError as exc:
+            raise YardError(
+                400,
+                "git_failed",
+                str(exc) or "git failed",
+                help_text="Git printed that text.",
+                example=f"yard git {name} log -1",
+            ) from exc
+        if call.delete_branch:
+            note = await self._drop_deleted(name, call.delete_branch)
+            removed = "".join(f"{line}\n" for line in note.splitlines() if line.startswith("slot "))
+            if removed:
+                text = f"{text}\n{removed}" if text else removed
+        if text and not text.endswith("\n"):
+            text += "\n"
+        return {"output": text}
+
+    async def hook_push(self, repo: str, new: str, ref: str) -> tuple[int, str]:
+        watched_ref = slot_ref(ref)
+        if not watched_ref:
             return 200, f"skip {ref}\n"
 
-        # A push of all zeros deletes the branch.
+        # A ref of all zeros deletes the branch.
         if not new.strip("0"):
-            return 200, await self._drop_deleted(repo, branch)
+            return 200, await self._drop_deleted(repo, watched_ref)
         slots = self.store.slots_for_repo(repo)
-        text = await self._drop_merged(slots, branch, new)
-        watched = [slot for slot in slots if slot.ref == branch]
+        text = ""
+        if ref.startswith("refs/heads/"):
+            text = await self._drop_merged(slots, watched_ref, new)
+        watched = [slot for slot in slots if slot.ref == watched_ref]
         if not watched:
             if not text:
-                text = f"no slot watches {repo} {branch}\n"
-            return 200, text
-
-        if self.skip_deploy:
-            for slot in watched:
-                text += f"slot {slot.name}: deploy skipped\n"
+                text = f"no slot watches {repo} {watched_ref}\n"
             return 200, text
 
         failed = False
         for slot in watched:
+            last = self.store.last_deploy(slot.name)
+            if last is not None and last.sha == new and last.status == "ok":
+                text += f"slot {slot.name}: current\n"
+                continue
+            if self.skip_deploy:
+                text += f"slot {slot.name}: deploy skipped\n"
+                continue
             out = await self.run_deploy(slot.name, new)
             text += out.text
             failed = failed or bool(out.error)
@@ -516,255 +749,17 @@ class Yard:
             return True, f"branch {slot.ref} is in {into_branch}"
         return False, ""
 
-    async def save_settings(
-        self,
-        domain: str | None,
-        email: str | None,
-        self_repo: str | None,
-        self_ref: str | None,
-        self_image: str | None,
-    ) -> JsonValue:
-        current = self.store.settings()
-        if domain is not None:
-            current.domain = domain.strip()
-        if email is not None:
-            current.email = email.strip()
-
-        # A repo and an image cannot both be the source. An empty value returns to the published image.
-        if self_repo is not None and self_repo.strip() and self_image is not None and self_image.strip():
-            raise YardError(
-                400,
-                "one_source",
-                "set self_image or self_repo",
-                help_text=(
-                    "A repo and an image cannot both be the source. An empty value returns to the published image."
-                ),
-                example="yard settings --self-repo yard",
-            )
-        if self_ref is not None:
-            current.self_ref = self_ref.strip()
-        if self_repo is not None and self_repo.strip():
-            current.self_repo = self_repo.strip()
-            current.self_image = ""
-        elif self_image is not None and self_image.strip():
-            current.self_image = self_image.strip()
-            current.self_repo = ""
-        elif self_repo is not None or self_image is not None:
-            current.self_repo = ""
-            current.self_image = YARD_IMAGE
-
-        self.store.save_settings(current)
-        saved = self.store.settings()
-        await self.push_caddy()
-        return {
-            "domain": saved.domain,
-            "email": saved.email,
-            "self_repo": saved.self_repo,
-            "self_ref": saved.self_ref,
-            "self_image": saved.self_image,
-        }
-
-    async def update_yard(self) -> JsonValue:
-        await self._tag_running()
-
-        settings = self.store.settings()
-        if not settings.self_repo:
-            image = YARD_IMAGE
-            sha = ""
-            self.store.set_meta("swap_image", image)
-            self.store.set_meta("swap_status", "pulling")
-            try:
-                await self.podman.pull(image)
-            except Exception as exc:
-                self.store.set_meta("swap_status", "failed")
-                raise YardError(
-                    500,
-                    "pull_failed",
-                    str(exc),
-                    help_text="The running container stays up. Fix the pull, then run yard update again.",
-                ) from exc
-            built = f"pull {image}"
-        else:
-            try:
-                sha = await run_cmd(
-                    "git", "-C", str(self.paths.repo(settings.self_repo)), "rev-parse", settings.self_ref
-                )
-            except RuntimeError as exc:
-                raise YardError(
-                    400,
-                    "no_rev",
-                    str(exc),
-                    context={"repo": settings.self_repo, "ref": settings.self_ref},
-                    help_text="The repo has to contain that branch.",
-                ) from exc
-            image = f"localhost/yard:{sha}"
-            self.store.set_meta("swap_image", image)
-            self.store.set_meta("swap_status", "building")
-            try:
-                built = await build_image(self.podman, self.paths, settings.self_repo, "", sha, image)
-            except Exception as exc:
-                self.store.set_meta("swap_status", "failed")
-                raise YardError(
-                    500,
-                    "build_failed",
-                    str(exc),
-                    help_text="The running container stays up. Fix the build, then run yard update again.",
-                ) from exc
-
-        # The running image was tagged first, so a missing new image can still roll back.
-        if not await self.podman.image_exists(image) or not await self.podman.image_exists("localhost/yard:previous"):
-            self.store.set_meta("swap_status", "failed")
-            raise YardError(
-                500,
-                "swap_failed",
-                "the new image or the previous image is not on this host",
-                help_text="The running container stays up. Read /srv/yard/data/yard/swap.log on the host.",
-            )
-        await self._begin_swap(image)
-        return {"image": image, "sha": sha, "status": "swapping", "log": built, "container": "yard-swap"}
-
-    async def rollback(self) -> None:
-        if not await self.podman.image_exists("localhost/yard:previous"):
-            raise YardError(
-                400,
-                "no_previous",
-                "no previous image is tagged",
-                help_text=(
-                    "An update tags the running image first. "
-                    "Run yard update once, then yard rollback can start that tag."
-                ),
-            )
-        await self._begin_swap("localhost/yard:previous")
-
-    async def _tag_running(self) -> None:
-        try:
-            current = (await self.podman.run("inspect", "--format", "{{.Image}}", "yard")).strip()
-        except YardError as exc:
-            self.store.set_meta("swap_status", "failed")
-            raise YardError(
-                500,
-                "swap_failed",
-                "Yard could not read the running image.",
-                help_text="The container named yard has to be running.",
-            ) from exc
-        if not current:
-            self.store.set_meta("swap_status", "failed")
-            raise YardError(
-                500,
-                "swap_failed",
-                "Yard could not read the running image.",
-                help_text="The container named yard has to be running.",
-            )
-
-        try:
-            await self.podman.run("tag", current, "localhost/yard:previous")
-        except YardError as exc:
-            self.store.set_meta("swap_status", "failed")
-            raise YardError(
-                500,
-                "swap_failed",
-                "Yard could not save the running image.",
-                help_text="Podman has to tag that image as localhost/yard:previous before the swap.",
-            ) from exc
-
-    async def _begin_swap(self, image: str) -> None:
-        swap_id = secrets.token_hex(8)
-        self.store.set_meta("swap_image", image)
-        self.store.set_meta("swap_id", swap_id)
-        self.store.set_meta("swap_status", "swapping")
-        try:
-            await self.swap(image, swap_id)
-        except Exception as exc:
-            self.store.set_meta("swap_status", "failed")
-            raise YardError(
-                500,
-                "swap_failed",
-                str(exc),
-                help_text="The running container stays up. Read /srv/yard/data/yard/swap.log on the host.",
-            ) from exc
-
-    async def swap(self, image: str, swap_id: str) -> None:
-        settings = self.store.settings()
-        sock = self.config.podman_sock or "/run/podman/podman.sock"
-        await self.podman.run(
-            "run",
-            "-d",
-            "--rm",
-            "--name",
-            "yard-swap",
-            "--log-driver",
-            "journald",
-            "-v",
-            f"{sock}:/run/podman/podman.sock",
-            "-v",
-            f"{self.paths.root}:{self.paths.root}",
-            "-e",
-            "CONTAINER_HOST=unix:///run/podman/podman.sock",
-            "-e",
-            f"YARD_IMAGE={image}",
-            "-e",
-            f"YARD_ROOT={self.paths.root}",
-            "-e",
-            f"YARD_PODMAN_SOCK={sock}",
-            "-e",
-            f"YARD_CADDY_SOCK={self.config.caddy_sock or ''}",
-            "-e",
-            f"YARD_PUBLIC_PORT={self.config.public_port}",
-            "-e",
-            f"YARD_DOMAIN={settings.domain}",
-            "-e",
-            f"YARD_SELF_IMAGE={settings.self_image or image}",
-            "-e",
-            f"YARD_SWAP_ID={swap_id}",
-            "quay.io/podman/stable",
-            "sh",
-            "-c",
-            _SWAP,
-            timeout=None,
-        )
-
-    def swap_status(self) -> JsonValue:
-        return {
-            "image": self.store.meta("swap_image"),
-            "status": self.store.meta("swap_status"),
-            "container": "yard-swap",
-        }
-
-    def _note_swap_boot(self) -> None:
-        result = self.config.data_dir / "swap.result"
-        try:
-            text = result.read_text().strip()
-        except OSError:
-            text = ""
-        if text:
-            result.unlink(missing_ok=True)
-
-        # The swap container writes this file when it puts the old container back.
-        kind, _, token = text.partition(" ")
-        if kind in {"rolled_back", "failed"} and token and token == self.store.meta("swap_id"):
-            self.store.set_meta("swap_status", kind)
-            return
-
-        # The probe container has no ack, so it cannot mark the swap ready.
-        if self.store.meta("swap_status") != "swapping":
-            return
-        if os.environ.get("YARD_SWAP_ACK") != "1":
-            return
-        want = self.store.meta("swap_id")
-        got = os.environ.get("YARD_SWAP_ID", "")
-        if want and got == want:
-            self.store.set_meta("swap_status", "ready")
-
     async def push_caddy(self) -> None:
         sock = self.config.caddy_sock
         if sock is None:
             return
         try:
             routes = routes_from(self.store.list_slots())
-            yard = yard_route(self.store.settings().domain)
-            if yard is not None:
-                routes.append(yard)
-            await asyncio.to_thread(_post_unix, sock, caddy_document(sock, self.store.settings().email, routes))
+            if self.config.domain and all(route.host != self.config.domain for route in routes):
+                yard = yard_route(self.config.domain)
+                if yard is not None:
+                    routes.append(yard)
+            await asyncio.to_thread(_post_unix, sock, caddy_document(sock, routes))
         except Exception as exc:
             log.warning("caddy: %s", exc)
 
@@ -841,22 +836,44 @@ class Yard:
                     continue
 
                 try:
-                    started = await run_job(self.podman, self.paths, slot, slot.live_image)
+                    await run_job(self.podman, self.paths, slot, slot.live_image, self.config.podman_sock)
                 except Exception as exc:
                     log.warning("job %s: warning: %s", name, exc)
                     await _wait_job(wake, JOB_RETRY)
                     continue
-                log.info("job %s: started %s", name, started)
+                log.info("job %s: started", name)
         except asyncio.CancelledError:
             return
 
     async def _job_runs(self, slot: str) -> list[RunState]:
-        raw = await self.podman.run("ps", "-a", "--filter", f"label=yard.slot={slot}", "--format", "json")
-        ids = ids_for_slot(raw, slot)
-        if not ids:
-            return []
-        rows = parse_inspect(await self.podman.run("inspect", *ids))
-        return [RunState(row.id, row.running, _real_time(row.started), _real_time(row.finished)) for row in rows]
+        running = await self.podman.run(
+            "ps",
+            "--filter",
+            f"label=yard.slot={slot}",
+            "--filter",
+            "label=yard.role=job",
+            "--filter",
+            "status=running",
+            "--format",
+            "json",
+        )
+        finished = await self.podman.run(
+            "ps",
+            "-a",
+            "--filter",
+            f"label=yard.slot={slot}",
+            "--filter",
+            "label=yard.role=job",
+            "--filter",
+            "status=exited",
+            "--sort",
+            "created",
+            "-n",
+            "1",
+            "--format",
+            "json",
+        )
+        return job_states(running, finished)
 
     async def _lane_for(self, name: str) -> _Lane:
         async with self._lane_lock:
@@ -866,6 +883,17 @@ class Yard:
                 self._lanes[name] = lane
             return lane
 
+    async def _allow_partial(self, directory: Path) -> None:
+        key = str(directory)
+        if key in self._partial:
+            return
+        try:
+            await run_cmd("git", "-C", key, "config", "uploadpack.allowFilter", "true")
+        except RuntimeError as exc:
+            log.warning("partial clone: %s", exc)
+            return
+        self._partial.add(key)
+
     async def serve_git(self, c: Context, w: Writer) -> None:
         token = self.store.token_ok(_basic_password(c.req.headers.get("authorization") or "") or "")
         if token is None:
@@ -873,9 +901,11 @@ class Yard:
             responses.text(w, "unauthorized\n", 401)
             return
         repo = git_repo(c.req.path)
-        if not repo or not self.paths.repo(repo).is_dir():
+        directory = self.paths.repo(repo)
+        if not repo or not directory.is_dir():
             responses.text(w, "not found\n", 404)
             return
+        await self._allow_partial(directory)
         backend = _git_backend()
         if not backend:
             responses.text(w, "git-http-backend not found\n", 500)
@@ -928,6 +958,27 @@ def git_repo(path: str) -> str:
     return name
 
 
+async def track_origin(directory: Path, origin: str) -> str:
+    await run_cmd("git", "-C", str(directory), "remote", "add", "origin", origin)
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    await run_cmd("git", "-C", str(directory), *prepare_git(["fetch"]).argv, timeout=60, env=env)
+    try:
+        await run_cmd("git", "-C", str(directory), "remote", "set-head", "origin", "-a", timeout=30, env=env)
+        head = await run_cmd("git", "-C", str(directory), "symbolic-ref", "refs/remotes/origin/HEAD")
+    except RuntimeError:
+        return "main"
+    name = head.removeprefix("refs/remotes/origin/").strip()
+    return name or "main"
+
+
+def _hide_secret(url: str, text: str) -> str:
+    password = urlsplit(url).password
+    if password:
+        return text.replace(password, "*****")
+    return text
+
+
 async def resolve_ref(directory: Path, ref: str) -> tuple[str, bool]:
     if not directory.exists():
         raise RuntimeError(f"repo directory {directory} is missing")
@@ -952,6 +1003,26 @@ async def resolve_ref(directory: Path, ref: str) -> tuple[str, bool]:
     return (text, True) if text else ("", False)
 
 
+def job_states(running_raw: str, finished_raw: str) -> list[RunState]:
+    """The running jobs, plus the newest finished job."""
+    running = [item for item in parse_ps(running_raw).values() if item.id]
+    finished = [item for item in parse_ps(finished_raw).values() if item.id]
+    states = [RunState(item.id, True, _real_time(item.started), None) for item in running]
+    seen = {state.id for state in states}
+    newest = _newest_finished(finished)
+    if newest is not None and newest.id not in seen:
+        states.append(RunState(newest.id, False, _real_time(newest.started), _real_time(newest.exited)))
+    return states
+
+
+def _newest_finished(items: list[Listed]) -> Listed | None:
+    found = [item for item in items if item.id]
+    if not found:
+        return None
+    empty = datetime.min.replace(tzinfo=UTC)
+    return max(found, key=lambda item: item.exited or item.created or empty)
+
+
 def _real_time(stamp: datetime | None) -> datetime | None:
     if stamp is None or stamp.year < 2:
         return None
@@ -966,11 +1037,31 @@ async def _wait_job(wake: asyncio.Event, seconds: float) -> None:
     wake.clear()
 
 
-_HOOK_BODY = """token=$(cat "$YARD_TOKEN_FILE")
+def slot_ref(ref: str) -> str:
+    """The slot ref for a git ref. A push uses the branch. A fetch uses origin/<branch>."""
+    if ref.startswith("refs/heads/"):
+        name = ref.removeprefix("refs/heads/")
+        if name and name != "HEAD":
+            return name
+        return ""
+    prefix = "refs/remotes/origin/"
+    if ref.startswith(prefix):
+        name = ref.removeprefix(prefix)
+        if name and name != "HEAD":
+            return f"origin/{name}"
+    return ""
+
+
+_HOOK_BODY = """state="${1:-}"
+if [ "$state" != "committed" ]; then
+  cat >/dev/null || true
+  exit 0
+fi
+token=$(cat "$YARD_TOKEN_FILE")
 url="$YARD_HOOK_URL"
-while read old new ref; do
-  body=$(printf '{"repo":"%s","old":"%s","new":"%s","ref":"%s"}' "$YARD_REPO" "$old" "$new" "$ref")
-  resp=$(curl -sS -H "Authorization: Bearer $token" -H "Content-Type: application/json" \\
+while read _old new ref; do
+  body=$(printf '{"repo":"%s","new":"%s","ref":"%s"}' "$YARD_REPO" "$new" "$ref")
+  resp=$(curl -sS --connect-timeout 5 -H "Authorization: Bearer $token" -H "Content-Type: application/json" \\
     -d "$body" -w "\\n%{http_code}" "$url") || {
     printf '%s\\n' "$resp" >&2
     exit 1
@@ -985,168 +1076,6 @@ while read old new ref; do
 done
 """
 
-_SWAP = r"""# Stop the live container and keep it until the new image answers /health.
-if [ -z "${YARD_IMAGE:-}" ] || [ -z "${YARD_ROOT:-}" ] || [ -z "${YARD_PODMAN_SOCK:-}" ]; then
-  echo "swap: missing env" >&2
-  exit 1
-fi
-if [ -z "${YARD_PUBLIC_PORT:-}" ]; then
-  echo "swap: missing env" >&2
-  exit 1
-fi
-YARD_SWAP_WAIT="${YARD_SWAP_WAIT:-60}"
-YARD_SWAP_TRIES="${YARD_SWAP_TRIES:-15}"
-YARD_SWAP_DELAY="${YARD_SWAP_DELAY:-1}"
-YARD_DOMAIN="${YARD_DOMAIN:-}"
-YARD_SELF_IMAGE="${YARD_SELF_IMAGE:-}"
-YARD_CADDY_SOCK="${YARD_CADDY_SOCK:-}"
-YARD_SWAP_ID="${YARD_SWAP_ID:-}"
-mkdir -p "$YARD_ROOT/data/yard"
-result_file="$YARD_ROOT/data/yard/swap.result"
-
-log() {
-  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$YARD_ROOT/data/yard/swap.log"
-}
-
-mark() {
-  printf '%s %s\n' "$1" "$YARD_SWAP_ID" > "$result_file"
-}
-
-healthy() {
-  podman --remote exec "$1" /workspace/.venv/bin/python -c \
-    'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=3).read()' \
-    >/dev/null 2>&1
-}
-
-wait_healthy() {
-  name="$1"
-  try=0
-  while [ "$try" -lt "$YARD_SWAP_WAIT" ]; do
-    if healthy "$name"; then
-      return 0
-    fi
-    state=$(podman --remote inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)
-    if [ "$state" = "exited" ] || [ "$state" = "dead" ]; then
-      log "$name is $state"
-      return 1
-    fi
-    try=$((try + 1))
-    if [ "$try" -lt "$YARD_SWAP_WAIT" ]; then
-      sleep 1
-    fi
-  done
-  log "$name did not answer /health"
-  return 1
-}
-
-save_logs() {
-  name="$1"
-  err=$(podman --remote logs --tail 80 "$name" 2>&1 || true)
-  if [ -n "$err" ]; then
-    log "logs $name: $err"
-  fi
-}
-
-run_container() {
-  name="$1"
-  image="$2"
-  publish="$3"
-  ack="$4"
-  podman --remote rm -f "$name" >/dev/null 2>&1 || true
-  set -- podman --remote run -d --name "$name" --network yard --log-driver journald \
-    -v "$YARD_ROOT:$YARD_ROOT" \
-    -v "$YARD_PODMAN_SOCK:/run/podman/podman.sock" \
-    -e CONTAINER_HOST=unix:///run/podman/podman.sock \
-    -e "YARD_IMAGE=$image" \
-    -e "YARD_ROOT=$YARD_ROOT" \
-    -e "YARD_PODMAN_SOCK=$YARD_PODMAN_SOCK" \
-    -e "YARD_CADDY_SOCK=$YARD_CADDY_SOCK" \
-    -e "YARD_PUBLIC_PORT=$YARD_PUBLIC_PORT" \
-    -e YARD_BOOT=1
-  if [ -n "$YARD_DOMAIN" ]; then
-    set -- "$@" -e "YARD_DOMAIN=$YARD_DOMAIN"
-  fi
-  if [ -n "$YARD_SELF_IMAGE" ]; then
-    set -- "$@" -e "YARD_SELF_IMAGE=$YARD_SELF_IMAGE"
-  fi
-  if [ "$ack" = "1" ]; then
-    set -- "$@" -e YARD_SWAP_ACK=1 -e "YARD_SWAP_ID=$YARD_SWAP_ID"
-  fi
-  if [ "$publish" = "1" ]; then
-    set -- "$@" --restart=always -p "127.0.0.1:${YARD_PUBLIC_PORT}:8000"
-  fi
-  set -- "$@" "$image"
-  if ! err=$("$@" 2>&1); then
-    log "run $name failed: $err"
-    return 1
-  fi
-  log "run $name"
-  return 0
-}
-
-start_published() {
-  image="$1"
-  try=0
-  while [ "$try" -lt "$YARD_SWAP_TRIES" ]; do
-    if run_container yard "$image" 1 1; then
-      return 0
-    fi
-    try=$((try + 1))
-    if [ "$try" -lt "$YARD_SWAP_TRIES" ]; then
-      sleep 1
-    fi
-  done
-  return 1
-}
-
-restore() {
-  log "restore the previous container"
-  save_logs yard-next
-  save_logs yard
-  podman --remote rm -f yard-next >/dev/null 2>&1 || true
-  if podman --remote container exists yard-old >/dev/null 2>&1; then
-    podman --remote rm -f yard >/dev/null 2>&1 || true
-    podman --remote rename yard-old yard >/dev/null 2>&1 || log "rename yard-old failed"
-  fi
-  mark rolled_back
-  if podman --remote start yard; then
-    log "started the previous container"
-    exit 1
-  fi
-  log "the previous container did not start"
-  if start_published localhost/yard:previous; then
-    mark rolled_back
-    exit 1
-  fi
-  mark failed
-  log "no yard container is running"
-  exit 1
-}
-
-if [ "$YARD_SWAP_DELAY" != "0" ]; then
-  sleep "$YARD_SWAP_DELAY"
-fi
-log "swap $YARD_IMAGE"
-if ! podman --remote stop -t 10 yard; then
-  log "stop failed"
-  exit 1
-fi
-if ! run_container yard-next "$YARD_IMAGE" 0 0 || ! wait_healthy yard-next; then
-  restore
-fi
-if ! podman --remote rename yard yard-old; then
-  log "rename yard failed"
-  restore
-fi
-podman --remote rm -f yard-next >/dev/null 2>&1 || true
-if ! start_published "$YARD_IMAGE" || ! wait_healthy yard; then
-  restore
-fi
-podman --remote rm -f yard-old >/dev/null 2>&1 || true
-log "ready"
-exit 0
-"""
-
 
 def _write_hook(path: Path, name: str, token_file: Path, hook_url: str) -> None:
     header = "\n".join(
@@ -1159,8 +1088,11 @@ def _write_hook(path: Path, name: str, token_file: Path, hook_url: str) -> None:
             "export YARD_TOKEN_FILE YARD_HOOK_URL YARD_REPO",
         ]
     )
+    text = header + "\n" + _HOOK_BODY
+    if path.is_file() and path.read_text() == text:
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(header + "\n" + _HOOK_BODY)
+    path.write_text(text)
     path.chmod(0o755)
 
 

@@ -19,6 +19,14 @@ The repo needs a `Containerfile` or a `Dockerfile`, at the root or in `ops/`.
 
 `yard init` creates the git repo, the Yard repo, and the slot. It does not push. The next push builds the image and starts the container. Yard removes the slot when that branch is merged or deleted.
 
+To start from a GitHub address, pass it to the host. The laptop does not need a checkout.
+
+```sh
+yard init --remote https://github.com/org/heldso --domain heldso.example.com
+```
+
+Yard clones that address and follows `origin/main`. The first deploy builds that revision. `--ref` selects another branch.
+
 ```sh
 yard init --every 5m
 ```
@@ -27,7 +35,7 @@ That slot is a job. Yard keeps one run at a time.
 
 ## On the machine
 
-Yard keeps its files in `/srv/yard`. A slot keeps its files in `/srv/yard/data/<name>`.
+Yard keeps its files in `/srv/yard`. A slot keeps its files in `/srv/yard/data/<name>`. The container sees that directory at `/data`.
 
 Caddy listens on 8443. The host forwards 443 to that port.
 
@@ -37,29 +45,28 @@ Install on the VM, as root:
 ./install.sh --domain yard.example.com
 ```
 
-The script prints an admin token. Use it with `yard login`. The image is `ghcr.io/bobowski/yard:latest`.
+The script prints an admin token. Use it with `yard login`. The script clones the public repo and builds Yard from `origin/main`.
 
 ## Day to day
 
 ```sh
 yard slot list
-yard slot logs <name>
+yard logs --slot <name>
+yard deploys <name>
+yard deploy <name>
 yard slot edit <name>
-yard update
+yard git <name> fetch
 ```
 
-`yard slot list` shows what is up, how long it has been up, and the revision it runs. A revision that is behind the branch shows both. Color marks a line that needs attention. A pipe, `--json`, `NO_COLOR`, and `--no-color` leave the color off.
+`yard slot list` shows what is up, how long it has been up, and the revision it runs. A revision that is behind the ref shows both. Color marks a line that needs attention. A failed build points at `yard deploys`. A down process points at `yard logs`. A pipe, `--json`, `NO_COLOR`, and `--no-color` leave the color off.
 
-`yard update` pulls the image and replaces this Yard. The current container stays until the new one answers. `yard rollback` returns to the previous image.
+`yard logs --slot <name>` reads containers whose role is app. `--role` selects app, deploy, revert, or job. `--service` and `--sha` narrow that set. `yard podman logs <container>` reads one container by its Podman name.
 
-To build Yard from a repo on the same host:
+`yard deploys <name>` shows the build time, the start time, and the total. `yard deploy <name>` builds the ref the slot follows. An edit of the ref, the directory, or an env value runs that deploy.
 
-```sh
-yard settings --self-repo yard
-yard update
-```
+`yard git <name> fetch` fetches origin. A slot whose ref is `origin/main` deploys when that tip moves. Yard is that kind of slot.
 
-`yard settings --self-image` returns to `ghcr.io/bobowski/yard:latest`.
+`yard git <name> log -1` reads that bare repo. The command list is log, show, rev-parse, ls-tree, cat-file, for-each-ref, branch, remote, fetch, and gc.
 
 `yard` prints the short command list. A terminal prints text. A pipe prints JSON.
 

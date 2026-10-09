@@ -2,10 +2,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from stario.testing import TestClient
-
-from app.main import bootstrap
-from tests.conftest import auth
+from tests.conftest import auth, local
 
 
 async def test_health(yard):
@@ -34,8 +31,10 @@ async def test_repo_and_slot(yard):
     res = await client.post("/api/v1/repos", json={"name": "heldso"}, headers=auth(token))
     assert res.status_code == 200
     bare = root / "repos" / "heldso.git"
-    hook = (bare / "hooks" / "post-receive").read_text()
+    hook = (bare / "hooks" / "reference-transaction").read_text()
     assert "/api/v1/hooks/push" in hook
+    assert "committed" in hook
+    assert not (bare / "hooks" / "post-receive").exists()
     assert not (bare / "hooks" / "pre-receive").exists()
     assert res.json()["name"] == "heldso"
     head = subprocess.check_output(["git", "-C", str(bare), "symbolic-ref", "HEAD"], text=True)
@@ -43,20 +42,20 @@ async def test_repo_and_slot(yard):
 
     res = await client.post(
         "/api/v1/slots",
-        json={"SLOT_NAME": "heldso", "SLOT_REPO": "heldso", "SLOT_DOMAIN": "heldso.example.com"},
+        json={"SLOT_NAME": "heldso", "SLOT_REPO": "heldso", "DOMAIN": "heldso.example.com"},
         headers=auth(token),
     )
     assert res.status_code == 200
     body = res.text
     values = res.json()["values"]
-    assert values["SLOT_BRANCH"] == "main"
-    assert values["SLOT_DOMAIN"] == "heldso.example.com"
+    assert values["REF"] == "main"
+    assert values["DOMAIN"] == "heldso.example.com"
     assert '"status":"waiting"' in body
     assert "no revision" in body
 
     res = await client.post(
         "/api/v1/slots",
-        json={"SLOT_NAME": "other", "SLOT_REPO": "heldso", "SLOT_DOMAIN": "heldso.example.com"},
+        json={"SLOT_NAME": "other", "SLOT_REPO": "heldso", "DOMAIN": "heldso.example.com"},
         headers=auth(token),
     )
     assert res.status_code == 409
@@ -82,7 +81,7 @@ async def test_repo_and_slot(yard):
 
     res = await client.put(
         "/api/v1/slots/heldso",
-        json={"SLOT_DOMAIN": "app.example.com", "SLOT_BRANCH": "release"},
+        json={"DOMAIN": "app.example.com", "REF": "release"},
         headers=auth(token),
     )
     assert res.status_code == 200
@@ -93,17 +92,24 @@ async def test_repo_and_slot(yard):
     assert res.status_code == 409
     assert "repo_in_use" in res.text
 
+    refused = await client.post(
+        "/api/v1/hooks/push",
+        json={"repo": "heldso", "new": "abc", "ref": "refs/heads/release"},
+        headers=auth(token),
+    )
+    assert refused.status_code == 403
+    assert refused.json()["error"]["code"] == "local_only"
     res = await client.post(
         "/api/v1/hooks/push",
-        json={"repo": "heldso", "old": "000", "new": "abc", "ref": "refs/heads/release"},
-        headers=auth(token),
+        json={"repo": "heldso", "new": "abc", "ref": "refs/heads/release"},
+        headers=local(token),
     )
     assert res.status_code == 200
     assert "deploy skipped" in res.text
     res = await client.post(
         "/api/v1/hooks/push",
-        json={"repo": "heldso", "old": "000", "new": "abc", "ref": "refs/heads/main"},
-        headers=auth(token),
+        json={"repo": "heldso", "new": "abc", "ref": "refs/heads/main"},
+        headers=local(token),
     )
     assert "no slot watches" in res.text
 
@@ -139,7 +145,7 @@ async def test_slot_file(yard):
     assert (await client.post("/api/v1/repos", json={"name": "heldso"}, headers=auth(token))).status_code == 200
     res = await client.post(
         "/api/v1/slots",
-        json={"SLOT_NAME": "heldso", "SLOT_REPO": "heldso", "SLOT_DOMAIN": "heldso.example.com"},
+        json={"SLOT_NAME": "heldso", "SLOT_REPO": "heldso", "DOMAIN": "heldso.example.com"},
         headers=auth(token),
     )
     assert res.status_code == 200
@@ -147,19 +153,19 @@ async def test_slot_file(yard):
     vals = res.json()
     assert res.status_code == 200
     assert vals["SLOT_NAME"] == "heldso"
-    assert vals["SLOT_DOMAIN"] == "heldso.example.com"
+    assert vals["DOMAIN"] == "heldso.example.com"
     res = await client.put(
         "/api/v1/slots/heldso",
-        json={"SLOT_BRANCH": "login", "SLOT_REPO": "other", "API_TOKEN": "secret"},
+        json={"REF": "login", "SLOT_REPO": "other", "API_TOKEN": "secret"},
         headers=auth(token),
     )
     assert res.status_code == 200
     assert "SLOT_REPO stays" in res.text
     assert "API_TOKEN" in res.text
     vals = (await client.get("/api/v1/slots/heldso", headers=auth(token))).json()
-    assert vals["SLOT_BRANCH"] == "login"
+    assert vals["REF"] == "login"
     assert vals["SLOT_REPO"] == "heldso"
-    assert vals["SLOT_DOMAIN"] == "heldso.example.com"
+    assert vals["DOMAIN"] == "heldso.example.com"
     assert vals["API_TOKEN"] == "secret"
 
 
@@ -174,12 +180,13 @@ async def test_repo_create_is_safe(yard):
     assert (junk / "nope").is_file()
     res = await client.post("/api/v1/repos", json={"name": "heldso", "force": True}, headers=auth(token))
     assert res.status_code == 200
-    assert (junk / "hooks" / "post-receive").is_file()
+    assert (junk / "hooks" / "reference-transaction").is_file()
+    assert not (junk / "hooks" / "post-receive").exists()
     assert not (junk / "nope").exists()
     res = await client.post("/api/v1/repos", json={"name": "heldso", "force": True}, headers=auth(token))
     assert res.status_code == 409
     assert "already exists" in res.text
-    assert (junk / "hooks" / "post-receive").is_file()
+    assert (junk / "hooks" / "reference-transaction").is_file()
 
 
 async def test_slot_deploys_existing_revision(yard):
@@ -188,14 +195,21 @@ async def test_slot_deploys_existing_revision(yard):
     sha = _commit_empty(root / "repos" / "app.git")
     res = await client.post(
         "/api/v1/slots",
-        json={"SLOT_NAME": "app", "SLOT_REPO": "app", "SLOT_BRANCH": "main"},
+        json={"SLOT_NAME": "app", "SLOT_REPO": "app", "REF": "main"},
         headers=auth(token),
     )
     assert res.status_code == 200
     assert sha in res.text
     assert '"status":"skipped"' in res.text
     vals = (await client.get("/api/v1/slots/app", headers=auth(token))).json()
-    assert vals["DEPLOY_SHA"] == ""
+    assert vals["SHA"] == ""
+    again = await client.post("/api/v1/slots/app/deploy", headers=auth(token))
+    assert again.status_code == 200
+    assert again.json()["status"] == "skipped"
+    assert sha in again.text
+    bad = await client.get("/api/v1/logs", params={"role": "nope"}, headers=auth(token))
+    assert bad.status_code == 400
+    assert bad.json()["error"]["code"] == "bad_role"
 
 
 async def test_experiment(yard):
@@ -257,8 +271,8 @@ async def test_token_tree(yard):
     assert res.status_code == 403
     res = await client.post(
         "/api/v1/hooks/push",
-        json={"repo": "shop", "old": "0", "new": "abcdef", "ref": "refs/heads/main", "actor": "ada"},
-        headers=auth(admin),
+        json={"repo": "shop", "new": "abcdef", "ref": "refs/heads/main", "actor": "ada"},
+        headers=local(admin),
     )
     assert res.status_code == 200
     assert (await client.delete("/api/v1/tokens/ada", headers=auth(admin))).status_code == 200
@@ -278,28 +292,28 @@ async def test_slot_leaves_when_branch_merges(yard):
     assert (
         await client.post(
             "/api/v1/slots",
-            json={"SLOT_NAME": "shop", "SLOT_REPO": "shop", "SLOT_BRANCH": "main"},
+            json={"SLOT_NAME": "shop", "SLOT_REPO": "shop", "REF": "main"},
             headers=auth(token),
         )
     ).status_code == 200
     res = await client.post(
         "/api/v1/slots",
-        json={"SLOT_NAME": "shop-wip", "SLOT_REPO": "shop", "SLOT_BRANCH": "feature", "SLOT_DOMAIN": "wip.example.com"},
+        json={"SLOT_NAME": "shop-wip", "SLOT_REPO": "shop", "REF": "feature", "DOMAIN": "wip.example.com"},
         headers=auth(token),
     )
     assert res.status_code == 200
-    assert '"SLOT_DOMAIN":"wip.example.com"' in res.text
+    assert '"DOMAIN":"wip.example.com"' in res.text
     assert (
         await client.post(
             "/api/v1/slots",
-            json={"SLOT_NAME": "shop-also", "SLOT_REPO": "shop", "SLOT_BRANCH": "feature"},
+            json={"SLOT_NAME": "shop-also", "SLOT_REPO": "shop", "REF": "feature"},
             headers=auth(token),
         )
     ).status_code == 200
     res = await client.post(
         "/api/v1/hooks/push",
-        json={"repo": "shop", "old": "000", "new": sha, "ref": "refs/heads/main"},
-        headers=auth(token),
+        json={"repo": "shop", "new": sha, "ref": "refs/heads/main"},
+        headers=local(token),
     )
     assert res.status_code == 200
     assert "slot shop-wip removed: branch feature is in main" in res.text
@@ -311,15 +325,15 @@ async def test_slot_leaves_when_branch_merges(yard):
     assert (
         await client.post(
             "/api/v1/slots",
-            json={"SLOT_NAME": "shop-wip", "SLOT_REPO": "shop", "SLOT_BRANCH": "feature"},
+            json={"SLOT_NAME": "shop-wip", "SLOT_REPO": "shop", "REF": "feature"},
             headers=auth(token),
         )
     ).status_code == 200
     zeros = "0" * 40
     res = await client.post(
         "/api/v1/hooks/push",
-        json={"repo": "shop", "old": sha, "new": zeros, "ref": "refs/heads/feature"},
-        headers=auth(token),
+        json={"repo": "shop", "new": zeros, "ref": "refs/heads/feature"},
+        headers=local(token),
     )
     assert res.status_code == 200
     assert "slot shop-wip removed: branch feature was deleted" in res.text
@@ -327,54 +341,21 @@ async def test_slot_leaves_when_branch_merges(yard):
     assert (await client.get("/api/v1/slots/shop", headers=auth(token))).status_code == 200
 
 
-async def test_self_image_is_a_registry_reference(yard):
-    client, token, _root = yard
-    res = await client.put(
-        "/api/v1/settings",
-        json={"self_image": "ghcr.io/bobowski/yard:latest"},
-        headers=auth(token),
-    )
-    assert res.status_code == 200
-    assert res.json()["self_image"] == "ghcr.io/bobowski/yard:latest"
-    got = await client.get("/api/v1/settings", headers=auth(token))
-    assert got.json()["self_image"] == "ghcr.io/bobowski/yard:latest"
-
-    res = await client.put("/api/v1/settings", json={"self_image": "yard:latest"}, headers=auth(token))
-    assert res.status_code == 400
-    assert res.json()["error"]["code"] == "bad_image"
-
+async def test_repo_git_reads_a_commit_and_fetch_needs_origin(yard):
+    client, token, root = yard
     made = await client.post("/api/v1/repos", json={"name": "heldso"}, headers=auth(token))
     assert made.status_code == 200
-    res = await client.put(
-        "/api/v1/settings",
-        json={"self_repo": "heldso", "self_image": "ghcr.io/bobowski/yard:latest"},
+    sha = _commit_empty(root / "repos" / "heldso.git")
+    res = await client.post(
+        "/api/v1/repos/heldso/git",
+        json={"args": ["log", "-1", "--oneline"]},
         headers=auth(token),
     )
-    assert res.status_code == 400
-    assert res.json()["error"]["code"] == "one_source"
-
-    res = await client.put("/api/v1/settings", json={"self_repo": "heldso"}, headers=auth(token))
     assert res.status_code == 200
-    assert res.json()["self_repo"] == "heldso"
-    assert res.json()["self_image"] == ""
-    res = await client.put("/api/v1/settings", json={"self_repo": ""}, headers=auth(token))
-    assert res.status_code == 200
-    assert res.json()["self_repo"] == ""
-    assert res.json()["self_image"] == "ghcr.io/bobowski/yard:latest"
-
-
-async def test_boot_keeps_the_registry_image(tmp_path, monkeypatch):
-    monkeypatch.setenv("YARD_ROOT", str(tmp_path))
-    monkeypatch.setenv("YARD_SKIP_DEPLOY", "1")
-    monkeypatch.setenv("YARD_BOOT", "0")
-    monkeypatch.setenv("YARD_HOOK_URL", "http://127.0.0.1:8000")
-    monkeypatch.setenv("YARD_PODMAN_BIN", "yard-podman-missing")
-    monkeypatch.setenv("YARD_SELF_IMAGE", "ghcr.io/bobowski/yard:latest")
-    async with TestClient(bootstrap) as client:
-        token = (tmp_path / "data" / "yard" / "admin.token").read_text().strip()
-        res = await client.get("/api/v1/settings", headers=auth(token))
-    assert res.status_code == 200
-    assert res.json()["self_image"] == "ghcr.io/bobowski/yard:latest"
+    assert sha[:7] in res.json()["output"]
+    refused = await client.post("/api/v1/repos/heldso/git", json={"args": ["fetch"]}, headers=auth(token))
+    assert refused.status_code == 400
+    assert refused.json()["error"]["code"] == "git_failed"
 
 
 async def test_container_inspect_rejects_a_bad_name(yard):
@@ -422,8 +403,8 @@ def _commit_empty(directory: Path) -> str:
 
 
 def _seed_merged_feature(bare: Path) -> str:
-    hook = bare / "hooks" / "post-receive"
-    off = hook.with_name("post-receive.off")
+    hook = bare / "hooks" / "reference-transaction"
+    off = hook.with_name("reference-transaction.off")
     hook.rename(off)
     try:
         work = bare.parent / "work"

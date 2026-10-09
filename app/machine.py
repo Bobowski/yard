@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import shutil
 import socket
 import stat
@@ -12,14 +13,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from app.apply import materialize, run_args, write_env
+from app.errors import YardError
 from app.podman import Podman
 from app.store import Slot
-from app.text import image_sha, slot_env
+from app.text import image_sha, parse_env, process_defaults
 
 PROXY_PORT = 8443
 APP_PORT = 8000
-CADDY_NAME = "caddy"
-CADDY_IMAGE = "docker.io/library/caddy:2"
 JOB_RETRY = 30.0
 
 
@@ -32,6 +33,9 @@ class Paths:
 
     def data(self, slot: str) -> Path:
         return self.root / "data" / slot
+
+    def run_dir(self, slot: str) -> Path:
+        return self.root / "run" / slot
 
     def build(self, repo: str, directory: str, sha: str) -> Path:
         name = sha if not directory else f"{sha}-{slug(directory)}"
@@ -53,6 +57,7 @@ class Result:
     image: str
     log: str
     error: str = ""
+    pending: bool = False
 
 
 @dataclass(slots=True)
@@ -97,152 +102,247 @@ def plan_job(every: float, image: str, runs: list[RunState], now: datetime) -> J
         return plan
     if job_due(runs, every, now):
         return JobPlan(start=True)
-    latest = max((run.finished for run in runs if run.finished), default=None)
-    if latest is None:
-        return JobPlan(start=True)
+    latest = max(run.finished for run in runs if run.finished)
     return JobPlan(sleep=max(0.0, (latest + timedelta(seconds=every) - now).total_seconds()))
 
 
-async def build_image(podman: Podman, paths: Paths, repo: str, directory: str, sha: str, image: str) -> str:
-    if await podman.image_exists(image):
-        return f"reuse {image}"
-
+async def prepare_checkout(paths: Paths, repo: str, directory: str, sha: str) -> Path:
+    """Extract one revision. A finished extract stays for the next deploy of that revision."""
     build_dir = paths.build(repo, directory, sha)
+    ready = build_dir.parent / f".{build_dir.name}.ready"
+    if ready.is_file() and build_dir.is_dir():
+        return build_dir
     shutil.rmtree(build_dir, ignore_errors=True)
+    ready.unlink(missing_ok=True)
+    build_dir.mkdir(parents=True)
+    source = paths.repo(repo)
+    sub = directory.strip("/")
+    cmd = ["git", "-C", str(source), "archive", "--format=tar", sha]
+    strip = 0
+    if sub:
+        cmd.append(sub)
+        strip = len([part for part in sub.split("/") if part])
+    tar_cmd = ["tar", "-x", "-C", str(build_dir)]
+    if strip:
+        tar_cmd.append(f"--strip-components={strip}")
+    read_fd, write_fd = os.pipe()
     try:
-        await run_cmd("git", "clone", str(paths.repo(repo)), str(build_dir))
-        await run_cmd("git", "-C", str(build_dir), "checkout", "-f", sha)
-        file, context = containerfile(build_dir, directory)
-        await podman.build(image, str(context), str(file))
+        git = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=write_fd,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    finally:
+        os.close(write_fd)
+    try:
+        tar = await asyncio.create_subprocess_exec(
+            *tar_cmd,
+            stdin=read_fd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except Exception:
+        git.kill()
+        await git.wait()
+        raise
+    finally:
+        os.close(read_fd)
+    assert git.stderr is not None and tar.stderr is not None
+    git_raw, tar_raw, git_code, tar_code = await asyncio.gather(
+        git.stderr.read(),
+        tar.stderr.read(),
+        git.wait(),
+        tar.wait(),
+    )
+    git_err = git_raw.decode(errors="replace")
+    tar_err = tar_raw.decode(errors="replace")
+    if git_code:
+        detail = git_err.strip()
+        low = detail.lower()
+        if sub and ("pathspec" in low or "did not match" in low):
+            raise RuntimeError(f"directory {directory!r} is not in the repo at this revision")
+        raise RuntimeError(detail or "git archive failed")
+    if tar_code:
+        raise RuntimeError(tar_err.strip() or "tar failed")
+    ready.write_text(sha + "\n")
+    return build_dir
+
+
+# The yard container reads these. A later deploy must not drop them.
+_HOST_KEYS = (
+    "YARD_PODMAN_SOCK",
+    "YARD_PUBLIC_PORT",
+    "YARD_CADDY_SOCK",
+    "YARD_BOOT",
+    "YARD_DOMAIN",
+    "CONTAINER_HOST",
+    "PROXY_PORT",
+)
+
+
+def _kept_host(env_path: Path) -> dict[str, str]:
+    found: dict[str, str] = {}
+    if env_path.is_file():
+        try:
+            current = parse_env(env_path.read_text())
+        except YardError:
+            current = {}
+        for key in _HOST_KEYS:
+            if current.get(key):
+                found[key] = current[key]
+    for key in _HOST_KEYS:
+        if key not in found and os.environ.get(key):
+            found[key] = os.environ[key]
+    return found
+
+
+def _apply_env(paths: Paths, slot: Slot, checkout: Path, image: str, sha: str) -> tuple[Path, Path]:
+    data = paths.data(slot.name)
+    data.mkdir(parents=True, exist_ok=True)
+    run = paths.run_dir(slot.name)
+    run.mkdir(parents=True, exist_ok=True)
+    env_path = run / "compose.env"
+    app_env = run / "app.env"
+    kept = _kept_host(env_path) if slot.name == "yard" else {}
+    values = process_defaults(slot.name)
+    values.update(
+        {
+            "IMAGE": image,
+            "PREVIOUS": slot.live_image,
+            "CHECKOUT": str(checkout),
+            "PORT": str(APP_PORT),
+            "RESTART": "no" if slot.every else "always",
+        }
+    )
+    values.update(slot.env)
+    values["SHA"] = sha
+    # The container path is SLOT_DATA_DIR. This host directory is that path.
+    values["DATA_DIR"] = str(data)
+    values["YARD_ROOT"] = str(paths.root)
+    compose = materialize(checkout, env_path, app_env, values)
+    with env_path.open("a") as handle:
+        for key, value in kept.items():
+            handle.write(f"{key}={value}\n")
+        handle.write(f"COMPOSE_FILE={compose}\n")
+    return compose, env_path
+
+
+def write_image(env_path: Path, image: str) -> None:
+    """Point the compose env at one image. The next apply command uses that image."""
+    values = parse_env(env_path.read_text()) if env_path.is_file() else {}
+    values["IMAGE"] = image
+    values["SHA"] = image_sha(image)
+    write_env(env_path, values)
+
+
+async def _revert_after_start(
+    podman: Podman,
+    paths: Paths,
+    slot: Slot,
+    image: str,
+    compose: Path,
+    env_path: Path,
+    sock: str,
+) -> list[str]:
+    if not slot.live_image or slot.live_image == image:
+        return []
+    try:
+        write_image(env_path, slot.live_image)
     except Exception as exc:
-        raise RuntimeError(f"build {image}\n{exc}") from exc
-    return f"build {image}"
+        return [str(exc)]
+    built = paths.run_dir(slot.name) / "apply.built"
+    if not built.is_file():
+        return [f"kept {slot.live_image}"]
+    lines = [f"rollback {slot.live_image}"]
+    try:
+        args, env = run_args(
+            root=str(paths.root),
+            sock=sock,
+            project=slot.name,
+            compose=str(compose),
+            env_file=str(env_path),
+            command="revert",
+            slot=slot.name,
+            sha=image_sha(slot.live_image),
+        )
+        lines.append(await podman.run(*args, env=env, program="docker-compose", timeout=None))
+    except Exception as roll:
+        lines.append(str(roll))
+    return lines
 
 
-async def deploy_slot(podman: Podman, paths: Paths, slot: Slot, sha: str) -> Result:
+async def deploy_slot(podman: Podman, paths: Paths, slot: Slot, sha: str, sock: str) -> Result:
     sha = sha.strip()
     image = image_tag(slot.repo, slot.directory, sha)
     lines: list[str] = []
     try:
-        lines.append(await build_image(podman, paths, slot.repo, slot.directory, sha, image))
+        checkout = await prepare_checkout(paths, slot.repo, slot.directory, sha)
+        compose, env_path = _apply_env(paths, slot, checkout, image, sha)
     except Exception as exc:
         lines.append(str(exc))
         return Result(image, "\n".join(lines) + "\n", str(exc))
 
-    # A job keeps the image and does not stay up.
+    # A push builds the image. A web slot also starts. A job waits for the clock.
+    # Upgrading yard replaces this container, so that apply container is detached.
+    command = "build" if slot.every else "up"
+    detach = slot.name == "yard" and command == "up"
+    try:
+        args, env = run_args(
+            root=str(paths.root),
+            sock=sock,
+            project=slot.name,
+            compose=str(compose),
+            env_file=str(env_path),
+            command=command,
+            slot=slot.name,
+            sha=sha,
+            detach=detach,
+        )
+        lines.append(await podman.run(*args, env=env, program="docker-compose", timeout=None))
+    except YardError as exc:
+        lines.append(str(exc))
+        if command == "up" and not detach:
+            lines.extend(await _revert_after_start(podman, paths, slot, image, compose, env_path, sock))
+        return Result(image, "\n".join(lines) + "\n", str(exc))
+    if detach:
+        lines.append("upgrading")
+        return Result(image, "\n".join(lines) + "\n", pending=True)
+
     if slot.every:
-        await _remove_stay(podman, slot.name)
         lines.append(f"job every {slot.every} image {image}")
         return Result(image, "\n".join(lines) + "\n")
 
-    paths.data(slot.name).mkdir(parents=True, exist_ok=True)
-    try:
-        await podman.ensure_network("yard")
-    except Exception:
-        pass
-    lines.append(f"stop {slot.name}")
-    await _remove_stay(podman, slot.name)
-    try:
-        await _run_slot(podman, paths, slot, image)
-    except Exception as exc:
-        lines.append(str(exc))
-        await _rollback(podman, paths, slot, image, lines)
-        return Result(image, "\n".join(lines) + "\n", str(exc))
-
-    # Health has to answer before this image replaces the previous one.
     health = f"http://{slot.name}:{APP_PORT}/"
     lines.append(f"wait {health}")
     try:
         await wait_url(health, 30)
     except Exception as exc:
-        try:
-            logs = await podman.run("logs", "--tail", "200", slot.name, timeout=20)
-        except Exception:
-            logs = ""
         lines.append(str(exc))
-        if logs:
-            lines.append(logs)
-        await _remove_stay(podman, slot.name)
-        await _rollback(podman, paths, slot, image, lines)
+        lines.extend(await _revert_after_start(podman, paths, slot, image, compose, env_path, sock))
         return Result(image, "\n".join(lines) + "\n", str(exc))
     lines.append(f"ready {image}")
     return Result(image, "\n".join(lines) + "\n")
 
 
-async def run_job(podman: Podman, paths: Paths, slot: Slot, image: str) -> str:
-    paths.data(slot.name).mkdir(parents=True, exist_ok=True)
-    try:
-        await podman.ensure_network("yard")
-    except Exception:
-        pass
-    await _remove_stay(podman, slot.name)
-    args = [
-        "run",
-        "-d",
-        "--name",
-        slot.name,
-        "--restart=no",
-        "--network",
-        "yard",
-        "--log-driver",
-        "journald",
-        "--userns=keep-id",
-        "--label",
-        f"yard.slot={slot.name}",
-        "--label",
-        f"yard.image={image}",
-        "-v",
-        f"{paths.data(slot.name)}:/data:U",
-    ]
-    for item in slot_env(slot.name, slot.env):
-        args.extend(("-e", item))
-    sha = image_sha(image)
-    if image.startswith("localhost/") and sha:
-        args.extend(("-e", f"SHA={sha}"))
-    args.append(image)
-    await podman.run(*args, timeout=None)
-    return slot.name
-
-
-async def _run_slot(podman: Podman, paths: Paths, slot: Slot, image: str) -> None:
-    args = [
-        "run",
-        "-d",
-        "--name",
-        slot.name,
-        "--restart=always",
-        "--network",
-        "yard",
-        "--label",
-        f"yard.slot={slot.name}",
-        "--log-driver",
-        "journald",
-        "--userns=keep-id",
-        "-v",
-        f"{paths.data(slot.name)}:/data:U",
-    ]
-    for item in slot_env(slot.name, slot.env):
-        args.extend(("-e", item))
-    args.append(image)
-    await podman.run(*args, timeout=None)
-
-
-async def _remove_stay(podman: Podman, slot: str) -> None:
-    try:
-        await podman.remove(slot)
-    except Exception:
-        pass
-
-
-async def _rollback(podman: Podman, paths: Paths, slot: Slot, image: str, lines: list[str]) -> None:
-    if not slot.live_image or slot.live_image == image:
-        return
-    lines.append(f"rollback {slot.live_image}")
-    await _remove_stay(podman, slot.name)
-    try:
-        await _run_slot(podman, paths, slot, slot.live_image)
-    except Exception as exc:
-        lines.append(str(exc))
+async def run_job(podman: Podman, paths: Paths, slot: Slot, image: str, sock: str) -> None:
+    env_path = paths.run_dir(slot.name) / "compose.env"
+    if not env_path.is_file():
+        raise RuntimeError(f"slot {slot.name} has no compose env")
+    values = parse_env(env_path.read_text())
+    compose = values.get("COMPOSE_FILE") or ""
+    if not compose:
+        raise RuntimeError(f"slot {slot.name} has no compose file")
+    args, env = run_args(
+        root=str(paths.root),
+        sock=sock,
+        project=slot.name,
+        compose=str(compose),
+        env_file=str(env_path),
+        command="job",
+        slot=slot.name,
+        sha=image_sha(image),
+    )
+    await podman.run(*args, env=env, program="docker-compose", timeout=None)
 
 
 async def wait_url(url: str, timeout: float) -> None:
@@ -267,21 +367,6 @@ def _probe(url: str) -> None:
         return
 
 
-def containerfile(root: Path, sub: str) -> tuple[Path, Path]:
-    directory = root if not sub else root / sub
-    if sub and not directory.is_dir():
-        raise RuntimeError(
-            f"directory {sub!r} is not in the repo at this revision. "
-            "Use a path that exists at this revision, such as projects/heldso."
-        )
-    for name in ("Containerfile", "Dockerfile", "ops/Containerfile", "ops/Dockerfile"):
-        path = directory / name
-        if path.is_file():
-            return path, directory
-    where = sub or "the repo root"
-    raise RuntimeError(f"no Containerfile in {where}. Add Containerfile or ops/Containerfile.")
-
-
 @dataclass(slots=True)
 class Route:
     host: str
@@ -298,18 +383,22 @@ def yard_route(domain: str) -> Route | None:
     return Route(domain, f"yard:{APP_PORT}")
 
 
-def caddy_document(sock: Path, email: str, routes: list[Route]) -> bytes:
+def caddy_document(sock: Path, routes: list[Route]) -> bytes:
     http_routes = [
         {
-            "handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": route.dial}]}],
+            "handle": [
+                {
+                    "handler": "reverse_proxy",
+                    "lb_try_duration": "10s",
+                    "lb_try_interval": "250ms",
+                    "upstreams": [{"dial": route.dial}],
+                }
+            ],
             "match": [{"host": [route.host]}],
         }
         for route in routes
     ]
     issuer: dict[str, object] = {"challenges": {"http": {"disabled": True}}, "module": "acme"}
-    if email:
-        issuer["email"] = email
-
     document = {
         "admin": {"listen": f"unix/{sock}|0600"},
         "apps": {
@@ -329,65 +418,16 @@ def caddy_document(sock: Path, email: str, routes: list[Route]) -> bytes:
     return json.dumps(document, indent="\t", sort_keys=True).encode() + b"\n"
 
 
-def caddy_run_args(root: Path, sock: Path) -> list[str]:
-    data = root / "data" / "caddy"
-    run = sock.parent
-    return [
-        "run",
-        "-d",
-        "--name",
-        CADDY_NAME,
-        "--restart=always",
-        "--network",
-        "yard",
-        "--log-driver",
-        "journald",
-        "--entrypoint",
-        "caddy",
-        "-p",
-        f"{PROXY_PORT}:{PROXY_PORT}",
-        "-v",
-        f"{data}:/config/caddy",
-        "-v",
-        f"{data}/lib:/data",
-        "-v",
-        f"{run}:{run}",
-        CADDY_IMAGE,
-        "run",
-        "--resume",
-    ]
-
-
-async def ensure_caddy(podman: Podman, root: Path, sock: Path) -> None:
+async def ensure_caddy(root: Path, sock: Path) -> None:
+    """Prepare Caddy's files. The compose project starts the container."""
     data = root / "data" / "caddy"
     data.mkdir(parents=True, exist_ok=True)
     (data / "lib").mkdir(parents=True, exist_ok=True)
     sock.parent.mkdir(parents=True, exist_ok=True)
     auto = data / "autosave.json"
     if not auto.is_file() or auto.stat().st_size == 0:
-        auto.write_bytes(caddy_document(sock, "", []))
+        auto.write_bytes(caddy_document(sock, []))
         auto.chmod(0o600)
-
-    try:
-        await podman.run("container", "exists", CADDY_NAME, timeout=20)
-        exists = True
-    except Exception:
-        exists = False
-    if exists:
-        try:
-            state = await podman.run("inspect", "-f", "{{.State.Running}}", CADDY_NAME, timeout=20)
-            running = state == "true"
-        except Exception:
-            running = False
-        if not running:
-            await podman.run("start", CADDY_NAME, timeout=20)
-    else:
-        try:
-            await podman.ensure_network("yard")
-        except Exception:
-            pass
-        await podman.run(*caddy_run_args(root, sock), timeout=None)
-
     await _wait_sock(sock, 15)
 
 
@@ -418,9 +458,10 @@ async def _wait_sock(path: Path, limit: float) -> None:
         await asyncio.sleep(0.1)
 
 
-async def run_cmd(*args: str, timeout: float | None = None) -> str:
+async def run_cmd(*args: str, timeout: float | None = None, env: dict[str, str] | None = None) -> str:
     proc = await asyncio.create_subprocess_exec(
         *args,
+        env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )

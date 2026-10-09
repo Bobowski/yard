@@ -15,13 +15,16 @@ RUN mkdir -p /out/usr/bin /out/usr/lib/git-core /out/usr/share/git-core /out/lib
 
 ADD https://github.com/stunnel/static-curl/releases/download/8.22.0/curl-linux-x86_64-glibc-8.22.0.tar.xz /tmp/curl.tar.xz
 ADD https://github.com/containers/podman/releases/download/v4.9.3/podman-remote-static-linux_amd64.tar.gz /tmp/podman-remote.tar.gz
+ADD https://github.com/docker/compose/releases/download/v5.3.1/docker-compose-linux-x86_64 /tmp/docker-compose
 
 RUN echo "d74460e43c0e6eaf40ec1fdda92c53dee94da8a6e6db066711541ada5aab0fa6  /tmp/curl.tar.xz" | sha256sum -c && \
     tar -xJf /tmp/curl.tar.xz -C /out/usr/bin && \
     chmod 755 /out/usr/bin/curl && \
     tar -xzf /tmp/podman-remote.tar.gz -C /tmp && \
     strip --strip-debug /tmp/bin/podman-remote-static-linux_amd64 && \
-    install -D -m 755 /tmp/bin/podman-remote-static-linux_amd64 /out/usr/local/bin/podman
+    install -D -m 755 /tmp/bin/podman-remote-static-linux_amd64 /out/usr/local/bin/podman && \
+    echo "f9ebc6ebdb19d769b793c245a736caaeb198c62587f13b25c660c13b4987f959  /tmp/docker-compose" | sha256sum -c && \
+    install -D -m 755 /tmp/docker-compose /out/usr/local/bin/docker-compose
 
 FROM python:3.14-slim-trixie AS builder
 
@@ -34,21 +37,18 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 WORKDIR /workspace
 
-RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=bind,source=uv.lock,target=uv.lock \
-    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --locked --extra server --no-install-project --no-editable
+COPY pyproject.toml uv.lock ./
+RUN uv sync --locked --extra server --no-install-project --no-editable
 
 COPY . /workspace
-
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --extra server --no-editable
+RUN uv sync --locked --extra server --no-editable
 
 FROM python:3.14-slim-trixie
 
 COPY --from=tools /out/usr /usr
 COPY --from=tools /out/lib/x86_64-linux-gnu/libpcre2-8.so.0 /lib/x86_64-linux-gnu/libpcre2-8.so.0
 COPY --from=builder /workspace/.venv /workspace/.venv
+COPY --from=builder /workspace/ops/apply /usr/local/share/yard/apply
 
 ENV PYTHONUNBUFFERED=1 \
     CONTAINER_HOST=unix:///run/podman/podman.sock \

@@ -161,7 +161,7 @@ async def _walk(client, root: Path, case: Surface) -> None:
     created = await _ask(client, "POST", "/api/v1/repos", token, {"name": case.repo})
     assert created.status_code == 200
     assert created.json()["name"] == case.repo
-    hook = root / "repos" / f"{case.repo}.git" / "hooks" / "post-receive"
+    hook = root / "repos" / f"{case.repo}.git" / "hooks" / "reference-transaction"
     assert "/api/v1/hooks/push" in hook.read_text()
     again = await _ask(client, "POST", "/api/v1/repos", token, {"name": case.repo, "force": True})
     _error(again, 409, "exists")
@@ -175,7 +175,7 @@ async def _walk(client, root: Path, case: Surface) -> None:
         {
             "SLOT_NAME": case.slot,
             "SLOT_REPO": case.repo,
-            "SLOT_DOMAIN": case.domain,
+            "DOMAIN": case.domain,
             "SLOT_INTERVAL": case.every,
         },
     )
@@ -183,8 +183,8 @@ async def _walk(client, root: Path, case: Surface) -> None:
     values = slot.json()["values"]
     assert values["SLOT_NAME"] == case.slot
     assert values["SLOT_REPO"] == case.repo
-    assert values["SLOT_BRANCH"] == "main"
-    assert values["SLOT_DOMAIN"] == case.domain
+    assert values["REF"] == "main"
+    assert values["DOMAIN"] == case.domain
     assert values["SLOT_INTERVAL"] == parse_every(case.every)
     assert slot.json()["deploy"]["status"] == "waiting"
 
@@ -193,7 +193,7 @@ async def _walk(client, root: Path, case: Surface) -> None:
         "POST",
         "/api/v1/slots",
         token,
-        {"SLOT_NAME": case.other, "SLOT_REPO": case.repo, "SLOT_DOMAIN": case.domain},
+        {"SLOT_NAME": case.other, "SLOT_REPO": case.repo, "DOMAIN": case.domain},
     )
     if case.domain:
         _error(second, 409, "domain_taken")
@@ -207,13 +207,13 @@ async def _walk(client, root: Path, case: Surface) -> None:
         "PUT",
         f"/api/v1/slots/{case.slot}",
         token,
-        {"SLOT_BRANCH": case.ref, case.env_key: case.env_value, "SLOT_REPO": replacement},
+        {"REF": case.ref, case.env_key: case.env_value, "SLOT_REPO": replacement},
     )
     assert saved.status_code == 200
     assert "SLOT_REPO stays" in saved.text
     current = (await _ask(client, "GET", f"/api/v1/slots/{case.slot}", token)).json()
     assert current["SLOT_REPO"] == case.repo
-    assert current["SLOT_BRANCH"] == case.ref
+    assert current["REF"] == case.ref
     assert current[case.env_key] == case.env_value
     _error(await _ask(client, "DELETE", f"/api/v1/repos/{case.repo}", token), 409, "repo_in_use")
 
@@ -275,7 +275,6 @@ async def _walk(client, root: Path, case: Surface) -> None:
 
 @API
 @example("")
-@example("yard")
 @example("yard-sampler")
 @example("Heldso")
 @given(bad_repos())
@@ -294,7 +293,6 @@ async def _bad_repo(name: str):
 
 @API
 @example("caddy")
-@example("yard")
 @example("yard-sampler")
 @given(bad_slots().filter(lambda name: name.strip() != ""))
 def test_api_rejects_a_bad_slot_name(name: str) -> None:

@@ -1,0 +1,62 @@
+# Yard's own project. The apply container is not a service here.
+services:
+  yard:
+    image: ${IMAGE}
+    pull_policy: never
+    build:
+      context: ${CHECKOUT}
+      dockerfile: ${DOCKERFILE:-Containerfile}
+    container_name: yard
+    restart: always
+    networks:
+      yard:
+        aliases:
+          - yard
+    labels:
+      yard.role: app
+      yard.slot: yard
+      yard.service: yard
+      yard.sha: ${SHA:-}
+    ports:
+      - "127.0.0.1:${YARD_PUBLIC_PORT:-8000}:8000"
+    volumes:
+      - ${YARD_ROOT}:${YARD_ROOT}
+      - ${YARD_PODMAN_SOCK}:/run/podman/podman.sock
+    env_file:
+      - ${COMPOSE_ENV_FILE}
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "/workspace/.venv/bin/python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()",
+        ]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  caddy:
+    image: docker.io/library/caddy:2
+    container_name: caddy
+    restart: always
+    labels:
+      yard.role: app
+      yard.slot: yard
+      yard.service: caddy
+    networks:
+      - yard
+    ports:
+      - "${PROXY_PORT:-8443}:${PROXY_PORT:-8443}"
+    volumes:
+      - ${YARD_ROOT}/data/caddy:/config/caddy
+      - ${YARD_ROOT}/data/caddy/lib:/data
+      - ${YARD_ROOT}/run:${YARD_ROOT}/run
+    entrypoint: ["caddy"]
+    command: ["run", "--resume"]
+
+networks:
+  yard:
+    external: true
+    name: yard

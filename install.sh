@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install Yard on a VM. A second run repairs a partial install.
 # A healthy Yard container stays in place. Data under /srv/yard stays in place.
-# The image is ghcr.io/bobowski/yard:latest. --domain is the public host for Yard.
+# The source is the public Yard repo. --domain is the public host for Yard.
 # Caddy listens on 8443. This script forwards 443 to that port.
 set -eu
 
@@ -15,9 +15,8 @@ die() {
   exit 1
 }
 
-image="ghcr.io/bobowski/yard:latest"
+origin="https://github.com/Bobowski/yard.git"
 domain=""
-caddy_image="docker.io/library/caddy:2"
 root="/srv/yard"
 public_port="8000"
 proxy_port="8443"
@@ -27,6 +26,11 @@ while [ $# -gt 0 ]; do
     --domain)
       [ $# -ge 2 ] || die "--domain needs a value" "Hint: ./install.sh --domain yard.example.com"
       domain="$2"
+      shift 2
+      ;;
+    --remote)
+      [ $# -ge 2 ] || die "--remote needs a git url" "Hint: ./install.sh --remote https://github.com/Bobowski/yard.git"
+      origin="$2"
       shift 2
       ;;
     *)
@@ -43,7 +47,7 @@ if ! command -v podman >/dev/null 2>&1 || ! command -v nft >/dev/null 2>&1; then
   fi
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y podman nftables git ca-certificates
+  apt-get install -y podman nftables git ca-certificates wget
 fi
 command -v podman >/dev/null 2>&1 || die "podman is not installed" "Hint: apt-get install -y podman"
 command -v nft >/dev/null 2>&1 || die "nft is not installed" "Hint: apt-get install -y nftables"
@@ -92,6 +96,7 @@ ensure_dir "$root/data/caddy"
 ensure_dir "$root/data/caddy/lib"
 ensure_dir "$root/repos"
 ensure_dir "$root/run"
+ensure_dir "$root/run/yard"
 
 if systemctl list-unit-files caddy.service >/dev/null 2>&1; then
   systemctl disable --now caddy.service >/dev/null 2>&1 || true
@@ -253,14 +258,6 @@ explain_route() {
     "Context: addresses [${addr:-none}] routes [${route:-none}]."
 }
 
-caddy_failed() {
-  logs="$(run_yard podman logs --tail 30 caddy 2>&1 || true)"
-  die "Caddy did not start." \
-    "The container must mount ${root} and publish port ${proxy_port}." \
-    "Hint: podman logs caddy" \
-    "Context: user yard must be able to enter every parent of ${root}. ${logs}"
-}
-
 yard_failed() {
   logs="$(run_yard podman logs --tail 30 yard 2>&1 || true)"
   die "The Yard container did not start." \
@@ -303,23 +300,6 @@ if ! run_yard podman network exists yard >/dev/null 2>&1; then
     "Hint: sudo -u yard podman network ls" \
     "Context: network create failed for user yard."
 fi
-
-pull_image() {
-  if run_yard podman pull "$1"; then
-    return 0
-  fi
-  if run_yard podman image exists "$1"; then
-    echo "pull $1 failed. Using the image already on this host." >&2
-    return 0
-  fi
-  die "Could not pull ${1}." \
-    "The host has no local copy of that image either." \
-    "Hint: podman login ghcr.io when the package is private." \
-    "Context: podman pull failed for user yard."
-}
-
-pull_image "$image"
-pull_image "$caddy_image"
 
 caddy_sock="$root/run/caddy.sock"
 autosave="$root/data/caddy/autosave.json"
@@ -375,42 +355,6 @@ if [ -e "$caddy_sock" ] && [ ! -S "$caddy_sock" ]; then
   rm -f "$caddy_sock"
 fi
 
-run_caddy() {
-  run_yard podman run -d --name caddy --restart=always --network yard \
-    --log-driver journald \
-    --entrypoint caddy \
-    -p "${proxy_port}:${proxy_port}" \
-    -v "$root/data/caddy:/config/caddy" \
-    -v "$root/data/caddy/lib:/data" \
-    -v "$root/run:$root/run" \
-    "$caddy_image" \
-    run --resume
-}
-
-if run_yard podman container exists caddy >/dev/null 2>&1; then
-  running="$(run_yard podman inspect --format '{{.State.Running}}' caddy 2>/dev/null || true)"
-  if [ "$running" != "true" ]; then
-    run_yard podman start caddy >/dev/null 2>&1 || {
-      run_yard podman rm -f caddy >/dev/null 2>&1 || true
-      run_caddy || caddy_failed
-    }
-  fi
-else
-  run_caddy || caddy_failed
-fi
-
-if ! retry 30 sh -c "test -S '$caddy_sock'"; then
-  run_yard podman rm -f caddy >/dev/null 2>&1 || true
-  run_caddy || caddy_failed
-fi
-if ! retry 30 sh -c "test -S '$caddy_sock'"; then
-  logs="$(run_yard podman logs --tail 30 caddy 2>&1 || true)"
-  die "Caddy did not create ${caddy_sock}." \
-    "Yard loads the proxy config through that socket." \
-    "Hint: podman logs caddy" \
-    "Context: ${logs}"
-fi
-
 yard_env_ok() {
   got="$(run_yard podman inspect --format '{{range .Config.Env}}{{println .}}{{end}}' yard 2>/dev/null || true)"
   for line in \
@@ -419,8 +363,6 @@ yard_env_ok() {
     "YARD_CADDY_SOCK=${caddy_sock}" \
     "YARD_PODMAN_SOCK=${sock}" \
     "YARD_PUBLIC_PORT=${public_port}" \
-    "YARD_SELF_IMAGE=${image}" \
-    "YARD_IMAGE=${image}" \
     "YARD_BOOT=1"
   do
     printf '%s\n' "$got" | grep -Fxq "$line" || return 1
@@ -436,28 +378,132 @@ yard_health() {
     >/dev/null 2>&1
 }
 
-run_yard_container() {
-  set -- podman run -d --name yard --restart=always --network yard \
-    --log-driver journald \
-    -p "127.0.0.1:${public_port}:${public_port}" \
-    -v "${root}:${root}" \
-    -v "${sock}:/run/podman/podman.sock" \
-    -e CONTAINER_HOST=unix:///run/podman/podman.sock \
-    -e "YARD_ROOT=${root}" \
-    -e "YARD_PODMAN_SOCK=${sock}" \
-    -e "YARD_CADDY_SOCK=${caddy_sock}" \
-    -e "YARD_PUBLIC_PORT=${public_port}" \
-    -e YARD_BOOT=1 \
-    -e "YARD_SELF_IMAGE=${image}" \
-    -e "YARD_IMAGE=${image}"
-  if [ -n "$domain" ]; then
-    set -- "$@" -e "YARD_DOMAIN=${domain}"
+prepare_source() {
+  repo="$root/repos/yard.git"
+  if [ ! -d "$repo" ]; then
+    run_yard git clone --bare "$origin" "$repo" || die "Could not clone ${origin}." \
+      "The host keeps that bare repo and builds Yard from it." \
+      "Hint: git ls-remote ${origin} HEAD" \
+      "Context: clone failed for user yard."
   fi
-  set -- "$@" "$image"
-  run_yard "$@"
+  if ! run_yard git -C "$repo" remote get-url origin >/dev/null 2>&1; then
+    run_yard git -C "$repo" remote add origin "$origin"
+  fi
+  run_yard git -C "$repo" fetch origin "+refs/heads/main:refs/remotes/origin/main" || die "Could not fetch origin/main." \
+    "The install follows that branch." \
+    "Hint: git -C ${repo} remote -v" \
+    "Context: fetch failed for user yard."
+  sha="$(run_yard git -C "$repo" rev-parse refs/remotes/origin/main)"
+  src="$root/build/yard/$sha"
+  ready="$root/build/yard/.${sha}.ready"
+  if [ -f "$ready" ] && [ -d "$src" ]; then
+    rm -rf "$root/src/yard"
+    return 0
+  fi
+  rm -rf "$src"
+  rm -f "$ready"
+  ensure_dir "$root/build"
+  ensure_dir "$root/build/yard"
+  ensure_dir "$src"
+  archive="$root/build/yard/.archive.tar"
+  rm -f "$archive"
+  run_yard git -C "$repo" archive --format=tar -o "$archive" "$sha" || die "Could not archive ${sha}." \
+    "The install extracts that revision into ${src}." \
+    "Hint: git -C ${repo} archive --format=tar -o ${archive} ${sha}" \
+    "Context: archive failed for user yard."
+  tar -x -C "$src" -f "$archive" || die "Could not extract ${sha}." \
+    "The checkout is ${src}." \
+    "Hint: tar -x -C ${src} -f ${archive}" \
+    "Context: extract failed."
+  rm -f "$archive"
+  printf '%s\n' "$sha" > "$ready"
+  chown -R yard:yard "$root/build/yard"
+  rm -rf "$root/src/yard"
+}
+
+ensure_compose() {
+  compose_bin="$root/run/docker-compose"
+  if [ -x "$compose_bin" ]; then
+    return 0
+  fi
+  if ! command -v wget >/dev/null 2>&1; then
+    die "wget is required" "Hint: apt-get install -y wget"
+  fi
+  dockerfile="$src/ops/apply/Containerfile"
+  ver="$(sed -n 's/^ARG COMPOSE_VERSION=//p' "$dockerfile")"
+  sum="$(sed -n 's/^ARG COMPOSE_SHA256=//p' "$dockerfile")"
+  [ -n "$ver" ] && [ -n "$sum" ] || die "Could not read the Compose pin." \
+    "The pin is in ${dockerfile}." \
+    "Hint: check ARG COMPOSE_VERSION and ARG COMPOSE_SHA256."
+  tmp="${compose_bin}.part"
+  url="https://github.com/docker/compose/releases/download/v${ver}/docker-compose-linux-x86_64"
+  run_yard wget -q -O "$tmp" "$url" || die "Could not download Compose ${ver}." \
+    "The apply image build uses that same pin." \
+    "Hint: wget ${url}" \
+    "Context: download failed for user yard."
+  echo "${sum}  ${tmp}" | sha256sum -c || die "Compose ${ver} checksum failed." \
+    "The pin is in ${dockerfile}."
+  mv "$tmp" "$compose_bin"
+  chmod 755 "$compose_bin"
+}
+
+build_apply() {
+  file="$src/ops/apply/apply.compose.yml"
+  run_yard env DOCKER_HOST="unix://${sock}" \
+    YARD_ROOT="$root" \
+    YARD_PODMAN_SOCK="$sock" \
+    "$compose_bin" -f "$file" build apply || die "Could not build the apply image." \
+    "That image runs Compose. The build is the apply service in ${file}." \
+    "Hint: docker-compose -f ${file} build apply" \
+    "Context: the build failed for user yard."
+}
+
+write_compose_env() {
+  envfile="$root/run/yard/compose.env"
+  cat > "$envfile" <<EOF
+IMAGE=localhost/yard:${sha}
+SHA=${sha}
+PREVIOUS=
+YARD_ROOT=${root}
+YARD_PODMAN_SOCK=${sock}
+YARD_PUBLIC_PORT=${public_port}
+YARD_CADDY_SOCK=${caddy_sock}
+YARD_BOOT=1
+YARD_DOMAIN=${domain}
+CHECKOUT=${src}
+COMPOSE_ENV_FILE=${envfile}
+CONTAINER_HOST=unix:///run/podman/podman.sock
+PROXY_PORT=${proxy_port}
+EOF
+  chown yard:yard "$envfile"
+  chmod 600 "$envfile"
+}
+
+run_apply_up() {
+  envfile="$root/run/yard/compose.env"
+  run_yard env \
+    DOCKER_HOST="unix://${sock}" \
+    YARD_PODMAN_SOCK="$sock" \
+    YARD_ROOT="$root" \
+    YARD_PROJECT=yard \
+    YARD_COMPOSE="${src}/ops/compose.yml" \
+    YARD_APP_ENV="$envfile" \
+    YARD_SLOT=yard \
+    YARD_SHA="$sha" \
+    YARD_ROLE=deploy \
+    "$compose_bin" -f "$src/ops/apply/apply.compose.yml" run -T --no-deps --rm=false apply up || yard_failed
 }
 
 release_port
+
+start_stack() {
+  prepare_source
+  ensure_compose
+  build_apply
+  write_compose_env
+  run_yard podman rm -f yard caddy >/dev/null 2>&1 || true
+  run_apply_up
+}
 
 if run_yard podman container exists yard >/dev/null 2>&1; then
   running="$(run_yard podman inspect --format '{{.State.Running}}' yard 2>/dev/null || true)"
@@ -466,11 +512,18 @@ if run_yard podman container exists yard >/dev/null 2>&1; then
     running="$(run_yard podman inspect --format '{{.State.Running}}' yard 2>/dev/null || true)"
   fi
   if [ "$running" != "true" ] || ! yard_env_ok || ! retry 30 yard_health; then
-    run_yard podman rm -f yard >/dev/null 2>&1 || true
-    run_yard_container || yard_failed
+    start_stack
   fi
 else
-  run_yard_container || yard_failed
+  start_stack
+fi
+
+if ! retry 30 sh -c "test -S '$caddy_sock'"; then
+  logs="$(run_yard podman logs --tail 30 caddy 2>&1 || true)"
+  die "Caddy did not create ${caddy_sock}." \
+    "Yard loads the proxy config through that socket." \
+    "Hint: podman logs caddy" \
+    "Context: ${logs}"
 fi
 
 if ! retry 60 yard_health; then
@@ -600,7 +653,7 @@ host = os.environ["YARD_CHECK_DOMAIN"]
 port = int(os.environ["YARD_CHECK_PORT"])
 raw = socket.create_connection(("127.0.0.1", port), 15)
 tls = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
-request = "GET /health HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % host
+request = f"GET /health HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
 tls.sendall(request.encode())
 data = b""
 while True:
@@ -620,25 +673,25 @@ PY
       "Context: the check uses port ${proxy_port} on 127.0.0.1 with the public host name."
   fi
 
-  settings_ok() {
+  slot_ok() {
     YARD_CHECK_TOKEN="$token" YARD_CHECK_DOMAIN="$domain" YARD_CHECK_PORT="$public_port" python3 - <<'PY' || return 1
 import json, os, urllib.request
 port = os.environ["YARD_CHECK_PORT"]
 req = urllib.request.Request(
-    "http://127.0.0.1:%s/api/v1/settings" % port,
+    f"http://127.0.0.1:{port}/api/v1/slots/yard",
     headers={"Authorization": "Bearer " + os.environ["YARD_CHECK_TOKEN"]},
 )
 with urllib.request.urlopen(req, timeout=5) as res:
     body = json.load(res)
-if body.get("domain") != os.environ["YARD_CHECK_DOMAIN"]:
-    raise SystemExit(str(body.get("domain")))
+if body.get("DOMAIN") != os.environ["YARD_CHECK_DOMAIN"]:
+    raise SystemExit(str(body.get("DOMAIN")))
 PY
   }
-  if ! settings_ok; then
+  if ! slot_ok; then
     die "Yard did not store the domain ${domain}." \
-      "The public host is the settings domain. Caddy uses that value for the route." \
-      "Hint: curl -H \"Authorization: Bearer <token>\" http://127.0.0.1:${public_port}/api/v1/settings" \
-      "Context: GET /api/v1/settings returned a different domain."
+      "The public host is the yard slot. Caddy uses that value for the route." \
+      "Hint: curl -H \"Authorization: Bearer <token>\" http://127.0.0.1:${public_port}/api/v1/slots/yard" \
+      "Context: GET /api/v1/slots/yard returned a different domain."
   fi
 fi
 
@@ -647,7 +700,7 @@ if [ -n "$domain" ]; then
   echo "url: https://$domain"
   echo "checks: health, route, acme, certificate"
 else
-  echo "url: yard settings --domain <host>" >&2
+  echo "url: pass --domain to publish this host" >&2
   echo "checks: health, route, acme"
 fi
 echo "local: http://127.0.0.1:${public_port}"
