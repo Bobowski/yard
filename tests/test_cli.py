@@ -38,7 +38,7 @@ def test_main_end_to_end(monkeypatch: pytest.MonkeyPatch, capsys: pytest.Capture
 
     main(["status", "--text"])
     out = capsys.readouterr().out
-    assert "heldso (heldso-app)" in out
+    assert "heldso-app" in out
     assert "host:" in out
 
     main(["slot", "show", "heldso", "--text"])

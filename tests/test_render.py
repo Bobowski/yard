@@ -21,12 +21,12 @@ def test_format_status():
     assert lines[0].startswith("name")
     header = lines[0].split()
     assert header == ["name", "state", "cpu", "mem", "data", "rev", "domain", "deploy"]
-    assert "heldso (heldso-app)" in lines[1]
+    assert "heldso-app" in lines[1]
     assert "up 2h" in lines[1]
     assert "abc1234 → f00ba12" in lines[1]
     assert "heldso.example.com" in lines[1]
     assert "ok 2m0s" in lines[1]
-    assert "shop (shop-app)" in lines[2]
+    assert "shop-app" in lines[2]
     assert "failed 3h" in lines[2]
     assert "idle" in lines[3]
     assert "caddy" in lines[4]

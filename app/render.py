@@ -103,11 +103,9 @@ def format_status(report: dict, now: datetime, *, color: bool = False) -> str:
 
 def _status_cells(row: dict, now: datetime) -> list[str]:
     slot = str(row.get("slot") or "")
-    container = str(row.get("container") or "")
-    if slot and container and container != slot:
-        name = f"{slot} ({container})"
-    else:
-        name = slot or container
+    # The container name is the row: bobowski-site-app-1, yard-caddy-1.
+    # A slot with nothing running shows its name.
+    name = str(row.get("container") or "") or slot
     mem = str(row.get("mem") or "").split("/", 1)[0].strip()
     return [
         name,
