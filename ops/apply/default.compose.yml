@@ -20,6 +20,10 @@ services:
       SLOT_DATA_DIR: /data
       SHA: ${SHA}
       PORT: "8000"
+      # A Stario app binds this address. 127.0.0.1 would hide it from Caddy.
+      STARIO_HOST: 0.0.0.0
+      STARIO_PORT: "8000"
+      STARIO_TRACER: json
     expose:
       - "8000"
 networks:

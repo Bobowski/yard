@@ -342,12 +342,14 @@ def test_the_default_compose_meets_the_contract():
         "SLOT_DATA_DIR: /data",
         "SHA: ${SHA}",
         'PORT: "8000"',
+        "STARIO_HOST: 0.0.0.0",
+        'STARIO_PORT: "8000"',
+        "STARIO_TRACER: json",
     ):
         assert line in text
     assert "restart: always" in text
     assert "      IMAGE:" not in text
     assert "yard." not in text
-    assert "STARIO" not in text
 
     own = (ops / "compose.yml").read_text()
     assert "yard." not in own
