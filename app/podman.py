@@ -167,15 +167,15 @@ def parse_info(raw: str) -> Host:
     return Host(cpus, mem, disk, str(version.get("Version") or "") if isinstance(version, dict) else "")
 
 
-# Podman is pinned to remote 4.9.3, so its json keys are fixed.
+# Podman --format json prints snake_case keys; the table header spellings are a fallback.
 def parse_stats(raw: str) -> dict[str, Sample]:
     found: dict[str, Sample] = {}
     for row in _rows(raw):
-        name = str(row.get("Name") or "")
+        name = str(row.get("name") or row.get("Name") or "")
         if not name:
             continue
-        cpu = str(row.get("CPUPerc") or "")
-        mem = str(row.get("MemUsage") or "")
+        cpu = str(row.get("cpu_percent") or row.get("CPUPerc") or "")
+        mem = str(row.get("mem_usage") or row.get("MemUsage") or "")
         found[name] = Sample(name, cpu, mem, _percent(cpu), _size(mem.split("/", 1)[0]))
     return found
 

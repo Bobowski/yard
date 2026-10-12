@@ -8,11 +8,14 @@ def _unix(seconds: int) -> datetime:
 
 
 def test_parse_stats_and_ps():
-    samples = parse_stats('[{"Name":"heldso","CPUPerc":"1.5%","MemUsage":"20MB / 1GB"}]')
+    # Podman 4.9 --format json prints snake_case keys; table headers also parse.
+    samples = parse_stats('[{"name":"heldso","cpu_percent":"1.5%","mem_usage":"20MB / 1GB"}]')
     assert samples["heldso"].cpu == "1.5%"
     assert samples["heldso"].mem == "20MB / 1GB"
     assert samples["heldso"].cpu_percent == 1.5
     assert samples["heldso"].mem_bytes == 20_000_000
+    old = parse_stats('[{"Name":"heldso","CPUPerc":"1.5%","MemUsage":"20MB / 1GB"}]')
+    assert old["heldso"].cpu == "1.5%"
     raw = """[
         {"Names":["heldso"],"State":"running","Status":"Up 2 minutes (healthy)",
          "StartedAt":1710000000,"ExitCode":0,"Restarts":3},
