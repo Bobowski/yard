@@ -100,6 +100,67 @@ def test_ensure_admin_writes_the_token_once(tmp_path):
         store.close()
 
 
+def test_legacy_env_reads_the_old_column(tmp_path):
+    directory = tmp_path / "db"
+    directory.mkdir()
+    db = sqlite3.connect(directory / "yard.sqlite3")
+    db.execute(
+        """
+        CREATE TABLE slots (
+            name TEXT PRIMARY KEY,
+            repo TEXT NOT NULL,
+            ref TEXT NOT NULL,
+            dir TEXT NOT NULL DEFAULT '',
+            domain TEXT NOT NULL,
+            live_image TEXT NOT NULL DEFAULT '',
+            every TEXT NOT NULL DEFAULT '',
+            env_json TEXT NOT NULL DEFAULT '{}',
+            created TEXT NOT NULL
+        )
+        """
+    )
+    db.execute(
+        "INSERT INTO slots (name, repo, ref, domain, env_json, created) VALUES (?, ?, ?, ?, ?, ?)",
+        ("honorata", "app", "main", "", '{"SESSION_SECRET": "s3cret", "N": 1}', "x"),
+    )
+    db.commit()
+    db.close()
+    store = Store.open(directory)
+    try:
+        assert store.legacy_env("honorata") == {"SESSION_SECRET": "s3cret"}
+        assert store.legacy_env("missing") == {}
+    finally:
+        store.close()
+
+
+def test_legacy_env_is_empty_without_the_column(tmp_path):
+    directory = tmp_path / "db"
+    directory.mkdir()
+    db = sqlite3.connect(directory / "yard.sqlite3")
+    db.execute(
+        """
+        CREATE TABLE slots (
+            name TEXT PRIMARY KEY,
+            repo TEXT NOT NULL,
+            ref TEXT NOT NULL,
+            dir TEXT NOT NULL DEFAULT '',
+            domain TEXT NOT NULL,
+            live_image TEXT NOT NULL DEFAULT '',
+            trigger TEXT NOT NULL DEFAULT '',
+            created TEXT NOT NULL
+        )
+        """
+    )
+    db.execute("INSERT INTO slots (name, repo, ref, domain, created) VALUES ('heldso', 'app', 'main', '', 'x')")
+    db.commit()
+    db.close()
+    store = Store.open(directory)
+    try:
+        assert store.legacy_env("heldso") == {}
+    finally:
+        store.close()
+
+
 def test_trigger_makes_a_job(tmp_path):
     store = Store.open(tmp_path / "db")
     try:

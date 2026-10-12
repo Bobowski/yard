@@ -1,6 +1,7 @@
 """Yard's SQLite state. One file, one process."""
 
 import hashlib
+import json
 import secrets
 import sqlite3
 from dataclasses import dataclass
@@ -405,6 +406,22 @@ class Store:
         rows = self._all(_DEPLOY_SQL + " WHERE slot = ? ORDER BY id DESC LIMIT ?", (slot, limit))
         return [self._deploy(row) for row in rows]
 
+    def legacy_env(self, name: str) -> dict[str, str]:
+        """Env values stored on the slot row by a 0.1 host. Empty when the column is absent or blank."""
+        columns = {str(row["name"]) for row in self._db.execute("PRAGMA table_info(slots)")}
+        if "env_json" not in columns:
+            return {}
+        row = self._one("SELECT env_json FROM slots WHERE name = ?", (name,))
+        if row is None:
+            return {}
+        try:
+            raw = json.loads(str(row["env_json"] or "{}"))
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        return {str(key): str(value) for key, value in raw.items() if isinstance(key, str) and isinstance(value, str)}
+
     def last_deploy(self, slot: str) -> Deploy | None:
         row = self._one(_DEPLOY_SQL + " WHERE slot = ? ORDER BY id DESC LIMIT 1", (slot,))
         return None if row is None else self._deploy(row)
@@ -435,7 +452,7 @@ class Store:
         )
 
 
-# env_json stays in the table unread. The slot env is the file under env/.
+# env_json stays in the table. A deploy copies it into the env file once, when that file is empty.
 _SLOT_SQL = "SELECT name, repo, ref, dir, domain, live_image, trigger, created FROM slots"
 _DEPLOY_SQL = "SELECT id, slot, sha, image, status, started, built, ended, log FROM deploys"
 
