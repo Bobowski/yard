@@ -494,9 +494,7 @@ class Yard:
             return
         try:
             found = caddy.routes(self.store.list_slots(), self.config.domain)
-            # Keep the admin socket the running Caddy already uses.
-            listen = caddy.admin_listen(self.config.root / "data" / "caddy" / "autosave.json")
-            await asyncio.to_thread(caddy.load, sock, caddy.document(found, listen))
+            await asyncio.to_thread(caddy.load, sock, caddy.document(found))
         except Exception as exc:
             log.warning("caddy: %s", exc)
 

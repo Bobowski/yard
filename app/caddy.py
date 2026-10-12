@@ -29,21 +29,7 @@ def routes(slots: list[Slot], domain: str) -> list[Route]:
     return found
 
 
-def admin_listen(path: Path) -> str:
-    """The admin socket in Caddy's autosave, or the socket from ops/caddy.json."""
-    default = f"unix/{ADMIN_SOCK}|0600"
-    try:
-        raw = json.loads(path.read_text())
-    except OSError, json.JSONDecodeError:
-        return default
-    admin = raw.get("admin") if isinstance(raw, dict) else None
-    listen = admin.get("listen") if isinstance(admin, dict) else None
-    if isinstance(listen, str) and listen.startswith("unix/"):
-        return listen
-    return default
-
-
-def document(routes: list[Route], listen: str = "") -> bytes:
+def document(routes: list[Route]) -> bytes:
     http_routes = [
         {
             "handle": [
@@ -60,7 +46,7 @@ def document(routes: list[Route], listen: str = "") -> bytes:
     ]
     issuer: dict[str, object] = {"challenges": {"http": {"disabled": True}}, "module": "acme"}
     document = {
-        "admin": {"listen": listen or f"unix/{ADMIN_SOCK}|0600"},
+        "admin": {"listen": f"unix/{ADMIN_SOCK}|0600"},
         "apps": {
             "http": {
                 "https_port": PROXY_PORT,
