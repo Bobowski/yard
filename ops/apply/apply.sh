@@ -12,7 +12,16 @@ dc() {
 
 build() {
   echo "== build $IMAGE"
-  dc build || exit 1
+  case "$COMPOSE_FILE" in
+    # The default contract is one image from CHECKOUT; podman-remote builds it
+    # in ~2s where dc build needs ~18s on the same socket.
+    */default.compose.yml)
+      podman-remote build -t "$IMAGE" -f "$CHECKOUT/${DOCKERFILE:-Containerfile}" "$CHECKOUT" || exit 1
+      ;;
+    *)
+      dc build || exit 1
+      ;;
+  esac
   echo "built $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 }
 

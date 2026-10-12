@@ -39,15 +39,19 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if ! command -v podman >/dev/null 2>&1 || ! command -v nft >/dev/null 2>&1; then
+[ "$(id -u)" -eq 0 ] || die "Run this script as root." \
+  "It creates the yard user, writes /etc files, and loads an nft table." \
+  "Hint: sudo ./install.sh --domain <host>"
+
+if ! command -v podman >/dev/null 2>&1 || ! command -v nft >/dev/null 2>&1 || ! command -v sudo >/dev/null 2>&1; then
   if ! command -v apt-get >/dev/null 2>&1; then
-    die "podman and nft are required" \
+    die "podman, nft, and sudo are required" \
       "The script installs them with apt-get when that command exists." \
-      "Hint: install podman and nftables, then rerun this script."
+      "Hint: install podman, nftables, and sudo, then rerun this script."
   fi
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y podman nftables git ca-certificates wget
+  apt-get install -y podman nftables git ca-certificates wget sudo iproute2 procps
 fi
 command -v podman >/dev/null 2>&1 || die "podman is not installed" "Hint: apt-get install -y podman"
 command -v nft >/dev/null 2>&1 || die "nft is not installed" "Hint: apt-get install -y nftables"
@@ -90,6 +94,9 @@ ensure_dir() {
 }
 
 ensure_dir "$root"
+# Yard's container writes checkouts/<repo> as the yard user; a root-owned
+# directory here would reject every deploy on a fresh host.
+ensure_dir "$root/checkouts"
 ensure_dir "$root/data"
 ensure_dir "$root/data/yard"
 ensure_dir "$root/data/caddy"
