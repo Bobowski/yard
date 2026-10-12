@@ -1,7 +1,6 @@
 """Yard's SQLite state. One file, one process."""
 
 import hashlib
-import json
 import secrets
 import sqlite3
 from dataclasses import dataclass
@@ -124,7 +123,6 @@ class Store:
                 domain TEXT NOT NULL,
                 live_image TEXT NOT NULL DEFAULT '',
                 trigger TEXT NOT NULL DEFAULT '',
-                env_json TEXT NOT NULL DEFAULT '{}',
                 created TEXT NOT NULL
             );
             -- An existing host has the old tokens table with parent and revoked columns.
@@ -150,18 +148,17 @@ class Store:
         self._db.execute("CREATE UNIQUE INDEX IF NOT EXISTS slots_domain ON slots(domain) WHERE domain != ''")
 
         # An existing deploys table gains image, log, and built.
-        # 0.1.1 has image and log. It has no built column.
         columns = {str(row["name"]) for row in self._db.execute("PRAGMA table_info(deploys)")}
         for column in ("image", "log", "built"):
             if column not in columns:
                 self._db.execute(f"ALTER TABLE deploys ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
 
-        # An existing slots table gains trigger. Old hosts used every as the
-        # schedule, so a row with every set becomes an `every` trigger once.
+        # An existing slots table gains trigger.
         slot_columns = {str(row["name"]) for row in self._db.execute("PRAGMA table_info(slots)")}
         if "trigger" not in slot_columns:
             self._db.execute("ALTER TABLE slots ADD COLUMN trigger TEXT NOT NULL DEFAULT ''")
-            self._db.execute("UPDATE slots SET trigger = 'every ' || every WHERE every != ''")
+            if "every" in slot_columns:
+                self._db.execute("UPDATE slots SET trigger = 'every ' || every WHERE every != ''")
 
         # A host from before flat tokens still has the revoked column. Drop the
         # revoked rows once: under the flat shape nothing could set revoked back,
@@ -406,22 +403,6 @@ class Store:
         rows = self._all(_DEPLOY_SQL + " WHERE slot = ? ORDER BY id DESC LIMIT ?", (slot, limit))
         return [self._deploy(row) for row in rows]
 
-    def legacy_env(self, name: str) -> dict[str, str]:
-        """Env values stored on the slot row by a 0.1 host. Empty when the column is absent or blank."""
-        columns = {str(row["name"]) for row in self._db.execute("PRAGMA table_info(slots)")}
-        if "env_json" not in columns:
-            return {}
-        row = self._one("SELECT env_json FROM slots WHERE name = ?", (name,))
-        if row is None:
-            return {}
-        try:
-            raw = json.loads(str(row["env_json"] or "{}"))
-        except json.JSONDecodeError:
-            return {}
-        if not isinstance(raw, dict):
-            return {}
-        return {str(key): str(value) for key, value in raw.items() if isinstance(key, str) and isinstance(value, str)}
-
     def last_deploy(self, slot: str) -> Deploy | None:
         row = self._one(_DEPLOY_SQL + " WHERE slot = ? ORDER BY id DESC LIMIT 1", (slot,))
         return None if row is None else self._deploy(row)
@@ -452,7 +433,6 @@ class Store:
         )
 
 
-# env_json stays in the table. A deploy copies it into the env file once, when that file is empty.
 _SLOT_SQL = "SELECT name, repo, ref, dir, domain, live_image, trigger, created FROM slots"
 _DEPLOY_SQL = "SELECT id, slot, sha, image, status, started, built, ended, log FROM deploys"
 

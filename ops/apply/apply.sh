@@ -32,7 +32,7 @@ revert() {
 up() {
   build
   echo "== start $IMAGE"
-  dc up -d --wait --no-build || revert
+  dc up -d --wait --remove-orphans --no-build || revert
 
   url="${HEALTH_URL:-http://${SLOT_NAME:?}:8000/}"
   echo "== wait $url"

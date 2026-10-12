@@ -64,6 +64,11 @@ def test_state_text_marks_no_answer_and_restarts():
     assert _state_text(row, NOW) == "up 2h · no answer · 1 restart"
     row["answers"] = True
     assert _state_text(row, NOW) == "up 2h · 1 restart"
+    row["health"] = "starting"
+    row["restarts"] = 0
+    assert _state_text(row, NOW) == "up 2h"
+    row["answers"] = None
+    assert _state_text(row, NOW) == "starting 2h"
 
 
 def test_status_hint_points_a_dead_probe_at_logs():

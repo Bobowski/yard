@@ -97,7 +97,7 @@ A running app gets a short HTTP probe against its name on the yard network. `no 
 
 `yard token new <name>` prints a token once. `yard token rm <name>` removes it.
 
-`yard git <name> fetch` fetches origin. A slot whose ref is `origin/main` deploys when that tip moves. Yard is that kind of slot.
+`yard git <name> fetch` fetches origin. A slot whose ref is `origin/main` deploys when that tip moves. The yard slot follows `main`. Fetch fast-forwards `main` from `origin/main`. A push to the host's `main` deploys it too.
 
 `yard git <name> log -1` reads that bare repo. The command list is log, show, rev-parse, ls-tree, cat-file, for-each-ref, branch, remote, fetch, and gc.
 

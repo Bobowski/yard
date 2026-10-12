@@ -52,8 +52,7 @@ class Yard:
         await self._prepare_repos()
 
         await self.ensure_network()
-        # The apply image build pulls a base image. Health must answer before that finishes.
-        # The 0.1 swap waits 60 seconds for /health.
+        # The apply image build pulls a base image. The server answers while that build runs.
         self._apply_task = app.create_task(self._build_apply_image(), name="apply-image")
         if self.config.caddy_sock is not None:
             try:
@@ -137,7 +136,7 @@ class Yard:
         except YardError as exc:
             if exc.code != "not_found":
                 raise
-            self.store.create_slot("yard", "yard", "origin/main", "", domain, "")
+            self.store.create_slot("yard", "yard", "main", "", domain, "")
             return
         if slot.domain != domain:
             self.store.update_slot(slot.name, domain=domain)
@@ -259,6 +258,11 @@ class Yard:
                 ) from exc
 
             # The row is last, so a failed init does not claim the name.
+            if origin and name == "yard":
+                # A push to main deploys this slot. Fetch moves origin/main, then main follows.
+                note = await self._follow_origin()
+                if note:
+                    log.info("yard repo: %s", note.strip())
             try:
                 self.store.create_repo(name)
             except YardError as exc:
@@ -491,7 +495,6 @@ class Yard:
         try:
             found = caddy.routes(self.store.list_slots(), self.config.domain)
             # Keep the admin socket the running Caddy already uses.
-            # A 0.1 host listens on /srv/yard/run/caddy.sock, not /run/caddy/caddy.sock.
             listen = caddy.admin_listen(self.config.root / "data" / "caddy" / "autosave.json")
             await asyncio.to_thread(caddy.load, sock, caddy.document(found, listen))
         except Exception as exc:
@@ -625,6 +628,10 @@ class Yard:
                 help_text="Git printed that text.",
                 example=f"yard git {name} log -1",
             ) from exc
+        if name == "yard" and call.argv[:1] == ["fetch"]:
+            note = await self._follow_origin()
+            if note:
+                text = f"{text}\n{note}" if text else note
         if call.delete_branch:
             note = await self._drop_deleted(name, call.delete_branch)
             removed = "".join(f"{line}\n" for line in note.splitlines() if line.startswith("slot "))
@@ -633,6 +640,29 @@ class Yard:
         if text and not text.endswith("\n"):
             text += "\n"
         return {"output": text}
+
+    async def _follow_origin(self) -> str:
+        """Point main at origin/main when that move is a fast-forward. A diverged main stays."""
+        repo = self.config.repo("yard")
+        try:
+            origin = (
+                await git.git("rev-parse", "--verify", "--end-of-options", "refs/remotes/origin/main", cwd=repo)
+            ).strip()
+        except RuntimeError:
+            return ""
+        try:
+            local = (await git.git("rev-parse", "--verify", "--end-of-options", "refs/heads/main", cwd=repo)).strip()
+        except RuntimeError:
+            local = ""
+        if local == origin:
+            return ""
+        if local:
+            try:
+                await git.git("merge-base", "--is-ancestor", local, origin, cwd=repo)
+            except RuntimeError:
+                return "main and origin/main have diverged\n"
+        await git.git("update-ref", "refs/heads/main", origin, cwd=repo)
+        return f"main {origin}\n"
 
 
 def _line(name: str, out: deploy.Outcome) -> str:

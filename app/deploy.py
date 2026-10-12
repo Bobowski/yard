@@ -1,6 +1,5 @@
 """One deploy: checkout, the compose check, and one apply container for the rest."""
 
-import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -27,29 +26,10 @@ async def deploy(yard: Yard, slot: Slot, sha: str) -> Outcome:
 
     # The checkout and the compose check. Any failure here stops before a build.
     try:
-        _keep_legacy_env(yard, slot.name)
         checkout = await git.checkout(config, slot.repo, slot.directory, sha)
         project, lines = await compose.prepare(config, slot, checkout, image, sha)
     except Exception as exc:
         return _finish(store, deploy_id, "failed", image, [str(exc)], str(exc))
-
-    # A service builds while the old container still answers. The 0.1 container
-    # is removed next, so the health probe hits the new container.
-    if not slot.job and slot.name != "yard":
-        code, text = await compose.apply(config, slot.name, "build", project)
-        lines.append(text)
-        built = compose.built_stamp(text)
-        if built:
-            store.mark_built(deploy_id, built)
-        if code:
-            return _finish(store, deploy_id, "failed", image, lines, f"apply exited {code}")
-        try:
-            note = await retire_legacy(yard, slot.name)
-        except Exception as exc:
-            lines.append(str(exc))
-            return _finish(store, deploy_id, "failed", image, lines, str(exc))
-        if note:
-            lines.append(note.rstrip("\n"))
 
     # One apply container runs the rest: build for a job slot, the whole
     # start/health/revert sequence otherwise.
@@ -78,34 +58,6 @@ async def deploy(yard: Yard, slot: Slot, sha: str) -> Outcome:
         except YardError as exc:
             lines.append(str(exc))
     return _finish(store, deploy_id, "ok", image, lines)
-
-
-def _keep_legacy_env(yard: Yard, name: str) -> None:
-    """Copy a 0.1 env_json into the env file when that file is still empty."""
-    if yard.read_env(name):
-        return
-    legacy = yard.store.legacy_env(name)
-    if legacy:
-        yard.write_env(name, legacy)
-
-
-async def retire_legacy(yard: Yard, name: str) -> str:
-    """Remove the 0.1 container named after the slot. A compose-owned container stays."""
-    try:
-        raw = await yard.podman.run("inspect", "--format", "{{json .Config.Labels}}", name, timeout=15)
-    except Exception:
-        return ""
-    try:
-        labels = json.loads(raw)
-    except json.JSONDecodeError:
-        labels = None
-    if isinstance(labels, dict) and labels.get("com.docker.compose.project"):
-        return ""
-    try:
-        await yard.podman.run("rm", "-f", "-t", "10", name, timeout=40)
-    except Exception as exc:
-        raise RuntimeError(f"remove {name} failed: {exc}") from exc
-    return f"removed {name}\n"
 
 
 def _finish(store: Store, deploy_id: int, status: str, image: str, lines: list[str], error: str = "") -> Outcome:

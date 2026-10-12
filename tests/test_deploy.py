@@ -67,7 +67,6 @@ class _Apply:
         self.calls: list[dict] = []
         self.code = code
         self.text = text
-        self.by_command: dict[str, tuple[int, str]] = {}
 
     async def __call__(
         self,
@@ -88,7 +87,7 @@ class _Apply:
                 "detach": detach,
             }
         )
-        return self.by_command.get(command, (self.code, self.text))
+        return self.code, self.text
 
 
 def _a(fn):
@@ -98,21 +97,11 @@ def _a(fn):
     return wrapped
 
 
-def _absent_podman(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A missing container. retire_legacy then leaves the slot alone."""
-
-    async def absent(self, *args, timeout=20, env=None):
-        raise YardError(502, "podman", "no such container")
-
-    monkeypatch.setattr(Podman, "run", absent)
-
-
 def _stub(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, code: int = 0, text: str = OK_LOG) -> _Apply:
     recorder = _Apply(code, text)
     checkout = _checkout(tmp_path)
     monkeypatch.setattr("app.git.checkout", _a(lambda *args, **kw: checkout))
     monkeypatch.setattr("app.compose.apply", recorder)
-    _absent_podman(monkeypatch)
     return recorder
 
 
@@ -125,10 +114,11 @@ def test_deploy_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         outcome = asyncio.run(deploy.deploy(yard, slot, "abc"))
         assert outcome.status == "ok"
         assert outcome.image == "localhost/app:abc"
-        assert [call["command"] for call in recorder.calls] == ["build", "up"]
-        assert recorder.calls[0]["project"].env["IMAGE"] == "localhost/app:abc"
-        assert recorder.calls[1]["previous"] == ""
-        assert recorder.calls[1]["detach"] is False
+        assert len(recorder.calls) == 1
+        call = recorder.calls[0]
+        assert call["command"] == "up"
+        assert call["project"].env["IMAGE"] == "localhost/app:abc"
+        assert call["detach"] is False
 
         row = yard.store.last_deploy("heldso")
         assert row is not None
@@ -158,12 +148,11 @@ def test_deploy_with_a_repo_compose(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         "app.compose.resolved", _resolved({"services": {"app": {"networks": {"yard": {"aliases": ["heldso"]}}}}})
     )
     monkeypatch.setattr("app.compose.apply", recorder)
-    _absent_podman(monkeypatch)
     slot = yard.store.slot("heldso")
     try:
         outcome = asyncio.run(deploy.deploy(yard, slot, "abc"))
         assert outcome.status == "ok"
-        assert [call["command"] for call in recorder.calls] == ["build", "up"]
+        assert [call["command"] for call in recorder.calls] == ["up"]
         assert recorder.calls[0]["project"].env["IMAGE"] == "localhost/app:abc"
 
         # The warnings open the log; the apply output follows.
@@ -209,103 +198,19 @@ def test_deploy_fails_before_apply_without_the_alias(tmp_path: Path, monkeypatch
 def test_deploy_apply_failure_keeps_the_previous_image(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yard = _yard(tmp_path)
     _slot(yard, image="localhost/app:old9")
-    recorder = _stub(monkeypatch, tmp_path)
-    recorder.by_command["up"] = (1, "== start localhost/app:abc\nboom\n")
+    recorder = _stub(monkeypatch, tmp_path, code=1, text="== start localhost/app:abc\nboom\n")
     slot = yard.store.slot("heldso")
     try:
         outcome = asyncio.run(deploy.deploy(yard, slot, "abc"))
         assert outcome.status == "failed"
         assert "apply exited 1" in outcome.error
         assert "boom" in outcome.log
-        # The build finished. The start saw the previous image for its revert.
-        assert recorder.calls[0]["command"] == "build"
-        assert recorder.calls[1]["command"] == "up"
-        assert recorder.calls[1]["previous"] == "localhost/app:old9"
+        # The failing apply saw the previous image for its revert.
+        assert recorder.calls[0]["previous"] == "localhost/app:old9"
 
         row = yard.store.last_deploy("heldso")
         assert row is not None
         assert row.status == "failed"
-        assert yard.store.slot("heldso").live_image == "localhost/app:old9"
-    finally:
-        yard.store.close()
-
-
-def test_deploy_removes_a_legacy_container_and_copies_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    yard = _yard(tmp_path)
-    _slot(yard)
-    yard.store._write(
-        "UPDATE slots SET env_json = ? WHERE name = ?",
-        (json.dumps({"SESSION_SECRET": "s3cret"}), "heldso"),
-    )
-    recorder = _stub(monkeypatch, tmp_path)
-    seen: list[tuple[str, ...]] = []
-
-    async def fake_run(self, *args, timeout=20, env=None):
-        seen.append(args)
-        if args[:1] == ("inspect",):
-            return '{"yard.slot": "heldso"}'
-        return ""
-
-    monkeypatch.setattr(Podman, "run", fake_run)
-    slot = yard.store.slot("heldso")
-    try:
-        outcome = asyncio.run(deploy.deploy(yard, slot, "abc"))
-        assert outcome.status == "ok"
-        assert "removed heldso" in outcome.log
-        assert ("rm", "-f", "-t", "10", "heldso") in seen
-        assert [call["command"] for call in recorder.calls] == ["build", "up"]
-        text = (tmp_path / "env" / "heldso.env").read_text()
-        assert "SESSION_SECRET=" in text
-        assert yard.read_env("heldso")["SESSION_SECRET"] == "s3cret"
-    finally:
-        yard.store.close()
-
-
-def test_deploy_keeps_a_compose_container_and_a_filled_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    yard = _yard(tmp_path)
-    _slot(yard)
-    yard.write_env("heldso", {"SESSION_SECRET": "kept"})
-    yard.store._write(
-        "UPDATE slots SET env_json = ? WHERE name = ?",
-        (json.dumps({"SESSION_SECRET": "other"}), "heldso"),
-    )
-    _stub(monkeypatch, tmp_path)
-    seen: list[tuple[str, ...]] = []
-
-    async def fake_run(self, *args, timeout=20, env=None):
-        seen.append(args)
-        return '{"com.docker.compose.project": "heldso"}'
-
-    monkeypatch.setattr(Podman, "run", fake_run)
-    slot = yard.store.slot("heldso")
-    try:
-        outcome = asyncio.run(deploy.deploy(yard, slot, "abc"))
-        assert outcome.status == "ok"
-        assert "removed heldso" not in outcome.log
-        assert not any(args[:1] == ("rm",) for args in seen)
-        assert yard.read_env("heldso")["SESSION_SECRET"] == "kept"
-    finally:
-        yard.store.close()
-
-
-def test_deploy_build_failure_leaves_the_legacy_container(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    yard = _yard(tmp_path)
-    _slot(yard, image="localhost/app:old9")
-    recorder = _stub(monkeypatch, tmp_path, code=1, text="== build localhost/app:abc\nboom\n")
-    seen: list[tuple[str, ...]] = []
-
-    async def fake_run(self, *args, timeout=20, env=None):
-        seen.append(args)
-        return "{}"
-
-    monkeypatch.setattr(Podman, "run", fake_run)
-    slot = yard.store.slot("heldso")
-    try:
-        outcome = asyncio.run(deploy.deploy(yard, slot, "abc"))
-        assert outcome.status == "failed"
-        assert recorder.calls[0]["command"] == "build"
-        assert len(recorder.calls) == 1
-        assert seen == []
         assert yard.store.slot("heldso").live_image == "localhost/app:old9"
     finally:
         yard.store.close()
@@ -412,6 +317,45 @@ def test_run_deploy_coalesces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         outcome = asyncio.run(yard.run_deploy("heldso", "eee"))
         assert outcome.status == "superseded"
         assert outcome.image == "localhost/app:def"
+    finally:
+        yard.store.close()
+
+
+def test_follow_origin_fast_forwards_main(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard = _yard(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_git(*args, cwd=None, timeout=60):
+        calls.append(tuple(args))
+        if args[0] == "rev-parse" and args[-1] == "refs/remotes/origin/main":
+            return "bbb\n"
+        if args[0] == "rev-parse":
+            return "aaa\n"
+        if args[0] == "merge-base":
+            return ""
+        return ""
+
+    monkeypatch.setattr("app.yard.git.git", fake_git)
+    try:
+        assert asyncio.run(yard._follow_origin()) == "main bbb\n"
+        assert calls[-1] == ("update-ref", "refs/heads/main", "bbb")
+    finally:
+        yard.store.close()
+
+
+def test_follow_origin_leaves_a_diverged_main(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard = _yard(tmp_path)
+
+    async def fake_git(*args, cwd=None, timeout=60):
+        if args[0] == "rev-parse" and args[-1] == "refs/remotes/origin/main":
+            return "bbb"
+        if args[0] == "rev-parse":
+            return "aaa"
+        raise RuntimeError("not an ancestor")
+
+    monkeypatch.setattr("app.yard.git.git", fake_git)
+    try:
+        assert asyncio.run(yard._follow_origin()) == "main and origin/main have diverged\n"
     finally:
         yard.store.close()
 

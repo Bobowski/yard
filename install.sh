@@ -300,7 +300,7 @@ if [ ! -d "$repo" ]; then
   run_yard git -C "$repo" remote set-head origin -a || true
 fi
 run_yard git -C "$repo" fetch origin || die "Could not fetch origin." \
-  "The install follows origin/main." \
+  "The install follows main. Fetch fast-forwards main from origin." \
   "Hint: git -C ${repo} remote -v" \
   "Context: fetch failed for user yard."
 sha="$(run_yard git -C "$repo" rev-parse refs/remotes/origin/main)"

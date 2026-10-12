@@ -136,7 +136,11 @@ def _state_text(row: dict, now: datetime) -> str:
         return f"{word} {age}".rstrip()
     if state == "running":
         age = _ago(str(row.get("started") or ""), now)
-        word = health if health in {"starting", "unhealthy"} else "up"
+        # A process that already answers is up. Podman can leave "starting" set with no check.
+        if health == "unhealthy" or (health == "starting" and row.get("answers") is not True):
+            word = health
+        else:
+            word = "up"
         text = f"{word} {age}".rstrip()
         if row.get("answers") is False:
             text += " · no answer"
