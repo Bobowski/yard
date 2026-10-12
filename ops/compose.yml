@@ -1,12 +1,11 @@
 # Yard's own project. The apply container is not a service here.
 services:
-  yard:
+  app:
     image: ${IMAGE}
     pull_policy: never
     build:
       context: ${CHECKOUT}
       dockerfile: ops/Containerfile
-    container_name: yard
     restart: always
     networks:
       yard:
@@ -38,7 +37,6 @@ services:
 
   caddy:
     image: docker.io/library/caddy:2
-    container_name: caddy
     restart: always
     networks:
       - yard

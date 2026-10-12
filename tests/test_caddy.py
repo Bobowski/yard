@@ -51,7 +51,8 @@ def test_the_committed_caddy_json_is_document_empty():
 def test_compose_spec_matches_the_document():
     spec = (Path(__file__).resolve().parents[1] / "ops" / "compose.yml").read_text()
     for part in (
-        "container_name: caddy",
+        "  app:",
+        "  caddy:",
         "${YARD_ROOT}/data/caddy:/config/caddy",
         "${YARD_ROOT}/data/caddy/lib:/data",
         "${YARD_ROOT}/run:/run/caddy",
@@ -62,6 +63,8 @@ def test_compose_spec_matches_the_document():
     ):
         assert part in spec
     assert "COMPOSE_ENV_FILE" not in spec
+    # Compose names the containers yard-app-1 and yard-caddy-1 like every slot.
+    assert "container_name" not in spec
     # Compose's own labels name the project and the service. No yard.* label is needed.
     assert "yard." not in spec
 

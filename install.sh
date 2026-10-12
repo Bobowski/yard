@@ -243,7 +243,7 @@ release_port() {
     done
     return 0
   fi
-  if run_yard podman container exists yard >/dev/null 2>&1; then
+  if run_yard podman container exists yard-app-1 >/dev/null 2>&1; then
     return 0
   fi
   die "Port ${public_port} is already in use." \
@@ -348,7 +348,7 @@ while [ ! -s "$root/data/yard/admin.token" ] && [ "$i" -lt 60 ]; do
   sleep 1
 done
 [ -s "$root/data/yard/admin.token" ] || die "Yard did not write its admin token." \
-  "Hint: podman logs yard" \
+  "Hint: podman logs yard-app-1" \
   "Context: the file was missing or empty after 60 seconds."
 token="$(cat "$root/data/yard/admin.token")"
 echo "token: $token"
@@ -358,4 +358,4 @@ else
   echo "url: pass --domain to publish this host"
 fi
 echo "local: http://127.0.0.1:8000"
-run_yard podman exec -e YARD_URL=http://127.0.0.1:8000 -e YARD_TOKEN="$token" yard /workspace/.venv/bin/yard doctor || true
+run_yard podman exec -e YARD_URL=http://127.0.0.1:8000 -e YARD_TOKEN="$token" yard-app-1 /workspace/.venv/bin/yard doctor || true

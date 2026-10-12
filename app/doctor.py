@@ -80,7 +80,8 @@ async def _exists(yard: Yard, kind: str, name: str) -> tuple[bool, str]:
 
 async def _caddy_up(yard: Yard) -> tuple[bool, str]:
     try:
-        found = podman.parse_ps(await yard.podman.run("ps", "-a", "--format", "json")).get("caddy")
+        items = podman.parse_ps(await yard.podman.run("ps", "-a", "--format", "json")).values()
+        found = next((item for item in items if item.slot == "yard" and item.service == "caddy"), None)
     except YardError as exc:
         return False, str(exc)
     if found is None:

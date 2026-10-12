@@ -13,6 +13,11 @@ from app.podman import Podman
 from app.store import Store
 from app.yard import Yard
 
+CADDY_PS = (
+    '[{"Names":["yard-caddy-1"],"State":"running",'
+    '"Labels":{"com.docker.compose.project":"yard","com.docker.compose.service":"caddy"}}]'
+)
+
 
 def _yard(tmp_path: Path, *, sock: bool = True, info: str = "", ps: str = "[]") -> Yard:
     config = Config(
@@ -45,7 +50,7 @@ def _run(yard: Yard) -> dict[str, dict]:
 
 
 def test_doctor_all_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    yard = _yard(tmp_path, ps='[{"Names":["caddy"],"State":"running"}]')
+    yard = _yard(tmp_path, ps=CADDY_PS)
     monkeypatch.setattr(caddy, "request", lambda sock, method, path, body=b"": b"[]")
     usage = collections.namedtuple("usage", "total used free")(200, 100, 100)
     monkeypatch.setattr(shutil, "disk_usage", lambda path: usage)
@@ -102,7 +107,7 @@ def test_doctor_flags_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 def test_doctor_routes_and_certificates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    yard = _yard(tmp_path, ps='[{"Names":["caddy"],"State":"running"}]')
+    yard = _yard(tmp_path, ps=CADDY_PS)
     try:
         yard.store.create_repo("app")
         yard.store.create_slot("heldso", "app", "main", "", "heldso.example.com", "")
@@ -144,7 +149,7 @@ def test_doctor_routes_and_certificates(tmp_path: Path, monkeypatch: pytest.Monk
 
 
 def test_doctor_acme_and_https(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    yard = _yard(tmp_path, ps='[{"Names":["caddy"],"State":"running"}]')
+    yard = _yard(tmp_path, ps=CADDY_PS)
     try:
         yard.store.create_repo("app")
         yard.store.create_repo("yard")
@@ -186,7 +191,7 @@ def test_doctor_acme_and_https(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 def test_doctor_https_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    yard = _yard(tmp_path, ps='[{"Names":["caddy"],"State":"running"}]')
+    yard = _yard(tmp_path, ps=CADDY_PS)
     try:
         yard.store.create_repo("app")
         yard.store.create_slot("heldso", "app", "main", "", "heldso.example.com", "")
