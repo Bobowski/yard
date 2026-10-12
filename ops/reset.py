@@ -31,6 +31,8 @@ def main() -> None:
             shutil.rmtree(path)
             print(f"removed {path}", flush=True)
     for name in NAMES:
+        # A restart policy can recreate the name between stop and rm.
+        subprocess.call(["podman", "update", "--restart", "no", name])
         code = subprocess.call(["podman", "rm", "-f", "-t", "3", name])
         print(f"remove {name} {code}", flush=True)
     Path("/tmp/ready").write_text("ok\n")
@@ -89,7 +91,11 @@ def _caddy_listen(root: Path) -> None:
         admin = {}
         doc["admin"] = admin
     admin["listen"] = "unix//run/caddy/caddy.sock|0600"
-    path.write_text(json.dumps(doc))
+    try:
+        path.write_text(json.dumps(doc))
+    except OSError as exc:
+        print(f"caddy listen not written: {exc}", flush=True)
+        return
     print("caddy listen updated", flush=True)
 
 

@@ -58,7 +58,13 @@ services:
       YARD_ROOT: ${YARD_ROOT}
     entrypoint: ["/workspace/.venv/bin/python", "/reset.py"]
     healthcheck:
-      test: ["CMD", "test", "-f", "/tmp/ready"]
+      test:
+        [
+          "CMD",
+          "/workspace/.venv/bin/python",
+          "-c",
+          "import os, sys; sys.exit(0 if os.path.isfile('/tmp/ready') else 1)",
+        ]
       interval: 2s
       timeout: 3s
       retries: 40
