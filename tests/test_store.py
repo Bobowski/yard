@@ -62,7 +62,6 @@ def test_schema_upgrades_an_old_database(tmp_path):
             sha TEXT NOT NULL,
             status TEXT NOT NULL,
             started TEXT NOT NULL,
-            built TEXT NOT NULL DEFAULT '',
             ended TEXT NOT NULL DEFAULT ''
         );
         INSERT INTO deploys (slot, sha, status, started) VALUES ('heldso', 'abc', 'ok', 'then');
@@ -77,6 +76,7 @@ def test_schema_upgrades_an_old_database(tmp_path):
         assert old is not None
         assert old.image == ""
         assert old.log == ""
+        assert old.built == ""
         deploy_id = store.begin_deploy("heldso", "def", "localhost/app:def")
         store.finish_deploy(deploy_id, "ok", "done\n")
 

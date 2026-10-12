@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from app.caddy import document, routes, wait_socket
+from app.caddy import admin_listen, document, routes, wait_socket
 from app.store import Slot
 
 
@@ -41,6 +41,15 @@ def test_document():
         '"disabled": true',
     ):
         assert part in text or part in body
+
+
+def test_admin_listen_keeps_the_saved_socket(tmp_path: Path):
+    saved = "unix//srv/yard/run/caddy.sock|0600"
+    path = tmp_path / "autosave.json"
+    path.write_text('{"admin":{"listen":"' + saved + '"}}')
+    assert admin_listen(path) == saved
+    assert saved in document([], admin_listen(path)).decode()
+    assert admin_listen(tmp_path / "missing.json") == "unix//run/caddy/caddy.sock|0600"
 
 
 def test_the_committed_caddy_json_is_document_empty():

@@ -148,9 +148,10 @@ class Store:
         )
         self._db.execute("CREATE UNIQUE INDEX IF NOT EXISTS slots_domain ON slots(domain) WHERE domain != ''")
 
-        # An existing deploys table gains image and log.
+        # An existing deploys table gains image, log, and built.
+        # 0.1.1 has image and log. It has no built column.
         columns = {str(row["name"]) for row in self._db.execute("PRAGMA table_info(deploys)")}
-        for column in ("image", "log"):
+        for column in ("image", "log", "built"):
             if column not in columns:
                 self._db.execute(f"ALTER TABLE deploys ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
 

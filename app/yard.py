@@ -31,6 +31,7 @@ class Yard:
         self._locks: dict[str, asyncio.Lock] = {}
         self._jobs: dict[str, asyncio.Task[None]] = {}
         self._wakes: dict[str, asyncio.Event] = {}
+        self._apply_task: asyncio.Task[None] | None = None
         self._app: App | None = None
 
     async def boot(self, app: App) -> None:
@@ -51,12 +52,9 @@ class Yard:
         await self._prepare_repos()
 
         await self.ensure_network()
-        try:
-            code, text = await compose.build_apply(self.config)
-            if code:
-                log.warning("apply image: %s", text.strip().splitlines()[-1] if text.strip() else code)
-        except Exception as exc:
-            log.warning("apply image: %s", exc)
+        # The apply image build pulls a base image. Health must answer before that finishes.
+        # The 0.1 swap waits 60 seconds for /health.
+        self._apply_task = app.create_task(self._build_apply_image(), name="apply-image")
         if self.config.caddy_sock is not None:
             try:
                 (self.config.root / "data" / "caddy" / "lib").mkdir(parents=True, exist_ok=True)
@@ -67,8 +65,20 @@ class Yard:
         await self.push_caddy()
         await self.start_jobs()
 
+    async def _build_apply_image(self) -> None:
+        try:
+            code, text = await compose.build_apply(self.config)
+            if code:
+                log.warning("apply image: %s", text.strip().splitlines()[-1] if text.strip() else code)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("apply image: %s", exc)
+
     async def aclose(self) -> None:
         tasks = list(self._jobs.values())
+        if self._apply_task is not None:
+            tasks.append(self._apply_task)
         for task in tasks:
             task.cancel()
         if tasks:
@@ -480,7 +490,10 @@ class Yard:
             return
         try:
             found = caddy.routes(self.store.list_slots(), self.config.domain)
-            await asyncio.to_thread(caddy.load, sock, caddy.document(found))
+            # Keep the admin socket the running Caddy already uses.
+            # A 0.1 host listens on /srv/yard/run/caddy.sock, not /run/caddy/caddy.sock.
+            listen = caddy.admin_listen(self.config.root / "data" / "caddy" / "autosave.json")
+            await asyncio.to_thread(caddy.load, sock, caddy.document(found, listen))
         except Exception as exc:
             log.warning("caddy: %s", exc)
 
