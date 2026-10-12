@@ -27,13 +27,8 @@ services:
       YARD_ROOT: ${YARD_ROOT}
       YARD_PODMAN_SOCK: ${YARD_PODMAN_SOCK}
       CONTAINER_HOST: unix:///run/podman/podman.sock
-    # Podman joins a CMD healthcheck through a shell, so no semicolons. curl is in the image.
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "-m", "3", "http://127.0.0.1:8000/health"]
-      interval: 2s
-      timeout: 5s
-      retries: 30
-      start_period: 15s
+    # No healthcheck: apply probes http://yard:8000/ after up, and a 2s probe
+    # would burn CPU and fill the log with /health spans forever.
 
   caddy:
     image: docker.io/library/caddy:2

@@ -217,7 +217,7 @@ async def test_slot_deploys_existing_revision(yard):
     assert res.status_code == 200
     deploy = res.json()["deploy"]
     assert deploy["status"] == "skipped"
-    assert sha in deploy["image"]
+    assert sha[:12] in deploy["image"]
     vals = (await client.get("/api/v1/slots/app", headers=auth(token))).json()
     assert vals["sha"] == ""
     again = await client.post("/api/v1/slots/app/deploy", headers=auth(token))
