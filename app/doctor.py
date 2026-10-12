@@ -161,7 +161,8 @@ async def _dns(host: str) -> tuple[bool, str]:
 
 
 def _certificate(config: Config, host: str) -> tuple[bool, str]:
-    root = config.data("caddy") / "lib" / "certificates"
+    # Caddy's /data volume is lib/, and it writes under a caddy/ directory in it.
+    root = config.data("caddy") / "lib" / "caddy" / "certificates"
     found = list(root.glob(f"*/{host}/{host}.crt")) if root.is_dir() else []
     if not found:
         return False, "not issued yet"

@@ -154,6 +154,7 @@ def saved_project(config: Config, slot: Slot) -> Project | None:
     compose_file = find_compose(checkout)
     files = [str(compose_file) if compose_file else DEFAULT_COMPOSE]
     env = run_env(config, slot, checkout, slot.live_image, sha)
+    ensure_env(config.env(slot.name))
     return Project(slot.name, files, env)
 
 

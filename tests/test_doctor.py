@@ -128,7 +128,7 @@ def test_doctor_routes_and_certificates(tmp_path: Path, monkeypatch: pytest.Monk
         assert not found["certificate heldso.example.com"]["ok"]
 
         # The certificate file ages out of the not-issued state.
-        cert = tmp_path / "data" / "caddy" / "lib" / "certificates" / "acme" / "heldso.example.com"
+        cert = tmp_path / "data" / "caddy" / "lib" / "caddy" / "certificates" / "acme" / "heldso.example.com"
         cert.mkdir(parents=True)
         (cert / "heldso.example.com.crt").write_text("pem")
         found = _run(yard)
