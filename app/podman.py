@@ -3,36 +3,30 @@
 import asyncio
 import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 from app.errors import YardError
 
 
 @dataclass(slots=True)
-class Listed:
+class Container:
     id: str = ""
     name: str = ""
+    image: str = ""
     slot: str = ""
     service: str = ""
     role: str = ""
-    sha: str = ""
     state: str = ""
-    status: str = ""
-    health: str = ""
-    exit_code: int = 0
     running: bool = False
+    restarts: int = 0
+    exit_code: int = 0
+    health: str = ""
     created: datetime | None = None
     started: datetime | None = None
     exited: datetime | None = None
-
-
-@dataclass(slots=True)
-class Inspected:
-    id: str
-    running: bool
-    started: datetime | None
-    finished: datetime | None
 
 
 @dataclass(slots=True)
@@ -40,24 +34,27 @@ class Sample:
     name: str
     cpu: str
     mem: str
+    cpu_percent: float = 0.0
+    mem_bytes: int = 0
 
 
 @dataclass(slots=True)
-class HostUse:
+class Host:
     cpus: int = 0
     mem: int = 0
     disk: int = 0
+    version: str = ""
 
 
 @dataclass(slots=True)
-class LogRow:
-    at: str
-    line: str
-    raw: str
+class Image:
+    name: str
+    created: datetime | None = None
+    size: int = 0
 
 
 class Podman:
-    def __init__(self, binary: str = "podman", *, remote: bool = False) -> None:
+    def __init__(self, binary: str = "podman", remote: bool = False) -> None:
         self.binary = binary or "podman"
         self.remote = remote
 
@@ -68,22 +65,14 @@ class Podman:
         head.extend(args)
         return head
 
-    async def run(
-        self,
-        *args: str,
-        timeout: float | None = 20,
-        env: dict[str, str] | None = None,
-        program: str = "",
-    ) -> str:
-        cmd = [program, *args] if program else self._args(args)
+    async def run(self, *args: str, timeout: float | None = 20, env: dict[str, str] | None = None) -> str:
         merged = os.environ.copy()
         if env:
             merged.update(env)
-        name = program or "podman"
         try:
             proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                env=merged if env or program else None,
+                *self._args(args),
+                env=merged if env else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -91,8 +80,8 @@ class Podman:
             raise YardError(
                 502,
                 "podman",
-                f"{name} {' '.join(args)}: {exc}",
-                help_text=f"The {name} command has to be on PATH.",
+                f"podman {' '.join(args)}: {exc}",
+                help_text="The podman command has to be on PATH.",
             ) from exc
         try:
             if timeout is None:
@@ -104,7 +93,7 @@ class Podman:
             raise YardError(
                 502,
                 "podman",
-                f"{name} {' '.join(args)}: timed out",
+                f"podman {' '.join(args)}: timed out",
                 help_text="The command did not finish. The container may still be starting.",
             ) from exc
         text = ((out or b"") + (err or b"")).decode(errors="replace").strip()
@@ -112,7 +101,7 @@ class Podman:
             raise YardError(
                 502,
                 "podman",
-                f"{name} {' '.join(args)}: {text}",
+                f"podman {' '.join(args)}: {text}",
                 exit_code=proc.returncode,
                 help_text="Yard talks to Podman through the socket on this host.",
             )
@@ -133,36 +122,6 @@ class Podman:
                 help_text="The podman command has to be on PATH.",
             ) from exc
 
-    async def ensure_network(self, name: str) -> None:
-        try:
-            await self.run("network", "exists", name, timeout=20)
-        except YardError:
-            await self.run("network", "create", name, timeout=20)
-
-    async def remove(self, name: str) -> None:
-        await self.run("rm", "-f", name, timeout=20)
-
-
-def ps_args() -> list[str]:
-    return ["ps", "-a", "--format", "json"]
-
-
-def stats_args() -> list[str]:
-    return ["stats", "--no-stream", "--format", "json"]
-
-
-def inspect_args(name: str) -> list[str]:
-    if not ok_name(name):
-        raise YardError(
-            400,
-            "bad_args",
-            "bad container name",
-            context={"name": name},
-            help_text="Start with a letter or digit. Then use letters, digits, and . _ -",
-            example="heldso",
-        )
-    return ["inspect", name]
-
 
 def ok_name(text: str) -> bool:
     if not text or len(text) > 128:
@@ -176,136 +135,132 @@ def ok_name(text: str) -> bool:
     return True
 
 
-def parse_info(raw: str) -> HostUse:
+def check_name(name: str) -> None:
+    if ok_name(name):
+        return
+    raise YardError(
+        400,
+        "bad_args",
+        "bad container name",
+        context={"name": name},
+        help_text="Start with a letter or digit. Then use letters, digits, and . _ -",
+        example="heldso",
+    )
+
+
+def parse_info(raw: str) -> Host:
     try:
         info = json.loads(raw)
     except json.JSONDecodeError:
-        return HostUse()
+        return Host()
     if not isinstance(info, dict):
-        return HostUse()
+        return Host()
     host = info.get("host")
     store = info.get("store")
     cpus = mem = disk = 0
     if isinstance(host, dict):
-        cpus = _number(host.get("cpus"))
-        mem = _number(host.get("memTotal"))
+        cpus = _int(host.get("cpus"))
+        mem = _int(host.get("memTotal"))
     if isinstance(store, dict):
-        disk = _number(store.get("graphRootAllocated"))
-    return HostUse(cpus, mem, disk)
+        disk = _int(store.get("graphRootAllocated"))
+    version = info.get("version")
+    return Host(cpus, mem, disk, str(version.get("Version") or "") if isinstance(version, dict) else "")
 
 
-def _number(value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return 0
-    return int(value)
-
-
+# Podman is pinned to remote 4.9.3, so its json keys are fixed.
 def parse_stats(raw: str) -> dict[str, Sample]:
-    rows = _rows(raw)
     found: dict[str, Sample] = {}
-    for row in rows:
-        name = _str(row, "Name", "name")
+    for row in _rows(raw):
+        name = str(row.get("Name") or "")
         if not name:
             continue
-        found[name] = Sample(name, _str(row, "CPUPerc", "CPU", "cpu_percent"), _str(row, "MemUsage", "mem_usage"))
+        cpu = str(row.get("CPUPerc") or "")
+        mem = str(row.get("MemUsage") or "")
+        found[name] = Sample(name, cpu, mem, _percent(cpu), _size(mem.split("/", 1)[0]))
     return found
 
 
-def parse_ps(raw: str) -> dict[str, Listed]:
-    found: dict[str, Listed] = {}
+def parse_images(raw: str) -> list[Image]:
+    """One row per tag. Podman 4.9 gives Names, unix Created, and Size in bytes."""
+    found: list[Image] = []
     for row in _rows(raw):
-        names = _names(row)
+        names = row.get("Names")
+        if not isinstance(names, list):
+            continue
+        created = _stamp(row.get("Created"))
+        size = _int(row.get("Size"))
+        for name in names:
+            if isinstance(name, str) and name:
+                found.append(Image(name, created, size))
+    return found
+
+
+def parse_ps(raw: str) -> dict[str, Container]:
+    found: dict[str, Container] = {}
+    for row in _rows(raw):
+        names = row.get("Names")
+        if not isinstance(names, list):
+            names = []
+        names = [str(name) for name in names if name]
         if not names:
             continue
-        health = _str(row, "Health", "health")
-        status = _str(row, "Status", "status")
+        health = str(row.get("Health") or "")
         if not health:
-            health = _health_text(status)
-        item = Listed(
-            id=_str(row, "Id", "ID", "id"),
-            name=names[0],
-            slot=_label(row, "yard.slot"),
-            service=_label(row, "yard.service"),
-            role=_label(row, "yard.role"),
-            sha=_label(row, "yard.sha"),
-            state=_str(row, "State", "state"),
-            status=status,
+            health = _health_text(str(row.get("Status") or ""))
+
+        # Yard names its apply containers; compose labels every app container with its project and service.
+        name = names[0]
+        if name.startswith("yard-apply-"):
+            rest = name.removeprefix("yard-apply-")
+            role = "job" if rest.endswith("-job") else "deploy"
+            slot = rest.removesuffix("-job")
+            service = ""
+        else:
+            role = "app"
+            slot = _label(row, "com.docker.compose.project")
+            service = _label(row, "com.docker.compose.service")
+
+        item = Container(
+            id=str(row.get("Id") or ""),
+            name=name,
+            image=str(row.get("Image") or ""),
+            slot=slot,
+            service=service,
+            role=role,
+            state=str(row.get("State") or ""),
+            restarts=_int(row.get("Restarts")),  # podman >= 4.3 exposes Restarts in ps --format json
+            exit_code=_int(row.get("ExitCode")),
             health=health,
-            exit_code=_int(row, "ExitCode", "exitCode"),
-            created=_time(row, "Created", "CreatedAt", "created"),
-            started=_time(row, "StartedAt", "startedAt"),
-            exited=_time(row, "ExitedAt", "exitedAt"),
+            created=_stamp(row.get("Created")),
+            started=_stamp(row.get("StartedAt")),
+            exited=_stamp(row.get("ExitedAt")),
         )
         item.running = item.state == "running"
         found[item.name] = item
     return found
 
 
-def ids_for_slot(raw: str, slot: str, role: str) -> list[str]:
-    listed = parse_ps(raw)
-    return [item.id for item in listed.values() if item.id and item.slot == slot and item.role == role]
-
-
-def log_hit(item: Listed, *, slot: str, role: str, sha: str) -> bool:
-    """One container matches the labels. An empty role means app."""
-    if item.role != (role or "app"):
-        return False
-    if slot and item.slot != slot and item.name != slot:
-        return False
-    if sha and not item.sha.startswith(sha):
-        return False
-    return True
-
-
-def parse_inspect(raw: str) -> list[Inspected]:
-    rows = _rows(raw)
-    found: list[Inspected] = []
-    for row in rows:
-        state = row.get("State")
-        if not isinstance(state, dict):
-            state = {}
-        started = _stamp(state.get("StartedAt"))
-        finished = _stamp(state.get("FinishedAt"))
-        found.append(Inspected(str(row.get("Id") or ""), bool(state.get("Running")), started, finished))
-    return found
-
-
 def page_logs(raw: str, cursor: str, limit: int) -> tuple[str, str, bool]:
-    rows, nxt, more = page_log_rows(raw, cursor, "", "", limit)
-    return "\n".join(row.raw for row in rows), nxt, more
-
-
-def page_log_rows(raw: str, cursor: str, since: str, until: str, limit: int) -> tuple[list[LogRow], str, bool]:
     if limit < 1:
         limit = 200
-    current = _parsed_stamp(cursor)
-    start = _parsed_stamp(since)
-    stop = _parsed_stamp(until)
+    current = parse_stamp(cursor)
     nxt = cursor
-    kept: list[LogRow] = []
+    kept: list[str] = []
 
     for line in raw.split("\n"):
         if not line:
             continue
         field, _, rest = line.partition(" ")
-        stamp = _parsed_stamp(field)
-        if stamp is not None:
-            if current is not None and stamp <= current:
-                continue
-            if start is not None and stamp < start:
-                continue
-            if stop is not None and stamp >= stop:
-                continue
+        stamp = parse_stamp(field)
+        if stamp is not None and current is not None and stamp <= current:
+            continue
 
         if len(kept) == limit:
-            return kept, nxt, True
-        row = LogRow(at="", line=line, raw=line)
+            return "\n".join(kept), nxt, True
         if stamp is not None and rest:
-            row.at = field
-            row.line = rest
             nxt = format_stamp(stamp)
-        kept.append(row)
-    return kept, nxt, False
+        kept.append(line)
+    return "\n".join(kept), nxt, False
 
 
 def format_stamp(stamp: datetime) -> str:
@@ -316,7 +271,22 @@ def format_stamp(stamp: datetime) -> str:
     return base + "." + f"{stamp.microsecond:06d}".rstrip("0") + "Z"
 
 
-def _rows(raw: str) -> list[dict]:
+def parse_stamp(text: str) -> datetime | None:
+    if not text:
+        return None
+    head = text.split("|", 1)[0]
+    if head.endswith("Z"):
+        head = head[:-1] + "+00:00"
+    try:
+        stamp = datetime.fromisoformat(head)
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=UTC)
+    return stamp
+
+
+def _rows(raw: str) -> list[dict[str, Any]]:
     raw = raw.strip()
     if raw in {"", "null", "[]"}:
         return []
@@ -331,71 +301,51 @@ def _rows(raw: str) -> list[dict]:
     return [row for row in data if isinstance(row, dict)]
 
 
-def _str(row: dict, *keys: str) -> str:
-    for key in keys:
-        value = row.get(key)
-        if isinstance(value, str):
-            return value
-    return ""
+_SIZE = re.compile(r"([0-9.]+)\s*([kmgtp]?i?b?|bytes?)", re.IGNORECASE)
+_SIZE_UNITS = {"": 1, "b": 1, "byte": 1, "bytes": 1}
+for _index, _prefix in enumerate("kmgtp", 1):
+    _SIZE_UNITS[_prefix] = 1000**_index
+    _SIZE_UNITS[f"{_prefix}b"] = 1000**_index
+    _SIZE_UNITS[f"{_prefix}ib"] = 1024**_index
 
 
-def _int(row: dict, *keys: str) -> int:
-    for key in keys:
-        value = row.get(key)
-        if isinstance(value, int) and not isinstance(value, bool):
-            return value
-    return 0
+def _percent(text: str) -> float:
+    try:
+        return float(text.strip().rstrip("%"))
+    except ValueError:
+        return 0.0
 
 
-def _names(row: dict) -> list[str]:
-    for key in ("Names", "names"):
-        value = row.get(key)
-        if isinstance(value, str) and value:
-            return [value]
-        if isinstance(value, list):
-            return [item for item in value if isinstance(item, str) and item]
-    return []
+def _size(text: str) -> int:
+    match = _SIZE.search(text.strip())
+    if not match:
+        return 0
+    unit = _SIZE_UNITS.get(match.group(2).lower())
+    if unit is None:
+        return 0
+    return int(float(match.group(1)) * unit)
 
 
-def _label(row: dict, key: str) -> str:
+def _int(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return int(value)
+
+
+def _label(row: dict[str, Any], key: str) -> str:
     labels = row.get("Labels")
-    if not isinstance(labels, dict):
-        labels = row.get("labels")
     if not isinstance(labels, dict):
         return ""
     value = labels.get(key, "")
     return value if isinstance(value, str) else ""
 
 
-def _time(row: dict, *keys: str) -> datetime | None:
-    for key in keys:
-        stamp = _stamp(row.get(key))
-        if stamp is not None:
-            return stamp
-    return None
-
-
-def _stamp(value: object) -> datetime | None:
+def _stamp(value: Any) -> datetime | None:
     if isinstance(value, str) and value:
-        return _parsed_stamp(value)
+        return parse_stamp(value)
     if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
         return datetime.fromtimestamp(int(value), UTC)
     return None
-
-
-def _parsed_stamp(text: str) -> datetime | None:
-    if not text:
-        return None
-    head = text.split("|", 1)[0]
-    if head.endswith("Z"):
-        head = head[:-1] + "+00:00"
-    try:
-        stamp = datetime.fromisoformat(head)
-    except ValueError:
-        return None
-    if stamp.tzinfo is None:
-        stamp = stamp.replace(tzinfo=UTC)
-    return stamp
 
 
 def _health_text(status: str) -> str:

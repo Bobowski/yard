@@ -1,0 +1,39 @@
+{
+	"admin": {
+		"listen": "unix//run/caddy/caddy.sock|0600"
+	},
+	"apps": {
+		"http": {
+			"https_port": 8443,
+			"servers": {
+				"yard": {
+					"automatic_https": {
+						"disable_redirects": true
+					},
+					"listen": [
+						":8443"
+					],
+					"routes": []
+				}
+			}
+		},
+		"tls": {
+			"automation": {
+				"policies": [
+					{
+						"issuers": [
+							{
+								"challenges": {
+									"http": {
+										"disabled": true
+									}
+								},
+								"module": "acme"
+							}
+						]
+					}
+				]
+			}
+		}
+	}
+}

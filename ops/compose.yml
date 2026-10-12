@@ -5,25 +5,29 @@ services:
     pull_policy: never
     build:
       context: ${CHECKOUT}
-      dockerfile: ${DOCKERFILE:-Containerfile}
+      dockerfile: ops/Containerfile
     container_name: yard
     restart: always
     networks:
       yard:
         aliases:
           - yard
-    labels:
-      yard.role: app
-      yard.slot: yard
-      yard.service: yard
-      yard.sha: ${SHA:-}
     ports:
-      - "127.0.0.1:${YARD_PUBLIC_PORT:-8000}:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
       - ${YARD_ROOT}:${YARD_ROOT}
       - ${YARD_PODMAN_SOCK}:/run/podman/podman.sock
+      - ${DATA_DIR}:/data
+    # The yard slot's env file. install.sh runs this before Yard has written it.
     env_file:
-      - ${COMPOSE_ENV_FILE}
+      - path: ${APP_ENV}
+        required: false
+    environment:
+      SHA: ${SHA}
+      IMAGE: ${IMAGE}
+      YARD_ROOT: ${YARD_ROOT}
+      YARD_PODMAN_SOCK: ${YARD_PODMAN_SOCK}
+      CONTAINER_HOST: unix:///run/podman/podman.sock
     healthcheck:
       test:
         [
@@ -41,20 +45,18 @@ services:
     image: docker.io/library/caddy:2
     container_name: caddy
     restart: always
-    labels:
-      yard.role: app
-      yard.slot: yard
-      yard.service: caddy
     networks:
       - yard
     ports:
-      - "${PROXY_PORT:-8443}:${PROXY_PORT:-8443}"
+      - "8443:8443"
     volumes:
       - ${YARD_ROOT}/data/caddy:/config/caddy
       - ${YARD_ROOT}/data/caddy/lib:/data
-      - ${YARD_ROOT}/run:${YARD_ROOT}/run
+      - ${YARD_ROOT}/run:/run/caddy
+      - ${CHECKOUT}/ops/caddy.json:/etc/caddy/caddy.json:ro
     entrypoint: ["caddy"]
-    command: ["run", "--resume"]
+    # --resume prefers the autosave Yard pushes; the file is the first start.
+    command: ["run", "--config", "/etc/caddy/caddy.json", "--resume"]
 
 networks:
   yard:

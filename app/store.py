@@ -1,31 +1,26 @@
-"""Yard's SQLite state. One file, one writer lock."""
+"""Yard's SQLite state. One file, one process."""
 
 import hashlib
-import json
-import posixpath
-import re
 import secrets
 import sqlite3
-import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import NoReturn
-from urllib.parse import urlsplit, urlunsplit
 
 from app.errors import YardError
-
-_NAME = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
-_DIR = re.compile(r"^[A-Za-z0-9._/-]+$")
-_DOMAIN = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
-_UNITS = {"ns": 1e-9, "us": 1e-6, "µs": 1e-6, "μs": 1e-6, "ms": 1e-3, "s": 1.0, "m": 60.0, "h": 3600.0}
+from app.values import (
+    check_domain,
+    check_name,
+    check_ref,
+    check_slot_name,
+    clean_dir,
+    parse_duration,
+    parse_trigger,
+)
 
 
 def now() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def now_nano() -> str:
     stamp = datetime.now(UTC)
     if stamp.microsecond == 0:
         return stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -37,150 +32,6 @@ def token_hash(plain: str) -> str:
     return hashlib.sha256(plain.encode()).hexdigest()
 
 
-def check_name(name: str) -> None:
-    if name.startswith("yard-"):
-        raise YardError(
-            400,
-            "bad_name",
-            "name must be a short lowercase word",
-            context={"name": name},
-            help_text="yard-* is reserved for this host.",
-            example="heldso",
-        )
-    if not _NAME.fullmatch(name):
-        raise YardError(
-            400,
-            "bad_name",
-            "name must be a short lowercase word",
-            context={"name": name},
-            help_text="Start with a letter. Then use letters, digits, and hyphens, up to 63 characters.",
-            example="heldso",
-        )
-
-
-def check_slot_name(name: str) -> None:
-    check_name(name)
-    if name == "caddy":
-        raise YardError(
-            400,
-            "bad_name",
-            "name must be a short lowercase word",
-            context={"name": name},
-            help_text="caddy is reserved for the proxy.",
-            example="heldso",
-        )
-
-
-def check_ref(ref: str) -> None:
-    if not ref or ".." in ref or ref.startswith("/") or any(ch in ref for ch in " \t\\"):
-        raise YardError(
-            400,
-            "bad_ref",
-            "ref must be a branch name",
-            context={"ref": ref},
-            help_text="Use a branch name. Do not start with a slash, and do not use spaces or ..",
-            example="main",
-        )
-
-
-def check_origin(url: str) -> str:
-    url = url.strip()
-    if any(ch in url for ch in " \t\r\n"):
-        _bad_origin(url)
-    parts = urlsplit(url)
-    if parts.scheme not in {"http", "https"} or not parts.hostname or not parts.path.strip("/"):
-        _bad_origin(url)
-    return url
-
-
-def origin_name(url: str) -> str:
-    name = urlsplit(check_origin(url)).path.rstrip("/").rsplit("/", 1)[-1]
-    if name.endswith(".git"):
-        name = name[:-4]
-    return name.lower()
-
-
-def public_origin(url: str) -> str:
-    parts = urlsplit(url)
-    host = parts.hostname or ""
-    if parts.port:
-        host = f"{host}:{parts.port}"
-    return urlunsplit((parts.scheme, host, parts.path, "", ""))
-
-
-def _bad_origin(url: str) -> NoReturn:
-    raise YardError(
-        400,
-        "bad_origin",
-        "remote must be an http or https git address",
-        context={"remote": url.split("@")[-1]},
-        help_text="Pass the GitHub address. Yard clones it on the host.",
-        example="https://github.com/org/heldso",
-    )
-
-
-def check_domain(domain: str) -> None:
-    if not domain:
-        return
-    if ".." in domain or not _DOMAIN.fullmatch(domain):
-        raise YardError(
-            400,
-            "bad_domain",
-            "domain must be a hostname",
-            context={"domain": domain},
-            help_text="Use a lowercase hostname. One domain belongs to one slot.",
-            example="heldso.example.com",
-        )
-
-
-def clean_dir(directory: str) -> str:
-    directory = directory.strip()
-    if directory in {"", ".", "./"}:
-        return ""
-    if directory.startswith("/") or not _DIR.fullmatch(directory):
-        _bad_dir(directory)
-    clean = posixpath.normpath(directory)
-    if clean in {".", ".."} or clean.startswith("../") or "/../" in f"/{clean}/":
-        _bad_dir(directory)
-    return clean
-
-
-def _bad_dir(directory: str) -> NoReturn:
-    raise YardError(
-        400,
-        "bad_dir",
-        "directory must be a relative path inside the repo",
-        context={"directory": directory},
-        help_text="The path stays inside the repo. Do not start with / and do not use ..",
-        example="projects/mono",
-    )
-
-
-def parse_duration(text: str) -> float:
-    if not text:
-        raise ValueError("empty")
-    total = 0.0
-    i = 0
-    size = len(text)
-    while i < size:
-        start = i
-        if text[i] == ".":
-            i += 1
-        if i >= size or not text[i].isdigit():
-            raise ValueError(text)
-        while i < size and (text[i].isdigit() or text[i] == "."):
-            i += 1
-        number = float(text[start:i])
-        unit_at = i
-        while i < size and (text[i].isalpha() or text[i] in "µμ"):
-            i += 1
-        unit = text[unit_at:i]
-        if unit not in _UNITS:
-            raise ValueError(unit)
-        total += number * _UNITS[unit]
-    return total
-
-
 def _domain_taken(domain: str) -> NoReturn:
     raise YardError(
         409,
@@ -189,50 +40,6 @@ def _domain_taken(domain: str) -> NoReturn:
         context={"domain": domain},
         help_text="One domain belongs to one slot.",
     )
-
-
-def _unknown_token(name: str) -> NoReturn:
-    raise YardError(404, "not_found", "unknown token", context={"name": name}, help_text="Run yard token list.")
-
-
-def _outside(name: str) -> NoReturn:
-    raise YardError(
-        403,
-        "forbidden",
-        "that token is outside your tree",
-        context={"name": name},
-        help_text="Revoke a token you created. You cannot revoke your own token.",
-    )
-
-
-def _bad_every(text: str) -> NoReturn:
-    raise YardError(
-        400,
-        "bad_every",
-        "every must be a duration, or empty",
-        context={"every": text},
-        help_text="Use at least 1s. An empty value, off, or - clears the job.",
-        example="5m",
-    )
-
-
-def parse_every(text: str) -> str:
-    text = text.strip().lower().removeprefix("every ")
-    if text in {"", "off", "-"}:
-        return ""
-    try:
-        seconds = parse_duration(text)
-    except ValueError as exc:
-        raise _bad_every(text) from exc
-    if seconds < 1:
-        raise _bad_every(text)
-    if seconds % 3600 == 0:
-        return f"{int(seconds // 3600)}h"
-    if seconds % 60 == 0:
-        return f"{int(seconds // 60)}m"
-    if seconds == int(seconds):
-        return f"{int(seconds)}s"
-    return text
 
 
 @dataclass(slots=True)
@@ -249,16 +56,23 @@ class Slot:
     directory: str
     domain: str
     live_image: str
-    every: str
-    env: dict[str, str]
+    trigger: str
     created: str
+
+    @property
+    def job(self) -> bool:
+        return bool(self.trigger)
+
+    @property
+    def every_seconds(self) -> float | None:
+        if not self.trigger.startswith("every "):
+            return None
+        return parse_duration(self.trigger[6:])
 
 
 @dataclass(slots=True)
 class Token:
     name: str
-    parent: str
-    revoked: bool
     created: str
 
 
@@ -267,32 +81,17 @@ class Deploy:
     id: int
     slot: str
     sha: str
+    image: str
     status: str
     started: str
     built: str
     ended: str
-
-
-@dataclass(slots=True)
-class Label:
-    key: str
-    value: str
-
-
-@dataclass(slots=True)
-class Experiment:
-    id: int
-    title: str
-    body: str
-    labels: list[Label] = field(default_factory=list)
-    created: str = ""
-    updated: str = ""
+    log: str
 
 
 class Store:
     def __init__(self, db: sqlite3.Connection) -> None:
         self._db = db
-        self._lock = threading.Lock()
 
     @classmethod
     def open(cls, directory: Path) -> Store:
@@ -307,8 +106,7 @@ class Store:
         return store
 
     def close(self) -> None:
-        with self._lock:
-            self._db.close()
+        self._db.close()
 
     def _schema(self) -> None:
         self._db.executescript(
@@ -324,61 +122,67 @@ class Store:
                 dir TEXT NOT NULL DEFAULT '',
                 domain TEXT NOT NULL,
                 live_image TEXT NOT NULL DEFAULT '',
-                every TEXT NOT NULL DEFAULT '',
+                trigger TEXT NOT NULL DEFAULT '',
                 env_json TEXT NOT NULL DEFAULT '{}',
                 created TEXT NOT NULL
             );
+            -- An existing host has the old tokens table with parent and revoked columns.
+            -- Both default, so inserts under this flat shape still work there.
             CREATE TABLE IF NOT EXISTS tokens (
                 name TEXT PRIMARY KEY,
                 hash TEXT NOT NULL,
-                parent TEXT NOT NULL DEFAULT '',
-                revoked INTEGER NOT NULL DEFAULT 0,
                 created TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS deploys (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 slot TEXT NOT NULL,
                 sha TEXT NOT NULL,
+                image TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL,
                 started TEXT NOT NULL,
                 built TEXT NOT NULL DEFAULT '',
-                ended TEXT NOT NULL DEFAULT ''
+                ended TEXT NOT NULL DEFAULT '',
+                log TEXT NOT NULL DEFAULT ''
             );
-            CREATE TABLE IF NOT EXISTS experiments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                body TEXT NOT NULL DEFAULT '',
-                created TEXT NOT NULL,
-                updated TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS exp_labels (
-                exp_id INTEGER NOT NULL,
-                key TEXT NOT NULL,
-                value TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS exp_labels_exp ON exp_labels(exp_id);
             """
         )
         self._db.execute("CREATE UNIQUE INDEX IF NOT EXISTS slots_domain ON slots(domain) WHERE domain != ''")
+
+        # An existing deploys table gains image and log.
+        columns = {str(row["name"]) for row in self._db.execute("PRAGMA table_info(deploys)")}
+        for column in ("image", "log"):
+            if column not in columns:
+                self._db.execute(f"ALTER TABLE deploys ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+
+        # An existing slots table gains trigger. Old hosts used every as the
+        # schedule, so a row with every set becomes an `every` trigger once.
+        slot_columns = {str(row["name"]) for row in self._db.execute("PRAGMA table_info(slots)")}
+        if "trigger" not in slot_columns:
+            self._db.execute("ALTER TABLE slots ADD COLUMN trigger TEXT NOT NULL DEFAULT ''")
+            self._db.execute("UPDATE slots SET trigger = 'every ' || every WHERE every != ''")
+
+        # A host from before flat tokens still has the revoked column. Drop the
+        # revoked rows once: under the flat shape nothing could set revoked back,
+        # so a revived row would wrongly become a live token again.
+        token_columns = {str(row["name"]) for row in self._db.execute("PRAGMA table_info(tokens)")}
+        if "revoked" in token_columns:
+            self._db.execute("DELETE FROM tokens WHERE revoked = 1")
         self._db.commit()
 
     def _one(self, sql: str, args: tuple = ()) -> sqlite3.Row | None:
-        with self._lock:
-            return self._db.execute(sql, args).fetchone()
+        return self._db.execute(sql, args).fetchone()
 
     def _all(self, sql: str, args: tuple = ()) -> list[sqlite3.Row]:
-        with self._lock:
-            return list(self._db.execute(sql, args))
+        return list(self._db.execute(sql, args))
 
     def _write(self, sql: str, args: tuple = ()) -> sqlite3.Cursor:
-        with self._lock:
-            try:
-                cur = self._db.execute(sql, args)
-                self._db.commit()
-            except sqlite3.IntegrityError as exc:
-                self._db.rollback()
-                _raise_integrity(exc)
-            return cur
+        try:
+            cur = self._db.execute(sql, args)
+            self._db.commit()
+        except sqlite3.IntegrityError as exc:
+            self._db.rollback()
+            _raise_integrity(exc)
+        return cur
 
     def list_repos(self) -> list[Repo]:
         rows = self._all("SELECT name, created FROM repos ORDER BY name")
@@ -439,7 +243,15 @@ class Store:
     def slots_for_repo(self, repo: str) -> list[Slot]:
         return [slot for slot in self.list_slots() if slot.repo == repo]
 
-    def create_slot(self, name: str, repo: str, ref: str, domain: str, directory: str, every: str) -> Slot:
+    def create_slot(
+        self,
+        name: str,
+        repo: str,
+        ref: str = "",
+        directory: str = "",
+        domain: str = "",
+        trigger: str = "",
+    ) -> Slot:
         check_slot_name(name)
         check_name(repo)
         ref = ref or "main"
@@ -455,15 +267,46 @@ class Store:
                 help_text="Create the repo first.",
                 example=f"yard repo new {repo}",
             )
-        every = parse_every(every)
+        trigger = parse_trigger(trigger)
         self._write(
             """
-            INSERT INTO slots (name, repo, ref, dir, domain, every, env_json, created)
-            VALUES (?, ?, ?, ?, ?, ?, '{}', ?)
+            INSERT INTO slots (name, repo, ref, dir, domain, trigger, created)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (name, repo, ref, directory, domain, every, now()),
+            (name, repo, ref, directory, domain, trigger, now()),
         )
         return self.slot(name)
+
+    def update_slot(
+        self,
+        name: str,
+        *,
+        ref: str | None = None,
+        dir: str | None = None,
+        domain: str | None = None,
+        trigger: str | None = None,
+    ) -> Slot:
+        slot = self.slot(name)
+        if ref is not None:
+            ref = ref or "main"
+            check_ref(ref)
+            slot.ref = ref
+        if dir is not None:
+            slot.directory = clean_dir(dir)
+        if domain is not None:
+            self._domain_free(domain, name)
+            slot.domain = domain
+        if trigger is not None:
+            slot.trigger = parse_trigger(trigger)
+
+        self._write(
+            "UPDATE slots SET ref = ?, dir = ?, domain = ?, trigger = ? WHERE name = ?",
+            (slot.ref, slot.directory, slot.domain, slot.trigger, name),
+        )
+        return self.slot(name)
+
+    def set_image(self, name: str, image: str) -> None:
+        self._write("UPDATE slots SET live_image = ? WHERE name = ?", (image, name))
 
     def delete_slot(self, name: str) -> None:
         cur = self._write("DELETE FROM slots WHERE name = ?", (name,))
@@ -476,38 +319,6 @@ class Store:
                 help_text="Run yard slot list to see the apps on this host.",
             )
 
-    def patch_slot(
-        self,
-        name: str,
-        ref: str | None,
-        domain: str | None,
-        directory: str | None,
-        every: str | None,
-        env: dict[str, str],
-    ) -> Slot:
-        slot = self.slot(name)
-        if ref is not None:
-            ref = ref or "main"
-            check_ref(ref)
-            slot.ref = ref
-        if directory is not None:
-            slot.directory = clean_dir(directory)
-        if domain is not None:
-            self._domain_free(domain, name)
-            slot.domain = domain
-        if every is not None:
-            slot.every = parse_every(every)
-        slot.env = env
-
-        self._write(
-            "UPDATE slots SET ref = ?, dir = ?, domain = ?, every = ?, env_json = ? WHERE name = ?",
-            (slot.ref, slot.directory, slot.domain, slot.every, json.dumps(env, sort_keys=True), name),
-        )
-        return self.slot(name)
-
-    def set_image(self, name: str, live: str) -> None:
-        self._write("UPDATE slots SET live_image = ? WHERE name = ?", (live, name))
-
     def _domain_free(self, domain: str, except_name: str) -> None:
         check_domain(domain)
         if not domain:
@@ -516,111 +327,67 @@ class Store:
         if row is not None:
             _domain_taken(domain)
 
-    def create_token(self, name: str, parent: str) -> str:
+    def create_token(self, name: str) -> str:
         check_name(name)
-        if parent:
-            check_name(parent)
-            row = self._one("SELECT COUNT(*) AS n FROM tokens WHERE name = ? AND revoked = 0", (parent,))
-            if row is None or int(row["n"]) == 0:
-                _unknown_token(parent)
         plain = secrets.token_hex(24)
-        self._write(
-            "INSERT INTO tokens (name, hash, parent, created) VALUES (?, ?, ?, ?)",
-            (name, token_hash(plain), parent, now()),
-        )
+        self._write("INSERT INTO tokens (name, hash, created) VALUES (?, ?, ?)", (name, token_hash(plain), now()))
         return plain
 
     def list_tokens(self) -> list[Token]:
-        rows = self._all("SELECT name, parent, revoked, created FROM tokens ORDER BY name")
-        return [self._token(row) for row in rows]
+        rows = self._all("SELECT name, created FROM tokens ORDER BY name")
+        return [Token(str(row["name"]), str(row["created"])) for row in rows]
 
-    def revoke_token(self, actor: str, name: str) -> None:
-        if not actor or actor == name:
-            _outside(name)
-        if self._one("SELECT 1 FROM tokens WHERE name = ?", (name,)) is None:
-            _unknown_token(name)
-        if not self._descendant(actor, name):
-            _outside(name)
-
-        # A revoked token takes the tokens created under it.
-        self._write(
-            """
-            WITH RECURSIVE sub(name) AS (
-                SELECT name FROM tokens WHERE name = ?
-                UNION
-                SELECT t.name FROM tokens t JOIN sub ON t.parent = sub.name
+    def delete_token(self, name: str, actor: str = "") -> None:
+        if name == actor:
+            raise YardError(
+                403,
+                "forbidden",
+                "you cannot delete your own token",
+                context={"name": name},
+                help_text="Ask another token to remove it.",
             )
-            UPDATE tokens SET revoked = 1 WHERE name IN (SELECT name FROM sub)
-            """,
-            (name,),
-        )
+        cur = self._write("DELETE FROM tokens WHERE name = ?", (name,))
+        if cur.rowcount == 0:
+            raise YardError(
+                404,
+                "not_found",
+                "unknown token",
+                context={"name": name},
+                help_text="Run yard token list.",
+            )
 
     def token_ok(self, plain: str) -> Token | None:
         if not plain:
             return None
-        row = self._one(
-            "SELECT name, parent, revoked, created FROM tokens WHERE hash = ?",
-            (token_hash(plain),),
-        )
+        row = self._one("SELECT name, created FROM tokens WHERE hash = ?", (token_hash(plain),))
         if row is None:
             return None
-        token = self._token(row)
+        return Token(str(row["name"]), str(row["created"]))
 
-        # A live child of a revoked parent is not a live token.
-        if token.revoked or not self._ancestors_live(token.name):
-            return None
-        return token
-
-    def _descendant(self, actor: str, name: str) -> bool:
-        row = self._one(
-            """
-            WITH RECURSIVE sub(name) AS (
-                SELECT name FROM tokens WHERE parent = ?
-                UNION
-                SELECT t.name FROM tokens t JOIN sub ON t.parent = sub.name
-            )
-            SELECT COUNT(*) AS n FROM sub WHERE name = ?
-            """,
-            (actor, name),
-        )
-        return row is not None and int(row["n"]) > 0
-
-    def _ancestors_live(self, name: str) -> bool:
-        seen: set[str] = set()
-        while name:
-            if name in seen:
-                return False
-            seen.add(name)
-            row = self._one("SELECT parent, revoked FROM tokens WHERE name = ?", (name,))
-            if row is None or int(row["revoked"]):
-                return False
-            name = str(row["parent"])
-        return True
-
-    def begin_deploy(self, slot: str, sha: str) -> int:
+    def begin_deploy(self, slot: str, sha: str, image: str) -> int:
         cur = self._write(
             """
-            INSERT INTO deploys (slot, sha, status, started)
-            VALUES (?, ?, 'running', ?)
+            INSERT INTO deploys (slot, sha, image, status, started)
+            VALUES (?, ?, ?, 'running', ?)
             """,
-            (slot, sha, now_nano()),
+            (slot, sha, image, now()),
         )
         return int(cur.lastrowid or 0)
 
-    def finish_deploy(self, deploy_id: int, status: str, built: str = "") -> None:
+    def mark_built(self, deploy_id: int, stamp: str) -> None:
+        self._write("UPDATE deploys SET built = ? WHERE id = ?", (stamp, deploy_id))
+
+    def finish_deploy(self, deploy_id: int, status: str, log: str) -> None:
         self._write(
-            "UPDATE deploys SET status = ?, built = ?, ended = ? WHERE id = ?",
-            (status, built, now_nano(), deploy_id),
+            "UPDATE deploys SET status = ?, log = ?, ended = ? WHERE id = ?",
+            (status, log, now(), deploy_id),
         )
 
     def interrupt_deploys(self) -> None:
-        self._write("UPDATE deploys SET status = 'interrupted', ended = ? WHERE status = 'running'", (now_nano(),))
+        self._write("UPDATE deploys SET status = 'interrupted', ended = ? WHERE status = 'running'", (now(),))
 
     def deploy(self, deploy_id: int) -> Deploy:
-        row = self._one(
-            "SELECT id, slot, sha, status, started, built, ended FROM deploys WHERE id = ?",
-            (deploy_id,),
-        )
+        row = self._one(_DEPLOY_SQL + " WHERE id = ?", (deploy_id,))
         if row is None:
             raise YardError(
                 404,
@@ -634,120 +401,14 @@ class Store:
     def list_deploys(self, slot: str, limit: int) -> list[Deploy]:
         if limit <= 0 or limit > 100:
             limit = 20
-        rows = self._all(
-            """
-            SELECT id, slot, sha, status, started, built, ended FROM deploys
-            WHERE slot = ?
-            ORDER BY id DESC LIMIT ?
-            """,
-            (slot, limit),
-        )
+        rows = self._all(_DEPLOY_SQL + " WHERE slot = ? ORDER BY id DESC LIMIT ?", (slot, limit))
         return [self._deploy(row) for row in rows]
 
     def last_deploy(self, slot: str) -> Deploy | None:
-        row = self._one(
-            """
-            SELECT id, slot, sha, status, started, built, ended
-            FROM deploys WHERE slot = ? ORDER BY id DESC LIMIT 1
-            """,
-            (slot,),
-        )
+        row = self._one(_DEPLOY_SQL + " WHERE slot = ? ORDER BY id DESC LIMIT 1", (slot,))
         return None if row is None else self._deploy(row)
 
-    def list_experiments(self) -> list[Experiment]:
-        rows = self._all("SELECT id, title, body, created, updated FROM experiments ORDER BY id DESC")
-        found = [
-            Experiment(
-                int(row["id"]),
-                str(row["title"]),
-                str(row["body"]),
-                [],
-                str(row["created"]),
-                str(row["updated"]),
-            )
-            for row in rows
-        ]
-        self._attach_labels(found)
-        return found
-
-    def save_experiments(
-        self,
-        blocks: list[tuple[bool, int, str, str, list[Label]]],
-        drop: list[int],
-    ) -> list[Experiment]:
-        """blocks are (has_id, id, title, body, labels). Unknown ids stop the save."""
-
-        def run(db: sqlite3.Connection) -> list[Experiment]:
-            for has_id, exp_id, _title, _body, _labels in blocks:
-                if not has_id:
-                    continue
-                row = db.execute("SELECT COUNT(*) AS n FROM experiments WHERE id = ?", (exp_id,)).fetchone()
-                if row is None or int(row["n"]) == 0:
-                    raise YardError(
-                        404,
-                        "not_found",
-                        f"experiment does not exist: {exp_id}",
-                        context={"id": exp_id},
-                        help_text="Run yard exp to see the notes on this host.",
-                    )
-
-            stamp = now()
-            saved: list[Experiment] = []
-            for has_id, exp_id, title, body, labels in blocks:
-                if has_id:
-                    created_row = db.execute("SELECT created FROM experiments WHERE id = ?", (exp_id,)).fetchone()
-                    created = str(created_row["created"]) if created_row else stamp
-                    db.execute(
-                        "UPDATE experiments SET title = ?, body = ?, updated = ? WHERE id = ?",
-                        (title, body, stamp, exp_id),
-                    )
-                else:
-                    cur = db.execute(
-                        "INSERT INTO experiments (title, body, created, updated) VALUES (?, ?, ?, ?)",
-                        (title, body, stamp, stamp),
-                    )
-                    exp_id = int(cur.lastrowid or 0)
-                    created = stamp
-                db.execute("DELETE FROM exp_labels WHERE exp_id = ?", (exp_id,))
-                for label in labels:
-                    db.execute(
-                        "INSERT INTO exp_labels (exp_id, key, value) VALUES (?, ?, ?)",
-                        (exp_id, label.key, label.value),
-                    )
-                saved.append(Experiment(exp_id, title, body, list(labels), created, stamp))
-
-            # An id in this save stays, even when the editor also marked it deleted.
-            keep = {exp_id for has_id, exp_id, *_rest in blocks if has_id}
-            for exp_id in drop:
-                if exp_id in keep:
-                    continue
-                db.execute("DELETE FROM exp_labels WHERE exp_id = ?", (exp_id,))
-                db.execute("DELETE FROM experiments WHERE id = ?", (exp_id,))
-            return saved
-
-        with self._lock:
-            try:
-                saved = run(self._db)
-                self._db.commit()
-            except Exception:
-                self._db.rollback()
-                raise
-        return saved
-
-    def _attach_labels(self, experiments: list[Experiment]) -> None:
-        if not experiments:
-            return
-        by_id: dict[int, list[Label]] = {}
-        for row in self._all("SELECT exp_id, key, value FROM exp_labels ORDER BY exp_id, rowid"):
-            by_id.setdefault(int(row["exp_id"]), []).append(Label(str(row["key"]), str(row["value"])))
-        for exp in experiments:
-            exp.labels = by_id.get(exp.id, [])
-
     def _slot(self, row: sqlite3.Row) -> Slot:
-        raw = str(row["env_json"] or "{}")
-        env = json.loads(raw)
-        if not isinstance(env, dict):
-            env = {}
         return Slot(
             name=str(row["name"]),
             repo=str(row["repo"]),
@@ -755,27 +416,27 @@ class Store:
             directory=str(row["dir"]),
             domain=str(row["domain"]),
             live_image=str(row["live_image"]),
-            every=str(row["every"]),
-            env={str(key): str(value) for key, value in env.items()},
+            trigger=str(row["trigger"]),
             created=str(row["created"]),
         )
-
-    def _token(self, row: sqlite3.Row) -> Token:
-        return Token(str(row["name"]), str(row["parent"]), bool(row["revoked"]), str(row["created"]))
 
     def _deploy(self, row: sqlite3.Row) -> Deploy:
         return Deploy(
             int(row["id"]),
             str(row["slot"]),
             str(row["sha"]),
+            str(row["image"]),
             str(row["status"]),
             str(row["started"]),
             str(row["built"] or ""),
             str(row["ended"]),
+            str(row["log"] or ""),
         )
 
 
-_SLOT_SQL = "SELECT name, repo, ref, dir, domain, live_image, every, env_json, created FROM slots"
+# env_json stays in the table unread. The slot env is the file under env/.
+_SLOT_SQL = "SELECT name, repo, ref, dir, domain, live_image, trigger, created FROM slots"
+_DEPLOY_SQL = "SELECT id, slot, sha, image, status, started, built, ended, log FROM deploys"
 
 
 def _raise_integrity(exc: sqlite3.IntegrityError) -> NoReturn:
@@ -795,7 +456,7 @@ def _raise_integrity(exc: sqlite3.IntegrityError) -> NoReturn:
 def ensure_admin(store: Store, directory: Path) -> str:
     if store.list_tokens():
         return ""
-    plain = store.create_token("admin", "")
+    plain = store.create_token("admin")
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "admin.token"
     path.write_text(plain + "\n")

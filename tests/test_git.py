@@ -1,7 +1,7 @@
 import pytest
 
 from app.errors import YardError
-from app.gitcmd import prepare_git
+from app.git import prepare_git
 
 
 def test_log_is_allowed():
@@ -32,7 +32,13 @@ def test_fetch_uses_one_depth():
         ["branch", "feature"],
         ["remote", "add", "origin", "https://github.com/org/heldso"],
         ["log", "--output", "out.txt"],
+        ["log", "--output=out.txt"],
         ["gc", "--aggressive"],
+        ["fetch", "--upload-pack=x"],
+        ["log", "-c", "color.ui=always"],
+        ["log", "--git-dir=/etc"],
+        ["log", "--git-dir=x"],
+        ["log", "--", "/etc/passwd"],
     ],
 )
 def test_bare_repo_rejects_other_git_commands(args: list[str]):

@@ -1,11 +1,4 @@
-"""
-Yard.
-
-```bash
-STARIO_LOOP=uvloop python -m app.main
-uv run yard login --url http://127.0.0.1:8000 --token <token>
-```
-"""
+"""Yard. `python -m app.main` serves; `yard login --token <token>` talks to it."""
 
 from stario import App, Span, serve
 from stario.http.config import server_config_from_env

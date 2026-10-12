@@ -16,5 +16,6 @@ jobs:
           python-version: "3.14"
       - run: uv sync --extra server --locked
       - run: uv run ruff check app tests
+      - run: uv run ruff format --check app tests
       - run: uv run pyright
       - run: uv run pytest

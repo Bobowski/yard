@@ -3,15 +3,17 @@ FROM alpine:3.22
 ARG COMPOSE_VERSION=5.3.1
 ARG COMPOSE_SHA256=f9ebc6ebdb19d769b793c245a736caaeb198c62587f13b25c660c13b4987f959
 
+# wget stays: it downloads docker-compose here and it is the health probe in apply.sh.
 RUN apk add --no-cache ca-certificates wget \
     && wget -q -O /usr/local/bin/docker-compose \
         "https://github.com/docker/compose/releases/download/v${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
     && echo "${COMPOSE_SHA256}  /usr/local/bin/docker-compose" | sha256sum -c \
-    && chmod 755 /usr/local/bin/docker-compose \
-    && apk del wget
+    && chmod 755 /usr/local/bin/docker-compose
+
+ENV DOCKER_HOST=unix:///run/podman/podman.sock
 
 COPY apply.sh /usr/local/bin/apply
-COPY default.compose.yml /usr/local/share/yard/default.compose.yml
 RUN chmod 755 /usr/local/bin/apply
+COPY default.compose.yml /usr/local/share/yard/default.compose.yml
 
 ENTRYPOINT ["/usr/local/bin/apply"]

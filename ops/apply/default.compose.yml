@@ -1,4 +1,4 @@
-# A repo that has a Containerfile and no compose file.
+# A repo that has a Containerfile and no compose file. Yard uses this file as it is.
 services:
   app:
     build:
@@ -6,23 +6,22 @@ services:
       dockerfile: ${DOCKERFILE:-Containerfile}
     image: ${IMAGE}
     pull_policy: never
-    restart: ${RESTART:-always}
+    restart: always
     networks:
       yard:
         aliases:
           - ${SLOT_NAME}
-    labels:
-      yard.role: app
-      yard.slot: ${SLOT_NAME}
-      yard.service: app
-      yard.sha: ${SHA:-}
     volumes:
       - ${DATA_DIR}:/data
     env_file:
       - ${APP_ENV}
+    environment:
+      SLOT_NAME: ${SLOT_NAME}
+      SLOT_DATA_DIR: /data
+      SHA: ${SHA}
+      PORT: "8000"
     expose:
-      - "${PORT:-8000}"
-
+      - "8000"
 networks:
   yard:
     external: true

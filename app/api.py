@@ -1,222 +1,337 @@
-"""JSON API. Git smart HTTP sits beside it and uses basic auth."""
+"""The public HTTP API. Git smart HTTP sits beside it and uses basic auth."""
 
+import base64
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict
-from typing import cast
+from typing import Any, cast
 
 import stario.responses as responses
 from stario import App, Context, Handler, Middleware, Route, Writer
 from stario.responses import JsonValue
 
+from app import doctor, git, podman, prune, status
 from app.errors import YardError
-from app.podman import inspect_args
-from app.store import Experiment, Label
-from app.text import apply_slot_keys, slot_values
+from app.store import Slot
+from app.values import check_slot_name
 from app.yard import Yard
 
 
+async def health(_yard: Yard, _c: Context, w: Writer) -> None:
+    responses.empty(w, 200)
+
+
+async def serve_git(yard: Yard, c: Context, w: Writer) -> None:
+    password = _basic_password(c.req.headers.get("authorization") or "") or ""
+    token = yard.store.token_ok(password)
+    if token is None:
+        w.headers.set("www-authenticate", 'Basic realm="yard"')
+        responses.text(w, "unauthorized\n", 401)
+        return
+    await git.http_backend(yard.config.root, token.name, c, w)
+
+
+async def repos_list(yard: Yard, _c: Context, w: Writer) -> None:
+    responses.json(w, [asdict(repo) for repo in yard.store.list_repos()])
+
+
+async def repos_create(yard: Yard, c: Context, w: Writer) -> None:
+    body = await _object(c)
+    name = body.get("name", "")
+    force = body.get("force", False)
+    origin = body.get("origin", "")
+    if not isinstance(name, str) or not isinstance(force, bool) or not isinstance(origin, str):
+        raise YardError(
+            400,
+            "bad_json",
+            "bad json",
+            help_text="name is a string. force is true or false. origin is an http address.",
+        )
+    responses.json(w, await yard.create_repo(name, force, origin))
+
+
+async def repos_delete(yard: Yard, c: Context, w: Writer) -> None:
+    name = c.match.params["name"]
+    yard.delete_repo(name)
+    responses.json(w, {"name": name})
+
+
+async def repos_git(yard: Yard, c: Context, w: Writer) -> None:
+    body = await _object(c)
+    args = body.get("args")
+    if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+        raise YardError(
+            400,
+            "bad_json",
+            "bad json",
+            help_text="args is a list of strings.",
+            example='{"args": ["log", "-1"]}',
+        )
+    responses.json(w, await yard.git_repo(c.match.params["name"], args))
+
+
+async def host_status(yard: Yard, c: Context, w: Writer) -> None:
+    responses.json(w, await status.report(yard, c.req.query.get("running") == "1"))
+
+
+async def slots_list(yard: Yard, _c: Context, w: Writer) -> None:
+    # The list carries no env; secrets show only on the single GET.
+    responses.json(w, [status.slot_json(slot) for slot in yard.store.list_slots()])
+
+
+def _slot_with_env(yard: Yard, slot: Slot) -> dict[str, Any]:
+    return {**status.slot_json(slot), "env": yard.read_env(slot.name)}
+
+
+async def slots_create(yard: Yard, c: Context, w: Writer) -> None:
+    body = await _object(c)
+    fields = _slot_fields(body)
+    name = body.get("name", "")
+    repo = body.get("repo", "")
+    if not isinstance(name, str) or not isinstance(repo, str):
+        raise YardError(
+            400,
+            "bad_json",
+            "bad json",
+            help_text="name and repo are strings.",
+        )
+    if not name.strip():
+        raise YardError(
+            400,
+            "bad_json",
+            "name is required",
+            context={"field": "name"},
+            help_text="A slot name uses lowercase letters, digits, and -",
+            example="staging",
+        )
+    if not repo.strip():
+        raise YardError(
+            400,
+            "bad_json",
+            "repo is required",
+            context={"field": "repo"},
+            help_text="Run yard repo list for the names.",
+        )
+    slot, outcome = await yard.create_slot(name, repo, **cast(dict[str, Any], fields))
+    responses.json(
+        w,
+        cast(JsonValue, {"slot": _slot_with_env(yard, slot), "deploy": asdict(outcome)}),
+    )
+
+
+async def slots_get(yard: Yard, c: Context, w: Writer) -> None:
+    name = c.match.params["name"]
+    responses.json(w, cast(JsonValue, _slot_with_env(yard, yard.store.slot(name))))
+
+
+async def slots_patch(yard: Yard, c: Context, w: Writer) -> None:
+    name = c.match.params["name"]
+    fields = _slot_fields(await _object(c))
+    if not fields:
+        raise YardError(
+            400,
+            "bad_json",
+            "nothing to change",
+            help_text="Set one of ref, dir, domain, trigger, or env.",
+        )
+    slot, outcome = await yard.update_slot(name, **cast(dict[str, Any], fields))
+    responses.json(
+        w,
+        cast(
+            JsonValue,
+            {
+                "slot": _slot_with_env(yard, slot),
+                "deploy": asdict(outcome) if outcome is not None else None,
+            },
+        ),
+    )
+
+
+async def slots_delete(yard: Yard, c: Context, w: Writer) -> None:
+    name = c.match.params["name"]
+    await yard.delete_slot(name)
+    responses.json(w, {"name": name})
+
+
+async def slot_run(yard: Yard, c: Context, w: Writer) -> None:
+    name = c.match.params["name"]
+    responses.json(w, cast(JsonValue, {"output": await yard.run_slot(name)}))
+
+
+async def slot_deploy(yard: Yard, c: Context, w: Writer) -> None:
+    name = c.match.params["name"]
+    slot = yard.store.slot(name)
+    body = await _object(c)
+    sha = body.get("sha", "")
+    if not isinstance(sha, str):
+        raise YardError(400, "bad_json", "bad json", help_text="sha is a string.")
+    outcome = await yard.deploy_ref(slot, sha)
+    responses.json(
+        w,
+        cast(
+            JsonValue,
+            {
+                "slot": _slot_with_env(yard, yard.store.slot(name)),
+                "deploy": asdict(outcome),
+            },
+        ),
+    )
+
+
+async def deploys(yard: Yard, c: Context, w: Writer) -> None:
+    name = c.match.params["name"]
+    yard.store.slot(name)
+    limit = c.req.query.get("limit") or "0"
+    rows = yard.store.list_deploys(name, int(limit) if limit.isdigit() else 0)
+    responses.json(w, [asdict(row) for row in rows])
+
+
+async def deploy(yard: Yard, c: Context, w: Writer) -> None:
+    name = c.match.params["name"]
+    yard.store.slot(name)
+    raw = c.match.params["id"]
+    if not raw.isdigit():
+        raise YardError(
+            400,
+            "bad_id",
+            "deploy id must be a number",
+            help_text="The id is the number from yard deploys <name>.",
+        )
+    row = yard.store.deploy(int(raw))
+    if row.slot != name:
+        raise YardError(404, "not_found", "deploy does not exist")
+    responses.json(w, asdict(row))
+
+
+async def logs(yard: Yard, c: Context, w: Writer) -> None:
+    slot, role, service, tail, cursor = _log_filters(c)
+    if c.req.query.get("follow") == "1":
+        await _follow(yard, w, slot, role, service, tail, cursor)
+        return
+    responses.json(w, await status.log_page(yard, slot, role, service, tail, cursor))
+
+
+async def container_logs(yard: Yard, c: Context, w: Writer) -> None:
+    name = c.match.params["name"]
+    tail, cursor = _tail(c), c.req.query.get("cursor") or ""
+    podman.check_name(name)
+    if c.req.query.get("follow") == "1":
+        await _stream_logs(yard, w, _follow_args(name, tail, cursor))
+        return
+    responses.json(w, await status.log_text(yard, [("", name)], tail, cursor))
+
+
+async def inspect(yard: Yard, c: Context, w: Writer) -> None:
+    name = c.match.params["name"]
+    podman.check_name(name)
+    text = await yard.podman.run("inspect", "--format", "json", name)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    responses.text(w, text)
+
+
+async def run_prune(yard: Yard, c: Context, w: Writer) -> None:
+    body = await _object(c)
+    days = body.get("days", 7)
+    dry = body.get("dry", False)
+    if not isinstance(days, int) or isinstance(days, bool) or days < 1 or not isinstance(dry, bool):
+        raise YardError(
+            400,
+            "bad_json",
+            "bad json",
+            help_text="days is a number 1 or more. dry is true or false.",
+            example='{"days": 7, "dry": false}',
+        )
+    responses.json(w, cast(JsonValue, await prune.run(yard, days, dry)))
+
+
+async def slots_status(yard: Yard, c: Context, w: Writer) -> None:
+    responses.json(w, await status.slot_report(yard, c.match.params["name"]))
+
+
+async def doctor_run(yard: Yard, _c: Context, w: Writer) -> None:
+    responses.json(w, cast(JsonValue, await doctor.run(yard)))
+
+
+async def tokens_list(yard: Yard, _c: Context, w: Writer) -> None:
+    responses.json(w, [asdict(token) for token in yard.store.list_tokens()])
+
+
+async def tokens_create(yard: Yard, c: Context, w: Writer) -> None:
+    body = await _object(c)
+    name = body.get("name", "")
+    if not isinstance(name, str) or not name:
+        raise YardError(400, "bad_json", "bad json", help_text="name is a string.")
+    plain = yard.store.create_token(name)
+    responses.json(w, {"name": name, "token": plain})
+
+
+async def tokens_delete(yard: Yard, c: Context, w: Writer) -> None:
+    name = c.match.params["name"]
+    actor = str(c.state.get("actor") or "")
+    if actor == name:
+        raise YardError(
+            403,
+            "forbidden",
+            "you cannot delete your own token",
+            context={"name": name},
+            help_text="Use another token to remove this one.",
+        )
+    yard.store.delete_token(name)
+    responses.json(w, {"name": name})
+
+
+async def hook(yard: Yard, c: Context, w: Writer) -> None:
+    body = await _object(c)
+    repo, new, ref = body.get("repo", ""), body.get("new", ""), body.get("ref", "")
+    if not all(isinstance(item, str) for item in (repo, new, ref)):
+        raise YardError(
+            400,
+            "bad_json",
+            "bad json",
+            help_text="repo, new, and ref are strings.",
+        )
+    code, text = await yard.hook_push(repo, new, ref)
+    responses.text(w, text, code)
+
+
+def _h(fn: Callable[[Yard, Context, Writer], Awaitable[None]], yard: Yard) -> Handler:
+    return lambda c, w: fn(yard, c, w)
+
+
 def register_api(app: App, yard: Yard) -> None:
-    async def health(_c: Context, w: Writer) -> None:
-        responses.empty(w, 200)
-
-    app.add(Route("GET /health"), health)
-    app.add(Route("GET /git/{path...}"), yard.serve_git)
-    app.add(Route("POST /git/{path...}"), yard.serve_git)
-
     auth = (_bearer(yard),)
-
-    async def repos_list(_c: Context, w: Writer) -> None:
-        responses.json(w, [asdict(repo) for repo in yard.store.list_repos()])
-
-    async def repos_create(c: Context, w: Writer) -> None:
-        body = await _object(c)
-        name = body.get("name", "")
-        force = body.get("force", False)
-        origin = body.get("origin", "")
-        if not isinstance(name, str) or not isinstance(force, bool) or not isinstance(origin, str):
-            raise YardError(
-                400,
-                "bad_json",
-                "bad json",
-                help_text="name is a string. force is true or false. origin is an http address.",
-            )
-        responses.json(w, await yard.create_repo(name, force, origin))
-
-    async def repos_delete(c: Context, w: Writer) -> None:
-        name = c.match.params["name"]
-        yard.delete_repo(name)
-        responses.json(w, {"name": name})
-
-    app.add(Route("GET /api/v1/repos"), repos_list, middleware=auth)
-
-    async def repos_git(c: Context, w: Writer) -> None:
-        body = await _object(c)
-        args = body.get("args")
-        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
-            raise YardError(
-                400,
-                "bad_json",
-                "bad json",
-                help_text="args is a list of strings.",
-                example='{"args": ["log", "-1"]}',
-            )
-        responses.json(w, await yard.git_repo(c.match.params["name"], args))
-
-    app.add(Route("POST /api/v1/repos"), repos_create, middleware=auth)
-    app.add(Route("POST /api/v1/repos/{name}/git"), repos_git, middleware=auth)
-    app.add(Route("DELETE /api/v1/repos/{name}"), repos_delete, middleware=auth)
-
-    async def slots_list(c: Context, w: Writer) -> None:
-        responses.json(w, await yard.list_rows(c.req.query.get("running") == "1"))
-
-    async def slots_create(c: Context, w: Writer) -> None:
-        slot, warn, note = await yard.create_slot(_string_map(await _object(c)))
-        responses.json(w, cast(JsonValue, {"values": slot_values(slot), "warnings": warn, "deploy": note}))
-
-    async def slots_get(c: Context, w: Writer) -> None:
-        responses.json(w, cast(JsonValue, slot_values(yard.store.slot(c.match.params["name"]))))
-
-    async def slots_put(c: Context, w: Writer) -> None:
-        name = c.match.params["name"]
-        edit = apply_slot_keys(yard.store.slot(name), _string_map(await _object(c)))
-        slot, note = await yard.update_slot(name, edit)
-        body: dict[str, JsonValue] = {"values": slot_values(slot), "warnings": edit.warn}
-        if note is not None:
-            body["deploy"] = note
-        responses.json(w, cast(JsonValue, body))
-
-    async def slots_delete(c: Context, w: Writer) -> None:
-        name = c.match.params["name"]
-        await yard.delete_slot(name)
-        responses.json(w, {"name": name})
-
-    async def logs(c: Context, w: Writer) -> None:
-        slot, role, service, sha, tail, cursor = _log_filters(c)
-        if c.req.query.get("follow") == "1":
-            await _follow(yard, w, slot, role, service, sha, tail, cursor)
-            return
-        responses.json(w, await yard.log_page(slot, role, service, sha, tail, cursor))
-
-    async def container_logs(c: Context, w: Writer) -> None:
-        name = c.match.params["name"]
-        tail, cursor = _tail(c), c.req.query.get("cursor") or ""
-        if c.req.query.get("follow") == "1":
-            inspect_args(name)
-            await _stream_logs(yard, w, _follow_args(name, tail, cursor))
-            return
-        responses.json(w, await yard.container_log_page(name, tail, cursor))
-
-    async def slot_deploy(c: Context, w: Writer) -> None:
-        name = c.match.params["name"]
-        note = await yard.deploy_existing(yard.store.slot(name))
-        responses.json(w, cast(JsonValue, note))
-
-    async def deploys(c: Context, w: Writer) -> None:
-        name = c.match.params["name"]
-        yard.store.slot(name)
-        limit = c.req.query.get("limit") or "0"
-        rows = yard.store.list_deploys(name, int(limit) if limit.isdigit() else 0)
-        responses.json(w, [asdict(row) for row in rows])
-
-    async def deploy(c: Context, w: Writer) -> None:
-        name = c.match.params["name"]
-        yard.store.slot(name)
-        raw = c.match.params["id"]
-        if not raw.isdigit():
-            raise YardError(
-                400,
-                "bad_id",
-                "deploy id must be a number",
-                help_text="The id is the number from yard deploys <name>.",
-            )
-
-        row = yard.store.deploy(int(raw))
-        if row.slot != name:
-            raise YardError(404, "not_found", "deploy does not exist")
-        responses.json(w, asdict(row))
-
-    async def inspect(c: Context, w: Writer) -> None:
-        text = await yard.podman.run(*inspect_args(c.match.params["name"]))
-        if text and not text.endswith("\n"):
-            text += "\n"
-        responses.text(w, text)
-
-    app.add(Route("GET /api/v1/slots"), slots_list, middleware=auth)
-    app.add(Route("POST /api/v1/slots"), slots_create, middleware=auth)
-    app.add(Route("GET /api/v1/slots/{name}"), slots_get, middleware=auth)
-    app.add(Route("PUT /api/v1/slots/{name}"), slots_put, middleware=auth)
-    app.add(Route("DELETE /api/v1/slots/{name}"), slots_delete, middleware=auth)
-    app.add(Route("POST /api/v1/slots/{name}/deploy"), slot_deploy, middleware=auth)
-    app.add(Route("GET /api/v1/logs"), logs, middleware=auth)
-    app.add(Route("GET /api/v1/containers/{name}/logs"), container_logs, middleware=auth)
-    app.add(Route("GET /api/v1/slots/{name}/deploys"), deploys, middleware=auth)
-    app.add(Route("GET /api/v1/slots/{name}/deploys/{id}"), deploy, middleware=auth)
-    app.add(Route("GET /api/v1/containers/{name}"), inspect, middleware=auth)
-
-    async def tokens_list(_c: Context, w: Writer) -> None:
-        responses.json(w, [asdict(token) for token in yard.store.list_tokens()])
-
-    async def tokens_create(c: Context, w: Writer) -> None:
-        body = await _object(c)
-        name = body.get("name", "")
-        if not isinstance(name, str):
-            raise YardError(400, "bad_json", "bad json", help_text="name is a string.")
-        actor = str(c.state.get("actor") or "")
-        plain = yard.store.create_token(name, actor)
-        responses.json(w, {"name": name, "token": plain, "parent": actor})
-
-    async def tokens_delete(c: Context, w: Writer) -> None:
-        name = c.match.params["name"]
-        yard.store.revoke_token(str(c.state.get("actor") or ""), name)
-        responses.json(w, {"name": name})
-
-    app.add(Route("GET /api/v1/tokens"), tokens_list, middleware=auth)
-    app.add(Route("POST /api/v1/tokens"), tokens_create, middleware=auth)
-    app.add(Route("DELETE /api/v1/tokens/{name}"), tokens_delete, middleware=auth)
-
-    async def experiments_list(c: Context, w: Writer) -> None:
-        rows = _filter_exps(yard.store.list_experiments(), c.req.query.items())
-        responses.json(w, [asdict(row) for row in rows])
-
-    async def experiments_create(c: Context, w: Writer) -> None:
-        title, body, labels = await _exp_body(c)
-        saved = yard.store.save_experiments([(False, 0, title, body, labels)], [])
-        responses.json(w, asdict(saved[0]))
-
-    async def experiments_get(c: Context, w: Writer) -> None:
-        responses.json(w, asdict(_one_exp(yard, c.match.params["id"])))
-
-    async def experiments_put(c: Context, w: Writer) -> None:
-        exp = _one_exp(yard, c.match.params["id"])
-        title, body, labels = await _exp_body(c)
-        saved = yard.store.save_experiments([(True, exp.id, title, body, labels)], [])
-        responses.json(w, asdict(saved[0]))
-
-    async def experiments_delete(c: Context, w: Writer) -> None:
-        exp = _one_exp(yard, c.match.params["id"])
-        yard.store.save_experiments([], [exp.id])
-        responses.json(w, {"id": exp.id})
-
-    app.add(Route("GET /api/v1/experiments"), experiments_list, middleware=auth)
-    app.add(Route("POST /api/v1/experiments"), experiments_create, middleware=auth)
-    app.add(Route("GET /api/v1/experiments/{id}"), experiments_get, middleware=auth)
-    app.add(Route("PUT /api/v1/experiments/{id}"), experiments_put, middleware=auth)
-    app.add(Route("DELETE /api/v1/experiments/{id}"), experiments_delete, middleware=auth)
-
-    async def hook(c: Context, w: Writer) -> None:
-        body = await _object(c)
-        repo, new, ref = body.get("repo", ""), body.get("new", ""), body.get("ref", "")
-        if not all(isinstance(item, str) for item in (repo, new, ref)):
-            raise YardError(
-                400,
-                "bad_json",
-                "bad json",
-                help_text="repo, new, and ref are strings.",
-            )
-        status, text = await yard.hook_push(repo, new, ref)
-        responses.text(w, text, status)
-
-    app.add(Route("POST /api/v1/hooks/push"), hook, middleware=(_local(), *auth))
+    routes = [
+        (Route("GET /health"), health, ()),
+        (Route("GET /git/{path...}"), serve_git, ()),
+        (Route("POST /git/{path...}"), serve_git, ()),
+        (Route("GET /api/v1/repos"), repos_list, auth),
+        (Route("POST /api/v1/repos"), repos_create, auth),
+        (Route("DELETE /api/v1/repos/{name}"), repos_delete, auth),
+        (Route("POST /api/v1/repos/{name}/git"), repos_git, auth),
+        (Route("GET /api/v1/status"), host_status, auth),
+        (Route("GET /api/v1/slots"), slots_list, auth),
+        (Route("POST /api/v1/slots"), slots_create, auth),
+        (Route("GET /api/v1/doctor"), doctor_run, auth),
+        (Route("GET /api/v1/slots/{name}/status"), slots_status, auth),
+        (Route("GET /api/v1/slots/{name}"), slots_get, auth),
+        (Route("PATCH /api/v1/slots/{name}"), slots_patch, auth),
+        (Route("DELETE /api/v1/slots/{name}"), slots_delete, auth),
+        (Route("POST /api/v1/slots/{name}/deploy"), slot_deploy, auth),
+        (Route("POST /api/v1/slots/{name}/run"), slot_run, auth),
+        (Route("GET /api/v1/logs"), logs, auth),
+        (Route("GET /api/v1/containers/{name}/logs"), container_logs, auth),
+        (Route("GET /api/v1/slots/{name}/deploys"), deploys, auth),
+        (Route("GET /api/v1/slots/{name}/deploys/{id}"), deploy, auth),
+        (Route("GET /api/v1/containers/{name}"), inspect, auth),
+        (Route("POST /api/v1/prune"), run_prune, auth),
+        (Route("GET /api/v1/tokens"), tokens_list, auth),
+        (Route("POST /api/v1/tokens"), tokens_create, auth),
+        (Route("DELETE /api/v1/tokens/{name}"), tokens_delete, auth),
+        (Route("POST /api/v1/hooks/push"), hook, (_local(), *auth)),
+    ]
+    for route, fn, middleware in routes:
+        app.add(route, _h(fn, yard), middleware=middleware)
 
 
 def _local() -> Middleware:
@@ -299,21 +414,23 @@ def _tail(c: Context) -> int:
     return int(text)
 
 
-def _log_filters(c: Context) -> tuple[str, str, str, str, int, str]:
+def _log_filters(c: Context) -> tuple[str, str, str, int, str]:
     role = c.req.query.get("role") or ""
-    if role and role not in {"app", "deploy", "revert", "job"}:
+    if role and role not in {"app", "deploy", "job"}:
         raise YardError(
             400,
             "bad_role",
-            "role must be app, deploy, revert, or job",
+            "role must be app, deploy, or job",
             help_text="An empty role reads app.",
             example="yard logs --role deploy",
         )
+    slot = c.req.query.get("slot") or ""
+    if slot:
+        check_slot_name(slot)
     return (
-        c.req.query.get("slot") or "",
+        slot,
         role,
         c.req.query.get("service") or "",
-        c.req.query.get("sha") or "",
         _tail(c),
         c.req.query.get("cursor") or "",
     )
@@ -325,17 +442,16 @@ async def _follow(
     slot: str,
     role: str,
     service: str,
-    sha: str,
     tail: int,
     cursor: str,
 ) -> None:
-    targets = await yard.log_targets(slot, role, service, sha)
+    targets = await status.log_targets(yard, slot, role, service)
     if len(targets) != 1:
         raise YardError(
             400,
             "many_services",
             "name one container to follow" if targets else "no container matches",
-            help_text="Add --slot, --service, or --sha until one container matches.",
+            help_text="Add --slot or --service until one container matches.",
             example="yard logs --slot heldso --follow",
         )
     await _stream_logs(yard, w, _follow_args(targets[0][1], tail, cursor))
@@ -366,8 +482,10 @@ async def _stream_logs(yard: Yard, w: Writer, args: list[str]) -> None:
 
 async def _object(c: Context) -> dict:
     raw = await c.req.body()
+    if not raw or not raw.strip():
+        return {}
     try:
-        body = json.loads(raw) if raw else None
+        body = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise YardError(400, "bad_json", "bad json", help_text="Send one JSON object.") from exc
     if not isinstance(body, dict):
@@ -375,72 +493,32 @@ async def _object(c: Context) -> dict:
     return body
 
 
-def _string_map(body: dict) -> dict[str, str]:
-    found: dict[str, str] = {}
-    for key, value in body.items():
-        if not isinstance(key, str) or not isinstance(value, str):
-            raise YardError(400, "bad_json", "bad json", help_text="Every slot field is a string.")
-        found[key] = value
-    return found
-
-
-def _one_exp(yard: Yard, raw: str) -> Experiment:
-    if not raw.isdigit() or int(raw) <= 0:
-        raise YardError(
-            400,
-            "bad_id",
-            "experiment id must be a number",
-            help_text="The id is the number from yard exp.",
-        )
-    exp_id = int(raw)
-    for exp in yard.store.list_experiments():
-        if exp.id == exp_id:
-            return exp
-    raise YardError(
-        404,
-        "not_found",
-        "experiment does not exist",
-        context={"id": exp_id},
-        help_text="Run yard exp to see the notes on this host.",
-    )
-
-
-async def _exp_body(c: Context) -> tuple[str, str, list[Label]]:
-    body = await _object(c)
-    title = body.get("title", "")
-    text = body.get("body", "")
-    labels = body.get("labels", [])
-    if not isinstance(title, str) or not isinstance(text, str) or not isinstance(labels, list):
-        raise YardError(
-            400,
-            "bad_json",
-            "bad json",
-            help_text="title and body are strings. labels is a list of {key, value}.",
-        )
-    if not title.strip():
-        raise YardError(400, "bad_title", "a title is required", help_text="The first line of a note is a title.")
-    parsed: list[Label] = []
-    for item in labels:
-        if not isinstance(item, dict) or not isinstance(item.get("key"), str) or not isinstance(item.get("value"), str):
-            raise YardError(400, "bad_json", "bad json", help_text="A label is {key, value}, and both are strings.")
-        parsed.append(Label(item["key"], item["value"]))
-    return title.strip(), text, parsed
-
-
-def _filter_exps(rows: list[Experiment], pairs: list[tuple[str, str]]) -> list[Experiment]:
-    want: dict[str, list[str]] = {}
-    for key, value in pairs:
-        if key == "id" or not value:
+def _slot_fields(body: dict) -> dict[str, str | bool | dict[str, str]]:
+    """The fields a slot PATCH or POST takes. dir maps to the directory column."""
+    fields: dict[str, str | bool | dict[str, str]] = {}
+    for key in ("ref", "dir", "domain", "trigger"):
+        if key not in body:
             continue
-        want.setdefault(key, []).append(value)
-    if not want:
-        return rows
+        value = body[key]
+        if not isinstance(value, str):
+            raise YardError(400, "bad_json", "bad json", help_text=f"{key} is a string.")
+        fields["directory" if key == "dir" else key] = value
+    if "env" in body:
+        env = body["env"]
+        if not isinstance(env, dict) or not all(
+            isinstance(key, str) and isinstance(value, str) for key, value in env.items()
+        ):
+            raise YardError(400, "bad_json", "bad json", help_text="env is an object of strings.")
+        fields["env"] = dict(env)
+    return fields
 
-    def matches(exp: Experiment) -> bool:
-        for key, values in want.items():
-            for value in values:
-                if not any(label.key == key and label.value == value for label in exp.labels):
-                    return False
-        return True
 
-    return [row for row in rows if matches(row)]
+def _basic_password(header: str) -> str | None:
+    if not header.lower().startswith("basic "):
+        return None
+    try:
+        raw = base64.b64decode(header.split(" ", 1)[1].strip()).decode()
+    except Exception:
+        return None
+    _user, sep, password = raw.partition(":")
+    return password if sep else None

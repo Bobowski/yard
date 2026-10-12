@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.values import slug
+
 
 def hook_url(host: str, port: str) -> str:
     if host in {"0.0.0.0", "::"}:
@@ -30,6 +32,19 @@ class Config:
     @property
     def token_file(self) -> Path:
         return self.data_dir / "admin.token"
+
+    def repo(self, name: str) -> Path:
+        return self.root / "repos" / f"{name}.git"
+
+    def data(self, slot: str) -> Path:
+        return self.root / "data" / slot
+
+    def env(self, slot: str) -> Path:
+        return self.root / "env" / f"{slot}.env"
+
+    def checkout(self, repo: str, directory: str, sha: str) -> Path:
+        name = sha if not directory else f"{sha}-{slug(directory)}"
+        return self.root / "checkouts" / repo / name
 
     @classmethod
     def from_env(cls) -> Config:
