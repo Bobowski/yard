@@ -199,6 +199,11 @@ def image_sha(image: str) -> str:
     return tail if head and tail else ""
 
 
+def short_sha(sha: str) -> str:
+    """The image tag and checkout name. Twelve chars, the docker convention."""
+    return sha[:12]
+
+
 def slug(directory: str) -> str:
     return directory.lower().replace("/", "-").replace("_", "-").replace(".", "-")
 

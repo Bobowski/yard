@@ -311,8 +311,10 @@ run_yard git -C "$repo" fetch origin || die "Could not fetch origin." \
   "Hint: git -C ${repo} remote -v" \
   "Context: fetch failed for user yard."
 sha="$(run_yard git -C "$repo" rev-parse refs/remotes/origin/main)"
+# The image tag and the checkout leaf use the same twelve chars, like config.checkout.
+short="$(printf '%s' "$sha" | cut -c1-12)"
 
-src="$root/checkouts/yard/$sha"
+src="$root/checkouts/yard/$short"
 if [ ! -d "$src" ]; then
   mkdir -p "$src.tmp"
   run_yard git -C "$repo" archive "$sha" | tar -x -C "$src.tmp" || die "Could not extract ${sha}." \
@@ -338,7 +340,7 @@ run_yard podman run --replace --name yard-apply-yard --network yard \
   -v "$sock:/run/podman/podman.sock" -v "$root:$root" \
   -e COMPOSE_PROJECT_NAME=yard -e COMPOSE_FILE="$src/ops/compose.yml" -e PREVIOUS= \
   -e APP_ENV="$root/env/yard.env" -e CHECKOUT="$src" -e DATA_DIR="$root/data/yard" \
-  -e IMAGE="localhost/yard:$sha" -e SHA="$sha" -e SLOT_NAME=yard \
+  -e IMAGE="localhost/yard:$short" -e SHA="$sha" -e SLOT_NAME=yard \
   -e YARD_ROOT="$root" -e YARD_PODMAN_SOCK="$sock" \
   localhost/yard-apply up || die "The first deploy failed." "Hint: podman logs yard-apply-yard"
 

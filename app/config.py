@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.values import slug
+from app.values import short_sha, slug
 
 
 def hook_url(host: str, port: str) -> str:
@@ -43,7 +43,8 @@ class Config:
         return self.root / "env" / f"{slot}.env"
 
     def checkout(self, repo: str, directory: str, sha: str) -> Path:
-        name = sha if not directory else f"{sha}-{slug(directory)}"
+        # The leaf matches the image tag, so a live image maps back to its checkout.
+        name = short_sha(sha) if not directory else f"{short_sha(sha)}-{slug(directory)}"
         return self.root / "checkouts" / repo / name
 
     @classmethod

@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from app.errors import YardError
 from app.store import Slot
-from app.values import image_sha, slug
+from app.values import image_sha, short_sha, slug
 
 if TYPE_CHECKING:
     from app.config import Config
@@ -25,9 +25,10 @@ DOCKERFILES = ("Containerfile", "Dockerfile", "ops/Containerfile", "ops/Dockerfi
 
 
 def image_tag(repo: str, directory: str, sha: str) -> str:
+    tag = short_sha(sha)
     if not directory:
-        return f"localhost/{repo}:{sha}"
-    return f"localhost/{repo}-{slug(directory)}:{sha}"
+        return f"localhost/{repo}:{tag}"
+    return f"localhost/{repo}-{slug(directory)}:{tag}"
 
 
 @dataclass(slots=True)
