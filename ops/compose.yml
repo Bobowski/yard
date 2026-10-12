@@ -8,9 +8,6 @@ services:
       dockerfile: ops/Containerfile
     container_name: yard
     restart: always
-    depends_on:
-      reset:
-        condition: service_healthy
     networks:
       yard:
         aliases:
@@ -44,39 +41,10 @@ services:
       retries: 30
       start_period: 15s
 
-  reset:
-    image: ghcr.io/bobowski/yard:latest
-    pull_policy: never
-    network_mode: none
-    restart: "no"
-    volumes:
-      - ${YARD_PODMAN_SOCK}:/run/podman/podman.sock
-      - ${YARD_ROOT}:${YARD_ROOT}
-      - ${CHECKOUT}/ops/reset.py:/reset.py:ro
-    environment:
-      CONTAINER_HOST: unix:///run/podman/podman.sock
-      YARD_ROOT: ${YARD_ROOT}
-    entrypoint: ["/workspace/.venv/bin/python", "/reset.py"]
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "/workspace/.venv/bin/python",
-          "-c",
-          "import os, sys; sys.exit(0 if os.path.isfile('/tmp/ready') else 1)",
-        ]
-      interval: 2s
-      timeout: 3s
-      retries: 40
-      start_period: 2s
-
   caddy:
     image: docker.io/library/caddy:2
     container_name: caddy
     restart: always
-    depends_on:
-      reset:
-        condition: service_healthy
     networks:
       - yard
     ports:
