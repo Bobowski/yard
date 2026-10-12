@@ -28,14 +28,9 @@ services:
       YARD_ROOT: ${YARD_ROOT}
       YARD_PODMAN_SOCK: ${YARD_PODMAN_SOCK}
       CONTAINER_HOST: unix:///run/podman/podman.sock
+    # Podman joins a CMD healthcheck through a shell, so no semicolons. curl is in the image.
     healthcheck:
-      test:
-        [
-          "CMD",
-          "/workspace/.venv/bin/python",
-          "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()",
-        ]
+      test: ["CMD", "curl", "-fsS", "-m", "3", "http://127.0.0.1:8000/health"]
       interval: 2s
       timeout: 5s
       retries: 30
