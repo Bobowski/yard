@@ -30,7 +30,7 @@ def test_fetch_uses_one_depth():
         ["config", "user.name"],
         ["update-ref", "refs/heads/main", "abc"],
         ["branch", "feature"],
-        ["remote", "add", "origin", "https://github.com/org/heldso"],
+        ["remote", "add", "upstream", "https://github.com/org/heldso"],
         ["log", "--output", "out.txt"],
         ["log", "--output=out.txt"],
         ["gc", "--aggressive"],
@@ -56,3 +56,8 @@ def test_branch_delete_is_recorded():
 def test_remote_set_url_keeps_an_http_address():
     call = prepare_git(["remote", "set-url", "origin", "https://github.com/org/heldso"])
     assert call.argv[-1] == "https://github.com/org/heldso"
+
+
+def test_remote_add_origin_keeps_an_http_address():
+    call = prepare_git(["remote", "add", "origin", "https://github.com/org/heldso"])
+    assert call.argv == ["remote", "add", "origin", "https://github.com/org/heldso"]

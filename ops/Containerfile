@@ -50,6 +50,11 @@ COPY --from=tools /out/lib/x86_64-linux-gnu/libpcre2-8.so.0 /lib/x86_64-linux-gn
 COPY --from=builder /workspace/.venv /workspace/.venv
 COPY --from=builder /workspace/ops/apply /usr/local/share/yard/apply
 
+# The git copied above has no HTTPS helper. A fetch from GitHub needs one.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
 ENV PYTHONUNBUFFERED=1 \
     CONTAINER_HOST=unix:///run/podman/podman.sock \
     GIT_EXEC_PATH=/usr/lib/git-core \

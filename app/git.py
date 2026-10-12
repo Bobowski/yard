@@ -444,8 +444,8 @@ def prepare_git(args: list[str]) -> GitCall:
     if command == "remote":
         if not rest or rest == ["-v"]:
             return GitCall(["remote", *rest])
-        if len(rest) == 3 and rest[0] == "set-url" and rest[1] == "origin":
-            return GitCall(["remote", "set-url", "origin", check_origin(rest[2])])
+        if len(rest) == 3 and rest[0] in ("add", "set-url") and rest[1] == "origin":
+            return GitCall(["remote", rest[0], "origin", check_origin(rest[2])])
         _bad_args("yard git heldso remote set-url origin https://github.com/org/heldso")
     for arg in rest:
         if arg in _FLAGS or _FLAG_WITH_VALUE.match(arg):
