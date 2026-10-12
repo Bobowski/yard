@@ -48,7 +48,8 @@ services:
       - ${YARD_ROOT}/data/caddy:/config/caddy
       - ${YARD_ROOT}/data/caddy/lib:/data
       - ${YARD_ROOT}/run:/run/caddy
-      - ${CHECKOUT}/ops/caddy.json:/etc/caddy/caddy.json:ro
+      # A stable path: mounting from CHECKOUT would recreate caddy on every deploy.
+      - ${YARD_ROOT}/run/caddy.json:/etc/caddy/caddy.json:ro
     entrypoint: ["caddy"]
     # --resume prefers the autosave Yard pushes; the file is the first start.
     command: ["run", "--config", "/etc/caddy/caddy.json", "--resume"]

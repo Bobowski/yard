@@ -40,6 +40,14 @@ revert() {
 
 up() {
   build
+
+  # Caddy's seed file lives on a stable path so compose leaves caddy alone;
+  # the running config comes from the admin socket and autosave anyway.
+  if [ -n "${YARD_ROOT:-}" ] && [ -f "$CHECKOUT/ops/caddy.json" ]; then
+    mkdir -p "$YARD_ROOT/run"
+    cp "$CHECKOUT/ops/caddy.json" "$YARD_ROOT/run/caddy.json"
+  fi
+
   echo "== start $IMAGE"
   dc up -d --wait --remove-orphans --no-build || revert
 
