@@ -50,12 +50,17 @@ COPY --from=tools /out/lib/x86_64-linux-gnu/libpcre2-8.so.0 /lib/x86_64-linux-gn
 COPY --from=builder /workspace/.venv /workspace/.venv
 COPY --from=builder /workspace/ops/apply /usr/local/share/yard/apply
 
+# staryard is a virtual package (tool.uv package = false), so uv sync installs
+# deps only. The image ships the source directory and resolves it by path.
+COPY app/ /workspace/app/
+
 # The git copied above has no HTTPS helper. A fetch from GitHub needs one.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends git ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/workspace \
     CONTAINER_HOST=unix:///run/podman/podman.sock \
     GIT_EXEC_PATH=/usr/lib/git-core \
     STARIO_HOST=0.0.0.0 \
