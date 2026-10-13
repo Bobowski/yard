@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1
+
+Formatting only. `app/api.py` and `app/git.py` are reformatted under the locked ruff 0.17 so CI's `ruff format --check` agrees with the workspace's local run. No behavior change.
+
 ## 0.3.0
 
 Stario 5.0 and a round of hardening after the 0.2 cutover. Same install.sh path.
