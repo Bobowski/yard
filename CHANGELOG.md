@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0
+
+Stario 5.0 and a round of hardening after the 0.2 cutover. Same install.sh path.
+
+- The table names the container (`engratia-app-1`); an idle row keeps the slot name. CPU and memory read the keys Podman actually prints.
+- Image tags use twelve chars of sha. Yard's own containers follow the compose convention: `yard-app-1`, `yard-caddy-1`.
+- Caddy no longer recreates on a Yard self-deploy. Its seed file mounts from a stable path under `run/` and the admin socket is fixed.
+- The recurring container healthcheck is gone. The apply probe is the only readiness gate; the healthcheck alone was about half of Yard's idle CPU.
+- The apply image builds with podman-remote, not the Compose API path.
+- `YardError` renders on every route through `catch_errors`; anything else gets the framework's 500. A log follow drains its writer and stops on disconnect.
+- install.sh fails early without root, installs `sudo`, and creates `checkouts/` itself. `saved_project` ensures the slot env file.
+- `staryard` is a virtual package (`package = false`). The image ships `app/` as source; `uv build` still publishes the PyPI wheel.
+
 ## 0.2.0
 
 A rewrite of the server and the command. Same host design: bare git repos, rootless Podman, Compose, Caddy. Backwards incompatible; rerun `install.sh` on the host and `uv tool upgrade staryard` on the laptop.
