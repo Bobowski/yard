@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import NoReturn
 from urllib.parse import urlsplit
 
-import stario.responses as responses
 from stario import Context, Writer
 
 from app.config import Config
@@ -275,11 +274,11 @@ async def http_backend(root: Path, token_name: str, c: Context, w: Writer) -> No
     repo = repo_name(c.req.path)
     directory = root / "repos" / f"{repo}.git"
     if not repo or not directory.is_dir():
-        responses.text(w, "not found\n", 404)
+        w.text("not found\n", 404)
         return
     backend = _git_backend()
     if not backend:
-        responses.text(w, "git-http-backend not found\n", 500)
+        w.text("git-http-backend not found\n", 500)
         return
 
     path_info = c.req.path.removeprefix("/git") or "/"
@@ -300,7 +299,8 @@ async def http_backend(root: Path, token_name: str, c: Context, w: Writer) -> No
             "GATEWAY_INTERFACE": "CGI/1.1",
             "SERVER_PROTOCOL": "HTTP/1.1",
             "SCRIPT_NAME": "/git",
-            "REQUEST_URI": c.req.path + (f"?{query}" if query else ""),
+            "REQUEST_URI": c.req.raw_path.decode("latin-1")
+            + (f"?{query}" if query else ""),
         }
     )
     proc = await asyncio.create_subprocess_exec(

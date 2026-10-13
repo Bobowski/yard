@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from stario.responses import JsonValue
+from stario.json import JsonValue
 
 from app import caddy, git, podman
 from app.compose import APP_PORT

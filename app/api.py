@@ -6,9 +6,9 @@ from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from typing import Any, cast
 
-import stario.responses as responses
 from stario import App, Context, Handler, Middleware, Route, Writer
-from stario.responses import JsonValue
+from stario.http.middleware import catch_errors
+from stario.json import JsonValue
 
 from app import doctor, git, podman, prune, status
 from app.errors import YardError
@@ -18,7 +18,7 @@ from app.yard import Yard
 
 
 async def health(_yard: Yard, _c: Context, w: Writer) -> None:
-    responses.empty(w, 200)
+    w.empty(200)
 
 
 async def serve_git(yard: Yard, c: Context, w: Writer) -> None:
@@ -26,13 +26,13 @@ async def serve_git(yard: Yard, c: Context, w: Writer) -> None:
     token = yard.store.token_ok(password)
     if token is None:
         w.headers.set("www-authenticate", 'Basic realm="yard"')
-        responses.text(w, "unauthorized\n", 401)
+        w.text("unauthorized\n", 401)
         return
     await git.http_backend(yard.config.root, token.name, c, w)
 
 
 async def repos_list(yard: Yard, _c: Context, w: Writer) -> None:
-    responses.json(w, [asdict(repo) for repo in yard.store.list_repos()])
+    w.json([asdict(repo) for repo in yard.store.list_repos()])
 
 
 async def repos_create(yard: Yard, c: Context, w: Writer) -> None:
@@ -47,13 +47,13 @@ async def repos_create(yard: Yard, c: Context, w: Writer) -> None:
             "bad json",
             help_text="name is a string. force is true or false. origin is an http address.",
         )
-    responses.json(w, await yard.create_repo(name, force, origin))
+    w.json(await yard.create_repo(name, force, origin))
 
 
 async def repos_delete(yard: Yard, c: Context, w: Writer) -> None:
     name = c.match.params["name"]
     yard.delete_repo(name)
-    responses.json(w, {"name": name})
+    w.json({"name": name})
 
 
 async def repos_git(yard: Yard, c: Context, w: Writer) -> None:
@@ -67,16 +67,16 @@ async def repos_git(yard: Yard, c: Context, w: Writer) -> None:
             help_text="args is a list of strings.",
             example='{"args": ["log", "-1"]}',
         )
-    responses.json(w, await yard.git_repo(c.match.params["name"], args))
+    w.json(await yard.git_repo(c.match.params["name"], args))
 
 
 async def host_status(yard: Yard, c: Context, w: Writer) -> None:
-    responses.json(w, await status.report(yard, c.req.query.get("running") == "1"))
+    w.json(await status.report(yard, c.req.query.get("running") == "1"))
 
 
 async def slots_list(yard: Yard, _c: Context, w: Writer) -> None:
     # The list carries no env; secrets show only on the single GET.
-    responses.json(w, [status.slot_json(slot) for slot in yard.store.list_slots()])
+    w.json([status.slot_json(slot) for slot in yard.store.list_slots()])
 
 
 def _slot_with_env(yard: Yard, slot: Slot) -> dict[str, Any]:
@@ -113,15 +113,13 @@ async def slots_create(yard: Yard, c: Context, w: Writer) -> None:
             help_text="Run yard repo list for the names.",
         )
     slot, outcome = await yard.create_slot(name, repo, **cast(dict[str, Any], fields))
-    responses.json(
-        w,
-        cast(JsonValue, {"slot": _slot_with_env(yard, slot), "deploy": asdict(outcome)}),
+    w.json(cast(JsonValue, {"slot": _slot_with_env(yard, slot), "deploy": asdict(outcome)}),
     )
 
 
 async def slots_get(yard: Yard, c: Context, w: Writer) -> None:
     name = c.match.params["name"]
-    responses.json(w, cast(JsonValue, _slot_with_env(yard, yard.store.slot(name))))
+    w.json(cast(JsonValue, _slot_with_env(yard, yard.store.slot(name))))
 
 
 async def slots_patch(yard: Yard, c: Context, w: Writer) -> None:
@@ -135,9 +133,7 @@ async def slots_patch(yard: Yard, c: Context, w: Writer) -> None:
             help_text="Set one of ref, dir, domain, trigger, or env.",
         )
     slot, outcome = await yard.update_slot(name, **cast(dict[str, Any], fields))
-    responses.json(
-        w,
-        cast(
+    w.json(cast(
             JsonValue,
             {
                 "slot": _slot_with_env(yard, slot),
@@ -150,12 +146,12 @@ async def slots_patch(yard: Yard, c: Context, w: Writer) -> None:
 async def slots_delete(yard: Yard, c: Context, w: Writer) -> None:
     name = c.match.params["name"]
     await yard.delete_slot(name)
-    responses.json(w, {"name": name})
+    w.json({"name": name})
 
 
 async def slot_run(yard: Yard, c: Context, w: Writer) -> None:
     name = c.match.params["name"]
-    responses.json(w, cast(JsonValue, {"output": await yard.run_slot(name)}))
+    w.json(cast(JsonValue, {"output": await yard.run_slot(name)}))
 
 
 async def slot_deploy(yard: Yard, c: Context, w: Writer) -> None:
@@ -166,9 +162,7 @@ async def slot_deploy(yard: Yard, c: Context, w: Writer) -> None:
     if not isinstance(sha, str):
         raise YardError(400, "bad_json", "bad json", help_text="sha is a string.")
     outcome = await yard.deploy_ref(slot, sha)
-    responses.json(
-        w,
-        cast(
+    w.json(cast(
             JsonValue,
             {
                 "slot": _slot_with_env(yard, yard.store.slot(name)),
@@ -183,7 +177,7 @@ async def deploys(yard: Yard, c: Context, w: Writer) -> None:
     yard.store.slot(name)
     limit = c.req.query.get("limit") or "0"
     rows = yard.store.list_deploys(name, int(limit) if limit.isdigit() else 0)
-    responses.json(w, [asdict(row) for row in rows])
+    w.json([asdict(row) for row in rows])
 
 
 async def deploy(yard: Yard, c: Context, w: Writer) -> None:
@@ -200,15 +194,15 @@ async def deploy(yard: Yard, c: Context, w: Writer) -> None:
     row = yard.store.deploy(int(raw))
     if row.slot != name:
         raise YardError(404, "not_found", "deploy does not exist")
-    responses.json(w, asdict(row))
+    w.json(asdict(row))
 
 
 async def logs(yard: Yard, c: Context, w: Writer) -> None:
     slot, role, service, tail, cursor = _log_filters(c)
     if c.req.query.get("follow") == "1":
-        await _follow(yard, w, slot, role, service, tail, cursor)
+        await _follow(yard, c, w, slot, role, service, tail, cursor)
         return
-    responses.json(w, await status.log_page(yard, slot, role, service, tail, cursor))
+    w.json(await status.log_page(yard, slot, role, service, tail, cursor))
 
 
 async def container_logs(yard: Yard, c: Context, w: Writer) -> None:
@@ -216,9 +210,9 @@ async def container_logs(yard: Yard, c: Context, w: Writer) -> None:
     tail, cursor = _tail(c), c.req.query.get("cursor") or ""
     podman.check_name(name)
     if c.req.query.get("follow") == "1":
-        await _stream_logs(yard, w, _follow_args(name, tail, cursor))
+        await _stream_logs(yard, c, w, _follow_args(name, tail, cursor))
         return
-    responses.json(w, await status.log_text(yard, [("", name)], tail, cursor))
+    w.json(await status.log_text(yard, [("", name)], tail, cursor))
 
 
 async def inspect(yard: Yard, c: Context, w: Writer) -> None:
@@ -227,7 +221,7 @@ async def inspect(yard: Yard, c: Context, w: Writer) -> None:
     text = await yard.podman.run("inspect", "--format", "json", name)
     if text and not text.endswith("\n"):
         text += "\n"
-    responses.text(w, text)
+    w.text(text)
 
 
 async def run_prune(yard: Yard, c: Context, w: Writer) -> None:
@@ -242,19 +236,19 @@ async def run_prune(yard: Yard, c: Context, w: Writer) -> None:
             help_text="days is a number 1 or more. dry is true or false.",
             example='{"days": 7, "dry": false}',
         )
-    responses.json(w, cast(JsonValue, await prune.run(yard, days, dry)))
+    w.json(cast(JsonValue, await prune.run(yard, days, dry)))
 
 
 async def slots_status(yard: Yard, c: Context, w: Writer) -> None:
-    responses.json(w, await status.slot_report(yard, c.match.params["name"]))
+    w.json(await status.slot_report(yard, c.match.params["name"]))
 
 
 async def doctor_run(yard: Yard, _c: Context, w: Writer) -> None:
-    responses.json(w, cast(JsonValue, await doctor.run(yard)))
+    w.json(cast(JsonValue, await doctor.run(yard)))
 
 
 async def tokens_list(yard: Yard, _c: Context, w: Writer) -> None:
-    responses.json(w, [asdict(token) for token in yard.store.list_tokens()])
+    w.json([asdict(token) for token in yard.store.list_tokens()])
 
 
 async def tokens_create(yard: Yard, c: Context, w: Writer) -> None:
@@ -263,7 +257,7 @@ async def tokens_create(yard: Yard, c: Context, w: Writer) -> None:
     if not isinstance(name, str) or not name:
         raise YardError(400, "bad_json", "bad json", help_text="name is a string.")
     plain = yard.store.create_token(name)
-    responses.json(w, {"name": name, "token": plain})
+    w.json({"name": name, "token": plain})
 
 
 async def tokens_delete(yard: Yard, c: Context, w: Writer) -> None:
@@ -278,7 +272,7 @@ async def tokens_delete(yard: Yard, c: Context, w: Writer) -> None:
             help_text="Use another token to remove this one.",
         )
     yard.store.delete_token(name)
-    responses.json(w, {"name": name})
+    w.json({"name": name})
 
 
 async def hook(yard: Yard, c: Context, w: Writer) -> None:
@@ -292,15 +286,26 @@ async def hook(yard: Yard, c: Context, w: Writer) -> None:
             help_text="repo, new, and ref are strings.",
         )
     code, text = await yard.hook_push(repo, new, ref)
-    responses.text(w, text, code)
+    w.text(text, code)
 
 
 def _h(fn: Callable[[Yard, Context, Writer], Awaitable[None]], yard: Yard) -> Handler:
-    return lambda c, w: fn(yard, c, w)
+    async def handler(c: Context, w: Writer) -> None:
+        await fn(yard, c, w)
+
+    return handler
+
+
+async def _error_body(_c: Context, w: Writer, exc: BaseException) -> None:
+    err = cast(YardError, exc)
+    w.json({"error": err.payload()}, err.status)
 
 
 def register_api(app: App, yard: Yard) -> None:
     auth = (_bearer(yard),)
+    # YardError is the API's failure shape on every route. Uncaught exceptions
+    # fall through to the framework's own 500.
+    app.use("/", catch_errors(YardError, respond=_error_body))
     routes = [
         (Route("GET /health"), health, ()),
         (Route("GET /git/{path...}"), serve_git, ()),
@@ -338,19 +343,12 @@ def _local() -> Middleware:
     def middleware(handler: Handler) -> Handler:
         async def wrapped(c: Context, w: Writer) -> None:
             if c.req.host not in {"127.0.0.1", "localhost", "::1"}:
-                responses.json(
-                    w,
-                    {
-                        "error": YardError(
-                            403,
-                            "local_only",
-                            "the hook accepts a request from this host",
-                            help_text="The git hook calls 127.0.0.1.",
-                        ).payload()
-                    },
+                raise YardError(
                     403,
+                    "local_only",
+                    "the hook accepts a request from this host",
+                    help_text="The git hook calls 127.0.0.1.",
                 )
-                return
             await handler(c, w)
 
         return wrapped
@@ -363,15 +361,9 @@ def _bearer(yard: Yard) -> Middleware:
         async def wrapped(c: Context, w: Writer) -> None:
             header = c.req.headers.get("authorization") or ""
             raw = header[7:].strip() if header.lower().startswith("bearer ") else ""
-            try:
-                token = yard.store.token_ok(raw)
-            except YardError as exc:
-                responses.json(w, {"error": exc.payload()}, exc.status)
-                return
+            token = yard.store.token_ok(raw)
             if token is None:
-                responses.json(
-                    w,
-                    {
+                w.json({
                         "error": YardError(
                             401,
                             "unauthorized",
@@ -384,17 +376,7 @@ def _bearer(yard: Yard) -> Middleware:
                 )
                 return
             c.state["actor"] = token.name
-            try:
-                await handler(c, w)
-            except YardError as exc:
-                # The writer already sent bytes. A second body would corrupt that response.
-                if not w.started:
-                    responses.json(w, {"error": exc.payload()}, exc.status)
-            except Exception as exc:
-                if not w.started:
-                    responses.json(w, {"error": {"code": "internal", "message": str(exc)}}, 500)
-                else:
-                    raise
+            await handler(c, w)
 
         return wrapped
 
@@ -438,6 +420,7 @@ def _log_filters(c: Context) -> tuple[str, str, str, int, str]:
 
 async def _follow(
     yard: Yard,
+    c: Context,
     w: Writer,
     slot: str,
     role: str,
@@ -454,7 +437,7 @@ async def _follow(
             help_text="Add --slot or --service until one container matches.",
             example="yard logs --slot heldso --follow",
         )
-    await _stream_logs(yard, w, _follow_args(targets[0][1], tail, cursor))
+    await _stream_logs(yard, c, w, _follow_args(targets[0][1], tail, cursor))
 
 
 def _follow_args(name: str, tail: int, cursor: str) -> list[str]:
@@ -465,14 +448,20 @@ def _follow_args(name: str, tail: int, cursor: str) -> list[str]:
     return args
 
 
-async def _stream_logs(yard: Yard, w: Writer, args: list[str]) -> None:
+async def _stream_logs(
+    yard: Yard, c: Context, w: Writer, args: list[str]
+) -> None:
     proc = await yard.podman.popen(*args)
     w.headers.set("content-type", "text/plain; charset=utf-8")
     w.write_headers(200)
     assert proc.stdout is not None
     try:
+        # drain() applies backpressure; disconnected stops the follow early.
         while chunk := await proc.stdout.read(8192):
+            if c.disconnected:
+                break
             w.write(chunk)
+            await w.drain()
     finally:
         if proc.returncode is None:
             proc.kill()

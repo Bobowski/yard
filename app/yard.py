@@ -16,7 +16,7 @@ from app.values import check_name, check_origin, format_env, parse_env, public_o
 
 if TYPE_CHECKING:
     from stario import App
-    from stario.responses import JsonValue
+    from stario.json import JsonValue
 
 log = logging.getLogger("yard")
 

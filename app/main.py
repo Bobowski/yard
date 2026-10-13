@@ -1,8 +1,7 @@
 """Yard. `python -m app.main` serves; `yard login --token <token>` talks to it."""
 
+import uvloop
 from stario import App, Span, serve
-from stario.http.config import server_config_from_env
-from stario.http.server import resolve_loop_runner
 
 from app.api import register_api
 from app.config import Config
@@ -29,8 +28,7 @@ async def bootstrap(app: App, span: Span):
 
 
 def main() -> None:
-    config = server_config_from_env()
-    resolve_loop_runner(config.event_loop)(serve(bootstrap, config=config))
+    uvloop.run(serve(bootstrap))
 
 
 if __name__ == "__main__":

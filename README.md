@@ -162,5 +162,5 @@ A deploy outcome — returned by the create, patch, and deploy routes — has `s
 
 ```sh
 uv run pytest
-STARIO_LOOP=uvloop uv run python -m app.main
+uv run python -m app.main
 ```
