@@ -299,8 +299,7 @@ async def http_backend(root: Path, token_name: str, c: Context, w: Writer) -> No
             "GATEWAY_INTERFACE": "CGI/1.1",
             "SERVER_PROTOCOL": "HTTP/1.1",
             "SCRIPT_NAME": "/git",
-            "REQUEST_URI": c.req.raw_path.decode("latin-1")
-            + (f"?{query}" if query else ""),
+            "REQUEST_URI": c.req.raw_path.decode("latin-1") + (f"?{query}" if query else ""),
         }
     )
     proc = await asyncio.create_subprocess_exec(

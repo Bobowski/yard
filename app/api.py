@@ -113,7 +113,8 @@ async def slots_create(yard: Yard, c: Context, w: Writer) -> None:
             help_text="Run yard repo list for the names.",
         )
     slot, outcome = await yard.create_slot(name, repo, **cast(dict[str, Any], fields))
-    w.json(cast(JsonValue, {"slot": _slot_with_env(yard, slot), "deploy": asdict(outcome)}),
+    w.json(
+        cast(JsonValue, {"slot": _slot_with_env(yard, slot), "deploy": asdict(outcome)}),
     )
 
 
@@ -133,7 +134,8 @@ async def slots_patch(yard: Yard, c: Context, w: Writer) -> None:
             help_text="Set one of ref, dir, domain, trigger, or env.",
         )
     slot, outcome = await yard.update_slot(name, **cast(dict[str, Any], fields))
-    w.json(cast(
+    w.json(
+        cast(
             JsonValue,
             {
                 "slot": _slot_with_env(yard, slot),
@@ -162,7 +164,8 @@ async def slot_deploy(yard: Yard, c: Context, w: Writer) -> None:
     if not isinstance(sha, str):
         raise YardError(400, "bad_json", "bad json", help_text="sha is a string.")
     outcome = await yard.deploy_ref(slot, sha)
-    w.json(cast(
+    w.json(
+        cast(
             JsonValue,
             {
                 "slot": _slot_with_env(yard, yard.store.slot(name)),
@@ -363,7 +366,8 @@ def _bearer(yard: Yard) -> Middleware:
             raw = header[7:].strip() if header.lower().startswith("bearer ") else ""
             token = yard.store.token_ok(raw)
             if token is None:
-                w.json({
+                w.json(
+                    {
                         "error": YardError(
                             401,
                             "unauthorized",
@@ -448,9 +452,7 @@ def _follow_args(name: str, tail: int, cursor: str) -> list[str]:
     return args
 
 
-async def _stream_logs(
-    yard: Yard, c: Context, w: Writer, args: list[str]
-) -> None:
+async def _stream_logs(yard: Yard, c: Context, w: Writer, args: list[str]) -> None:
     proc = await yard.podman.popen(*args)
     w.headers.set("content-type", "text/plain; charset=utf-8")
     w.write_headers(200)
