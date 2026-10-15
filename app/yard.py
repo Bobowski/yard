@@ -1,24 +1,27 @@
 """Yard operations. HTTP handlers call this. Podman and git stay behind it."""
 
 import asyncio
+import json
 import logging
-import os
+import re
 import shutil
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
+from urllib.parse import quote
 
 from app import caddy, compose, deploy, git, podman
 from app.config import Config
 from app.errors import YardError
 from app.podman import Podman
 from app.store import Slot, Store
-from app.values import check_name, check_origin, format_env, parse_env, public_origin
+from app.values import check_domain, check_name, check_origin, format_env, parse_env, public_origin
 
 if TYPE_CHECKING:
     from stario import App
     from stario.json import JsonValue
 
 log = logging.getLogger("yard")
+_EXEC_ARG = re.compile(r"^[A-Za-z0-9_.=:/*+,@%-]+$")
 
 
 class Yard:
@@ -36,32 +39,21 @@ class Yard:
 
     async def boot(self, app: App) -> None:
         self._app = app
-        (self.config.root / "env").mkdir(mode=0o700, parents=True, exist_ok=True)
+        (self.config.root / "projects").mkdir(parents=True, exist_ok=True)
+        (self.config.root / "repos").mkdir(parents=True, exist_ok=True)
+        (self.config.root / "tokens").mkdir(mode=0o700, parents=True, exist_ok=True)
+        caddy_root = self.config.project_dir("yard") / "caddy"
+        (caddy_root / "config").mkdir(parents=True, exist_ok=True)
+        (caddy_root / "data").mkdir(parents=True, exist_ok=True)
         try:
             self.ensure_host_slot()
         except YardError as exc:
-            log.warning("host slot: %s", exc)
-        try:
-            await self._claim_yard_deploy()
-        except YardError as exc:
-            log.warning("yard deploy: %s", exc)
-        try:
-            self.store.interrupt_deploys()
-        except YardError as exc:
-            log.warning("deploys: %s", exc)
+            log.warning("host project: %s", exc)
         await self._prepare_repos()
 
         await self.ensure_network()
         # The apply image build pulls a base image. The server answers while that build runs.
         self._apply_task = app.create_task(self._build_apply_image(), name="apply-image")
-        if self.config.caddy_sock is not None:
-            try:
-                (self.config.root / "data" / "caddy" / "lib").mkdir(parents=True, exist_ok=True)
-                self.config.caddy_sock.parent.mkdir(parents=True, exist_ok=True)
-                await caddy.wait_socket(self.config.caddy_sock)
-            except Exception as exc:
-                log.warning("caddy: %s", exc)
-        await self.push_caddy()
         await self.start_jobs()
 
     async def _build_apply_image(self) -> None:
@@ -120,56 +112,19 @@ class Yard:
                 log.warning("hook: %s", exc)
 
     def ensure_host_slot(self) -> None:
-        """The yard slot: a slot with no domain is valid, it just has no route."""
-        domain = self.config.domain
+        """The yard project. Its compose runs the app and Caddy."""
         if not self.config.repo("yard").exists():
             return
         compose.ensure_env(self.config.env("yard"))
-        try:
-            self.store.repo("yard")
-        except YardError as exc:
-            if exc.code != "not_found":
-                raise
-            self.store.create_repo("yard")
-        try:
-            slot = self.store.slot("yard")
-        except YardError as exc:
-            if exc.code != "not_found":
-                raise
-            self.store.create_slot("yard", "yard", "main", "", domain, "")
-            return
-        if slot.domain != domain:
-            self.store.update_slot(slot.name, domain=domain)
-
-    async def _claim_yard_deploy(self) -> None:
-        """The new yard process records the upgrade that replaced the previous process."""
-        sha = os.environ.get("SHA", "").strip()
-        image = os.environ.get("IMAGE", "").strip()
-        if not sha or not image:
-            return
+        caddy_root = self.config.project_dir("yard") / "caddy"
+        (caddy_root / "config").mkdir(parents=True, exist_ok=True)
+        (caddy_root / "data").mkdir(parents=True, exist_ok=True)
         try:
             self.store.slot("yard")
         except YardError as exc:
             if exc.code != "not_found":
                 raise
-            return
-        last = self.store.last_deploy("yard")
-        if last is not None and last.status == "running":
-            if last.sha == sha:
-                self.store.set_image("yard", image)
-                self.store.finish_deploy(last.id, "ok", "")
-            else:
-                # The upgrade rolled back and the old process is speaking.
-                # The apply log says why the new build never came up.
-                try:
-                    text = await self.podman.run("logs", "yard-apply-yard")
-                except Exception:
-                    text = ""
-                self.store.finish_deploy(last.id, "failed", text)
-            return
-        if last is None:
-            self.store.set_image("yard", image)
-            self.store.finish_deploy(self.store.begin_deploy("yard", sha, image), "ok", "")
+            self.store.create_slot("yard", "yard", "main")
 
     async def create_repo(self, name: str, force: bool, origin: str = "") -> JsonValue:
         name = name.strip()
@@ -177,30 +132,16 @@ class Yard:
         if origin:
             origin = check_origin(origin)
         async with self._repo_lock:
-            try:
-                self.store.repo(name)
-            except YardError as exc:
-                if exc.code != "not_found":
-                    raise
-            else:
-                raise YardError(
-                    409,
-                    "exists",
-                    "already exists",
-                    context={"name": name},
-                    help_text="Pick another name.",
-                )
-
-            # A leftover directory is a create that stopped after git init.
             directory = self.config.repo(name)
             if directory.exists():
-                if not force:
+                # --force replaces a stray directory. A git repo stays.
+                if (directory / "HEAD").is_file() or not force:
                     raise YardError(
                         409,
-                        "directory_exists",
-                        f"{directory} already exists and {name} is not recorded.",
-                        context={"name": name, "directory": str(directory)},
-                        help_text="A previous create may have stopped.",
+                        "exists",
+                        "already exists",
+                        context={"name": name},
+                        help_text="Pick another name, or pass --force to replace a directory that is not a repo.",
                         example=f"yard repo new {name} --force",
                     )
                 try:
@@ -263,17 +204,6 @@ class Yard:
                 note = await self._follow_origin()
                 if note:
                     log.info("yard repo: %s", note.strip())
-            try:
-                self.store.create_repo(name)
-            except YardError as exc:
-                raise YardError(
-                    500,
-                    "repo_unrecorded",
-                    f"git init succeeded but saving {name} failed: {exc}",
-                    context={"name": name},
-                    help_text="The directory is there. Finish the create with --force.",
-                    example=f"yard repo new {name} --force",
-                ) from exc
             repo = self.store.repo(name)
         body: JsonValue = {"name": repo.name, "created": repo.created}
         if ref:
@@ -292,18 +222,13 @@ class Yard:
         repo: str,
         ref: str = "",
         directory: str = "",
-        domain: str = "",
         trigger: str = "",
         env: dict[str, str] | None = None,
-    ) -> tuple[Slot, deploy.Outcome]:
-        slot = self.store.create_slot(name, repo, ref, directory, domain, trigger)
+    ) -> Slot:
+        slot = self.store.create_slot(name, repo, ref, directory, trigger)
         self.write_env(slot.name, env or {})
-        await self.push_caddy()
-        try:
-            outcome = await self.deploy_ref(slot)
-        finally:
-            await self.sync_job(slot.name)
-        return slot, outcome
+        await self.sync_job(slot.name)
+        return slot
 
     async def update_slot(
         self,
@@ -311,25 +236,17 @@ class Yard:
         *,
         ref: str | None = None,
         directory: str | None = None,
-        domain: str | None = None,
         trigger: str | None = None,
         env: dict[str, str] | None = None,
-    ) -> tuple[Slot, deploy.Outcome | None]:
+    ) -> Slot:
         before = self.store.slot(name)
-        slot = self.store.update_slot(name, ref=ref, dir=directory, domain=domain, trigger=trigger)
-        env_changed = env is not None and env != self.read_env(name)
+        slot = self.store.update_slot(name, ref=ref, dir=directory, trigger=trigger)
         if env is not None:
             self.write_env(name, env)
         if slot.job and not before.job:
             await self._down(name)
-        await self.push_caddy()
         await self.sync_job(slot.name)
-
-        # A new ref, directory, or env value is a new container. Domain and the timer are not.
-        changed = slot.ref != before.ref or slot.directory != before.directory or env_changed
-        if not changed:
-            return slot, None
-        return slot, await self.deploy_ref(slot)
+        return slot
 
     async def delete_slot(self, name: str) -> None:
         slot = self.store.slot(name)
@@ -341,12 +258,11 @@ class Yard:
                 log.warning("purge %s: %s", name, exc)
 
         self.store.delete_slot(name)
-        self.config.env(name).unlink(missing_ok=True)
-        data = self.config.data(name)
-        if data.exists():
-            shutil.rmtree(data)
+        await git.remove_worktree(self.config, name, slot.repo)
+        directory = self.config.project_dir(name)
+        if directory.exists():
+            shutil.rmtree(directory)
 
-        await self.push_caddy()
         await self.sync_job(name)
 
     def read_env(self, name: str) -> dict[str, str]:
@@ -382,14 +298,14 @@ class Yard:
                 raise YardError(
                     500,
                     "deploy_failed",
-                    f"slot {slot.name} is saved. Yard could not read {slot.repo} {slot.ref}: {exc}",
-                    context={"slot": slot.name, "repo": slot.repo, "ref": slot.ref},
+                    f"project {slot.name} is saved. Yard could not read {slot.repo} {slot.ref}: {exc}",
+                    context={"project": slot.name, "repo": slot.repo, "ref": slot.ref},
                     help_text=f"Fix the repo, then push to {slot.ref}.",
                 ) from exc
             if not sha:
                 return deploy.Outcome(
                     "waiting",
-                    log=f"branch {slot.ref} has no revision yet. The next push to {slot.ref} deploys this slot.\n",
+                    log=f"branch {slot.ref} has no revision yet. The next push to {slot.ref} deploys this project.\n",
                 )
         image = compose.image_tag(slot.repo, slot.directory, sha)
         if self.skip_deploy:
@@ -399,8 +315,8 @@ class Yard:
             raise YardError(
                 500,
                 "deploy_failed",
-                f"slot {slot.name} is saved. Deploy of {slot.ref} ({sha}) failed:\n{outcome.log.strip()}",
-                context={"slot": slot.name, "ref": slot.ref, "sha": sha},
+                f"project {slot.name} is saved. Deploy of {slot.ref} ({sha}) failed:\n{outcome.log.strip()}",
+                context={"project": slot.name, "ref": slot.ref, "sha": sha},
                 help_text=f"Push to {slot.ref} to deploy again.",
             )
         return outcome
@@ -411,9 +327,9 @@ class Yard:
                 slot = self.store.slot(name)
             except YardError as exc:
                 return deploy.Outcome("failed", error=str(exc))
-            last = self.store.last_deploy(name)
-            if last is not None and last.sha == sha and last.status == "ok":
-                return deploy.Outcome("current", last.image or compose.image_tag(slot.repo, slot.directory, sha))
+            image = compose.image_tag(slot.repo, slot.directory, sha)
+            if await _image_in_use(self, name, image):
+                return deploy.Outcome("current", image)
             try:
                 tip = await git.resolve(self.config.repo(slot.repo), slot.ref)
             except RuntimeError as exc:
@@ -440,13 +356,13 @@ class Yard:
         watched = [slot for slot in slots if slot.ref == watched_ref]
         if not watched:
             if not text:
-                text = f"no slot watches {repo} {watched_ref}\n"
+                text = f"no project watches {repo} {watched_ref}\n"
             return 200, text
 
         failed = False
         for slot in watched:
             if self.skip_deploy:
-                text += f"slot {slot.name}: deploy skipped\n"
+                text += f"project {slot.name}: deploy skipped\n"
                 continue
             out = await self.run_deploy(slot.name, new)
             text += _line(slot.name, out)
@@ -474,8 +390,8 @@ class Yard:
         try:
             await self.delete_slot(slot.name)
         except Exception as exc:
-            return f"slot {slot.name}: {exc}\n"
-        return f"slot {slot.name} removed: {why}\n"
+            return f"project {slot.name}: {exc}\n"
+        return f"project {slot.name} removed: {why}\n"
 
     async def _branch_merged(self, slot: Slot, into_branch: str, into_sha: str) -> tuple[bool, str]:
         try:
@@ -487,16 +403,6 @@ class Yard:
         if await git.is_ancestor(self.config.repo(slot.repo), tip, into_sha):
             return True, f"branch {slot.ref} is in {into_branch}"
         return False, ""
-
-    async def push_caddy(self) -> None:
-        sock = self.config.caddy_sock
-        if sock is None:
-            return
-        try:
-            found = caddy.routes(self.store.list_slots(), self.config.domain)
-            await asyncio.to_thread(caddy.load, sock, caddy.document(found))
-        except Exception as exc:
-            log.warning("caddy: %s", exc)
 
     async def start_jobs(self) -> None:
         for slot in self.store.list_slots():
@@ -535,7 +441,7 @@ class Yard:
         except Exception as exc:
             log.warning("job %s: ps: %s", name, exc)
             return None
-        item = listed.get(f"yard-apply-{name}-job")
+        item = listed.get(f"up-{name}-job")
         return item.created if item is not None else None
 
     async def _job_loop(self, name: str, wake: asyncio.Event) -> None:
@@ -588,14 +494,14 @@ class Yard:
                 "running",
                 f"{name} is already running",
                 help_text="One run at a time. The log is live.",
-                example=f"yard logs --slot {name} --follow",
+                example=f"yard podman logs up-{name}",
             )
-        if not slot.live_image:
+        if compose.saved_project(self.config, slot) is None:
             raise YardError(
                 409,
                 "no_image",
                 f"{name} has no build yet",
-                example=f"yard deploy {name}",
+                example=f"yard up {name}",
             )
         try:
             if slot.job:
@@ -615,9 +521,9 @@ class Yard:
                 help_text="Create the repo, then run the git command.",
                 example=f"yard repo new {name}",
             )
-        call = git.prepare_git(args)
+        _check_git_args(args)
         try:
-            text = await git.git(*call.argv, cwd=directory)
+            text = await git.git(*args, cwd=directory)
         except RuntimeError as exc:
             raise YardError(
                 400,
@@ -626,18 +532,194 @@ class Yard:
                 help_text="Git printed that text.",
                 example=f"yard git {name} log -1",
             ) from exc
-        if name == "yard" and call.argv[:1] == ["fetch"]:
+        if name == "yard" and args[:1] == ["fetch"]:
             note = await self._follow_origin()
             if note:
                 text = f"{text}\n{note}" if text else note
-        if call.delete_branch:
-            note = await self._drop_deleted(name, call.delete_branch)
-            removed = "".join(f"{line}\n" for line in note.splitlines() if line.startswith("slot "))
+        deleted = _deleted_branch(args)
+        if deleted:
+            note = await self._drop_deleted(name, deleted)
+            removed = "".join(f"{line}\n" for line in note.splitlines() if line.startswith("project "))
             if removed:
                 text = f"{text}\n{removed}" if text else removed
         if text and not text.endswith("\n"):
             text += "\n"
         return {"output": text}
+
+    async def caddy_routes(self) -> list[dict[str, str]]:
+        return caddy.routes_from_autosave(self.config.autosave())
+
+    async def caddy_config(self) -> JsonValue:
+        _code, raw = await self._caddy("GET", caddy.CONFIG_PATH)
+        try:
+            found = json.loads(raw or b"{}")
+        except json.JSONDecodeError as exc:
+            raise YardError(502, "caddy", "caddy config was not json") from exc
+        return found if isinstance(found, dict) else {}
+
+    async def caddy_put(self, host: str, dial: str, window: str) -> dict[str, str]:
+        host = _public_host(host)
+        target = caddy.normalize_dial(dial)
+        span = caddy.check_window(window)
+        body = json.dumps(caddy.proxy_route(host, target, span)).encode()
+        found = caddy.find_route(caddy.autosave_route_json(self.config.autosave()), host)
+        if found is None:
+            await self._caddy("POST", caddy.ROUTES_PATH, body)
+        else:
+            # A stored id is one object. An older route has no id, so the write uses its index.
+            index, ident = found
+            path = f"/id/{quote(ident, safe='')}" if ident else f"{caddy.ROUTES_PATH}/{index}"
+            await self._caddy("PUT", path, body)
+        return {"host": host, "dial": target, "id": caddy.route_id(host)}
+
+    async def caddy_delete(self, host: str) -> dict[str, str]:
+        host = _public_host(host)
+        found = caddy.find_route(caddy.autosave_route_json(self.config.autosave()), host)
+        if found is None:
+            raise YardError(
+                404,
+                "not_found",
+                "route does not exist",
+                context={"host": host},
+                help_text="Run yard bind ls to see the binds.",
+                example=f"yard bind rm {host}",
+            )
+        index, ident = found
+        path = f"/id/{quote(ident, safe='')}" if ident else f"{caddy.ROUTES_PATH}/{index}"
+        await self._caddy("DELETE", path)
+        return {"host": host}
+
+    async def caddy_cli(self, args: list[str]) -> dict[str, str]:
+        if not args:
+            raise YardError(
+                400,
+                "bad_args",
+                "the command needs words",
+                help_text="Pass the caddy command.",
+                example="yard caddy version",
+            )
+        text = await self._service_exec("caddy", ["caddy", *args])
+        return {"output": text if text.endswith("\n") or not text else text + "\n"}
+
+    async def route_list(self) -> list[dict[str, str]]:
+        rows = await self.caddy_routes()
+        try:
+            listed = podman.parse_ps(await self.podman.run("ps", "-a", "--format", "json"))
+        except YardError:
+            listed = {}
+        for row in rows:
+            name = row["dial"].split(":", 1)[0] if row["dial"] else ""
+            row["state"] = _route_state(name, listed)
+        return rows
+
+    async def route_put(self, host: str, dial: str, window: str) -> dict[str, str]:
+        """One public route for this container. A second add replaces that record."""
+        host = _public_host(host)
+        target = caddy.normalize_dial(dial)
+        span = caddy.check_window(window)
+        name = target.split(":", 1)[0]
+        for row in await self.caddy_routes():
+            if row["dial"].split(":", 1)[0] == name and row["host"] != host:
+                await self.caddy_delete(row["host"])
+        saved = await self.caddy_put(host, target, span)
+        listed = podman.parse_ps(await self.podman.run("ps", "-a", "--format", "json"))
+        saved["state"] = _route_state(name, listed)
+        return saved
+
+    async def route_delete(self, dial: str) -> dict[str, str]:
+        target = caddy.normalize_dial(dial)
+        name = target.split(":", 1)[0]
+        rows = [row for row in await self.caddy_routes() if row["dial"].split(":", 1)[0] == name]
+        if not rows:
+            raise YardError(
+                404,
+                "not_found",
+                "route does not exist",
+                context={"dial": name},
+                help_text="Run yard bind ls to see the binds.",
+                example=f"yard bind rm {name}",
+            )
+        for row in rows:
+            await self.caddy_delete(row["host"])
+        return {"host": rows[0]["host"], "dial": rows[0]["dial"]}
+
+    async def podman_command(self, args: list[str]) -> dict[str, str]:
+        if not args or len(args) > 64 or any(_bad_word(arg) for arg in args):
+            raise YardError(
+                400,
+                "bad_args",
+                "the command needs words",
+                help_text="Pass the podman command.",
+                example="yard podman ps",
+            )
+        if "-f" in args or "--follow" in args:
+            raise YardError(
+                400,
+                "bad_args",
+                "follow stays open",
+                help_text="The logs command streams. Leave the other commands as one reply.",
+                example="yard podman logs -f heldso-app-1",
+            )
+        text = await self.podman.run(*args, timeout=None)
+        return {"output": text if text.endswith("\n") or not text else text + "\n"}
+
+    async def _caddy(self, method: str, path: str, body: bytes = b"") -> tuple[int, bytes]:
+        """One admin call. curl runs inside the caddy container."""
+        try:
+            listed = podman.parse_ps(await self.podman.run("ps", "--format", "json"))
+        except YardError as exc:
+            raise YardError(
+                400,
+                "no_caddy",
+                "caddy is not running",
+                help_text="Start the yard project. Caddy is one of its containers.",
+                example="yard up yard",
+            ) from exc
+        name = next((item.name for item in listed.values() if item.running and _is_service(item, "caddy")), "")
+        if not name:
+            raise YardError(
+                400,
+                "no_caddy",
+                "caddy is not running",
+                help_text="Start the yard project. Caddy is one of its containers.",
+                example="yard up yard",
+            )
+        try:
+            text = await self.podman.run(
+                "exec",
+                "-i",
+                name,
+                *caddy.curl_words(method, path, bool(body)),
+                stdin=body or None,
+                timeout=20,
+            )
+        except YardError as exc:
+            raise YardError(502, "caddy", str(exc), help_text="curl inside the caddy container failed.") from exc
+        code, raw = caddy.split_curl(text)
+        if code >= 300:
+            raise YardError(502, "caddy", f"caddy {method} {path}: {code}")
+        return code, raw
+
+    async def _service_exec(self, service: str, argv: list[str]) -> str:
+        if not argv or len(argv) > 32 or any(not _EXEC_ARG.fullmatch(arg) for arg in argv):
+            raise YardError(
+                400,
+                "bad_args",
+                "bad command",
+                help_text="Pass the command words. Do not put a space inside one word.",
+                example=f"yard {service} version",
+            )
+        listed = podman.parse_ps(await self.podman.run("ps", "--format", "json"))
+        name = next((item.name for item in listed.values() if item.running and _is_service(item, service)), "")
+        if not name:
+            raise YardError(
+                404,
+                "not_found",
+                f"{service} is not running",
+                help_text=f"Start the {service} container on the yard network.",
+                example=f"yard {service} ls",
+            )
+        return await self.podman.run("exec", name, *argv, timeout=30)
 
     async def _follow_origin(self) -> str:
         """Point main at origin/main when that move is a fast-forward. A diverged main stays."""
@@ -663,8 +745,76 @@ class Yard:
         return f"main {origin}\n"
 
 
+_GIT_BLOCK = {"-C", "--git-dir", "--work-tree", "--exec-path", "--namespace"}
+
+
+def _bad_word(arg: str) -> bool:
+    return not arg or "\n" in arg or "\x00" in arg or len(arg) > 4096
+
+
+def _check_git_args(args: list[str]) -> None:
+    if not args or len(args) > 64 or any(_bad_word(arg) for arg in args):
+        raise YardError(
+            400,
+            "bad_args",
+            "the command needs words",
+            help_text="Pass the git command.",
+            example="yard git heldso log -1",
+        )
+    for arg in args:
+        if arg.split("=", 1)[0] in _GIT_BLOCK:
+            raise YardError(
+                400,
+                "bad_args",
+                "that flag leaves the repo",
+                help_text="The command runs inside the bare repo.",
+                example="yard git heldso log -1",
+            )
+
+
+def _deleted_branch(args: list[str]) -> str:
+    if not args or args[0] != "branch" or "-D" not in args and "-d" not in args:
+        return ""
+    words = [arg for arg in args[1:] if not arg.startswith("-")]
+    return words[-1] if words else ""
+
+
+def _route_state(name: str, listed: dict[str, podman.Container]) -> str:
+    item = listed.get(name) or listed.get(f"{name}-1")
+    if item is None:
+        return "absent"
+    return "up" if item.running else "down"
+
+
+def _public_host(host: str) -> str:
+    host = host.strip()
+    check_domain(host)
+    if host:
+        return host
+    raise YardError(
+        400,
+        "bad_domain",
+        "domain must be a hostname",
+        help_text="Use a lowercase hostname.",
+        example="heldso.example.com",
+    )
+
+
+def _is_service(item: podman.Container, service: str) -> bool:
+    return item.service == service or item.name == service or item.name == f"yard-{service}-1"
+
+
+async def _image_in_use(yard: Yard, name: str, image: str) -> bool:
+    """True when a container for this slot already runs that image."""
+    try:
+        listed = podman.parse_ps(await yard.podman.run("ps", "-a", "--format", "json"))
+    except Exception:
+        return False
+    return any(item.slot == name and item.image == image for item in listed.values())
+
+
 def _line(name: str, out: deploy.Outcome) -> str:
-    line = f"slot {name}: {out.status}"
+    line = f"project {name}: {out.status}"
     if out.image:
         line += f" {out.image}"
     line += "\n"

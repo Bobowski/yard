@@ -12,14 +12,14 @@ from app.values import format_env, name_ok, parse_env
 # --- slot file ------------------------------------------------------------
 
 
-_YARD_ENV = "SLOT_NAME SLOT_DATA_DIR SHA PORT"
+_YARD_ENV = "PROJECT_NAME PROJECT_DATA_DIR SHA PORT"
 
 
 def format_slot(slot: dict) -> str:
     name = slot.get("name", "")
-    env_file = slot.get("env_file") or f"/srv/yard/env/{name}.env"
+    env_file = slot.get("env_file") or f"/srv/yard/projects/{name}/env"
     lines = [
-        f"# slot {name}",
+        f"# project {name}",
         f"# image {slot.get('image', '')}",
         f"# Yard sets {_YARD_ENV} in the container.",
         f"# The file is {env_file} on the host.",
@@ -27,7 +27,6 @@ def format_slot(slot: dict) -> str:
         f"REPO={slot.get('repo', '')}",
         f"REF={slot.get('ref', '')}",
         f"DIR={slot.get('dir', '')}",
-        f"DOMAIN={slot.get('domain', '')}",
         f"TRIGGER={slot.get('trigger', '')}",
         "",
         "# env. The container receives these lines.",
@@ -38,23 +37,23 @@ def format_slot(slot: dict) -> str:
 
 
 def parse_slot(text: str) -> tuple[dict[str, Any], dict[str, str]]:
-    """The slot file parsed: the four PATCH fields plus REPO, and the env."""
+    """The project file parsed: the four PATCH fields plus REPO, and the env."""
     values = parse_env(text)
     fields = {
         "repo": values.pop("REPO", ""),
         "ref": values.pop("REF", ""),
         "dir": values.pop("DIR", ""),
-        "domain": values.pop("DOMAIN", ""),
         "trigger": values.pop("TRIGGER", ""),
     }
+    values.pop("DOMAIN", None)
     return fields, values
 
 
-_FIELD_SETS = {"ref": "ref", "dir": "dir", "domain": "domain", "trigger": "trigger"}
+_FIELD_SETS = {"ref": "ref", "dir": "dir", "trigger": "trigger"}
 
 
 def slot_edit_patch(current: dict, sets: list[str]) -> dict[str, Any]:
-    """The PATCH body for `slot edit --set`. Field keys patch fields; other keys patch env."""
+    """The PATCH body for `project edit --set`. Field keys patch fields; other keys patch env."""
     patch: dict[str, Any] = {}
     env = dict(current.get("env") or {})
     env_touched = False
@@ -102,9 +101,9 @@ def format_status(report: dict, now: datetime, *, color: bool = False) -> str:
 
 
 def _status_cells(row: dict, now: datetime) -> list[str]:
-    slot = str(row.get("slot") or "")
+    slot = str(row.get("project") or "")
     # The container name is the row: bobowski-site-app-1, yard-caddy-1.
-    # A slot with nothing running shows its name.
+    # A project with nothing running shows its name.
     name = str(row.get("container") or "") or slot
     mem = str(row.get("mem") or "").split("/", 1)[0].strip()
     return [
@@ -187,27 +186,28 @@ def _host_line(host: dict) -> str:
 
 
 def status_hint(report: dict) -> str:
-    """The one command worth typing next. deploys beats logs."""
+    """The one command worth typing next. A failed up comes before a down app."""
     hint = ""
     for row in report.get("rows") or []:
         if not isinstance(row, dict):
             continue
-        slot = str(row.get("slot") or "")
+        slot = str(row.get("project") or "")
         if not slot:
             continue
         deploy = row.get("deploy")
         if isinstance(deploy, dict) and deploy.get("status") == "failed":
-            return f"yard deploys {slot}"
+            return f"yard podman logs up-{slot}"
         # The state word without its age drives the hint.
         word = _state_text(row, datetime.now(UTC)).split(" ", 1)[0]
         if not hint and (word in {"failed", "down", "unhealthy"} or row.get("answers") is False):
-            hint = f"yard logs --slot {slot}"
+            container = str(row.get("container") or "") or f"up-{slot}"
+            hint = f"yard podman logs {container}"
     return hint
 
 
 def format_slot_status(report: dict, now: datetime, *, color: bool = False) -> str:
-    """The one-slot page: header, containers, deploys, log."""
-    slot_raw = report.get("slot")
+    """The one-project page: header, containers, deploys, log."""
+    slot_raw = report.get("project")
     slot: dict = slot_raw if isinstance(slot_raw, dict) else {}
     name = str(slot.get("name") or "")
     lines = [name]
@@ -239,7 +239,7 @@ def format_slot_status(report: dict, now: datetime, *, color: bool = False) -> s
     containers = _align(
         [
             [
-                str(row.get("container") or row.get("slot") or name),
+                str(row.get("container") or row.get("project") or name),
                 _state_text(row, now),
                 str(row.get("cpu") or ""),
                 str(row.get("mem") or "").split("/", 1)[0].strip(),
@@ -329,7 +329,7 @@ def deploy_line(row: dict, *, color: bool = False) -> str:
     started = str(row.get("started") or "")
     built = str(row.get("built") or "")
     ended = str(row.get("ended") or "")
-    parts = [f"deploy {row.get('id')}", str(row.get("slot") or ""), sha, status, _when(started)]
+    parts = [f"deploy {row.get('id')}", str(row.get("project") or ""), sha, status, _when(started)]
     build = format_span(started, built)
     start = format_span(built, ended)
     if build:
@@ -340,6 +340,20 @@ def deploy_line(row: dict, *, color: bool = False) -> str:
     if took:
         parts.append(took)
     return "  ".join(part for part in parts if part)
+
+
+def format_slots(rows: list, *, color: bool = False) -> str:
+    body = [
+        [
+            str(row.get("name") or ""),
+            str(row.get("repo") or ""),
+            str(row.get("ref") or ""),
+            str(row.get("trigger") or ""),
+        ]
+        for row in rows
+        if isinstance(row, dict)
+    ]
+    return _render(["project", "repo", "ref", "trigger"], body, color=color)
 
 
 def format_repos(rows: list, *, color: bool = False) -> str:
@@ -460,15 +474,13 @@ def _deploy_attention(status: str) -> str:
 
 
 def format_prune(report: dict) -> str:
-    checkouts = [row for row in report.get("checkouts") or [] if isinstance(row, dict)]
     images = [row for row in report.get("images") or [] if isinstance(row, dict)]
     refused = [row for row in images if row.get("kept")]
     word = "would remove" if report.get("dry") else "removed"
     days = report.get("days") or 7
     lines = [
-        f"{word} {len(checkouts)} checkouts and {len(images) - len(refused)} images, "
-        f"{format_bytes(int(report.get('freed') or 0))}",
-        f"kept: every slot's live image and its revert image, and anything newer than {days} days",
+        f"{word} {len(images) - len(refused)} images, {format_bytes(int(report.get('freed') or 0))}",
+        f"kept: every project's live image and its revert image, and anything newer than {days} days",
     ]
     for row in refused:
         lines.append(f"kept {row.get('tag')} ({row.get('kept')})")

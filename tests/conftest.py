@@ -14,7 +14,7 @@ async def yard(tmp_path, monkeypatch):
     monkeypatch.setenv("YARD_HOOK_URL", "http://127.0.0.1:8000")
     monkeypatch.setenv("YARD_PODMAN_BIN", "yard-podman-missing")
     async with TestClient(bootstrap) as client:
-        token = (tmp_path / "data" / "yard" / "admin.token").read_text().strip()
+        token = (tmp_path / "tokens" / "admin.token").read_text().strip()
         yield client, token, tmp_path
 
 
@@ -45,7 +45,7 @@ def status_report() -> dict:
         },
         "rows": [
             {
-                "slot": "heldso",
+                "project": "heldso",
                 "container": "heldso-app",
                 "service": "app",
                 "state": "running",
@@ -71,7 +71,7 @@ def status_report() -> dict:
                 },
             },
             {
-                "slot": "shop",
+                "project": "shop",
                 "container": "shop-app",
                 "service": "app",
                 "state": "exited",
@@ -97,7 +97,7 @@ def status_report() -> dict:
                 },
             },
             {
-                "slot": "nightly",
+                "project": "nightly",
                 "container": "",
                 "service": "",
                 "state": "absent",
@@ -117,7 +117,7 @@ def status_report() -> dict:
                 "deploy": None,
             },
             {
-                "slot": "",
+                "project": "",
                 "container": "caddy",
                 "service": "",
                 "state": "running",

@@ -65,7 +65,13 @@ class Podman:
         head.extend(args)
         return head
 
-    async def run(self, *args: str, timeout: float | None = 20, env: dict[str, str] | None = None) -> str:
+    async def run(
+        self,
+        *args: str,
+        timeout: float | None = 20,
+        env: dict[str, str] | None = None,
+        stdin: bytes | None = None,
+    ) -> str:
         merged = os.environ.copy()
         if env:
             merged.update(env)
@@ -73,6 +79,7 @@ class Podman:
             proc = await asyncio.create_subprocess_exec(
                 *self._args(args),
                 env=merged if env else None,
+                stdin=asyncio.subprocess.PIPE if stdin is not None else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -85,9 +92,9 @@ class Podman:
             ) from exc
         try:
             if timeout is None:
-                out, err = await proc.communicate()
+                out, err = await proc.communicate(stdin)
             else:
-                out, err = await asyncio.wait_for(proc.communicate(), timeout)
+                out, err = await asyncio.wait_for(proc.communicate(stdin), timeout)
         except TimeoutError as exc:
             proc.kill()
             raise YardError(
@@ -208,10 +215,10 @@ def parse_ps(raw: str) -> dict[str, Container]:
         if not health:
             health = _health_text(str(row.get("Status") or ""))
 
-        # Yard names its apply containers; compose labels every app container with its project and service.
+        # An up container is up-<slot>. Compose labels every app container with its project and service.
         name = names[0]
-        if name.startswith("yard-apply-"):
-            rest = name.removeprefix("yard-apply-")
+        if name.startswith("up-"):
+            rest = name.removeprefix("up-")
             role = "job" if rest.endswith("-job") else "deploy"
             slot = rest.removesuffix("-job")
             service = ""

@@ -12,8 +12,8 @@ from app.yard import Yard
 async def bootstrap(app: App, span: Span):
     config = Config.from_env()
     span.attrs({"yard.root": str(config.root), "yard.boot": config.boot})
-    store = Store.open(config.data_dir)
-    token = ensure_admin(store, config.data_dir)
+    store = Store.open(config.root)
+    token = ensure_admin(store)
     if token:
         span.event("yard.admin_token", {"path": str(config.token_file)})
     yard = Yard(config, store)

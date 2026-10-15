@@ -10,14 +10,14 @@ services:
     networks:
       yard:
         aliases:
-          - ${SLOT_NAME}
+          - ${PROJECT_NAME}
     volumes:
       - ${DATA_DIR}:/data
     env_file:
       - ${APP_ENV}
     environment:
-      SLOT_NAME: ${SLOT_NAME}
-      SLOT_DATA_DIR: /data
+      PROJECT_NAME: ${PROJECT_NAME}
+      PROJECT_DATA_DIR: /data
       SHA: ${SHA}
       PORT: "8000"
       # A Stario app binds this address. 127.0.0.1 would hide it from Caddy.

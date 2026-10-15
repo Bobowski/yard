@@ -40,7 +40,7 @@ def _run(tmp_path: Path, *argv: str, **extra: str) -> tuple[int, str, str]:
             "FAIL_SPENT": str(tmp_path / "spent"),
             "COMPOSE_PROJECT_NAME": "heldso",
             "COMPOSE_FILE": "a.yml:b.yml",
-            "SLOT_NAME": "heldso",
+            "PROJECT_NAME": "heldso",
             "SHA": "abc",
             "IMAGE": "localhost/heldso:abc",
             "WAIT_SECONDS": "1",

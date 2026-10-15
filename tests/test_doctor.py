@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from app import caddy, doctor
+from app import doctor
 from app.config import Config
 from app.errors import YardError
 from app.podman import Podman
@@ -22,19 +22,20 @@ CADDY_PS = (
 def _yard(tmp_path: Path, *, sock: bool = True, info: str = "", ps: str = "[]") -> Yard:
     config = Config(
         root=tmp_path,
-        caddy_sock=tmp_path / "run" / "caddy.sock" if sock else None,
         podman_sock="",
         podman_bin="podman",
         hook_url="http://127.0.0.1:8000",
         domain="",
         skip_deploy=True,
-        boot=False,
+        boot=sock,
         remote=False,
     )
-    yard = Yard(config, Store.open(tmp_path / "db"))
+    yard = Yard(config, Store.open(tmp_path))
 
     class _Fake(Podman):
-        async def run(self, *args: str, timeout: float | None = 20, env: dict | None = None) -> str:
+        async def run(
+            self, *args: str, timeout: float | None = 20, env: dict | None = None, stdin: bytes | None = None
+        ) -> str:
             if args and args[0] == "info":
                 return info or '{"host":{"cpus":4,"memTotal":1000},"version":{"Version":"5.3.1"}}'
             if args and args[0] == "ps":
@@ -45,17 +46,29 @@ def _yard(tmp_path: Path, *, sock: bool = True, info: str = "", ps: str = "[]") 
     return yard
 
 
+def _route(host: str, dial: str) -> dict:
+    return {
+        "@id": f"yard-{host}",
+        "match": [{"host": [host]}],
+        "handle": [{"upstreams": [{"dial": dial}]}],
+    }
+
+
+def _save(yard: Yard, routes: list) -> None:
+    path = yard.config.autosave()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(routes))
+
+
 def _run(yard: Yard) -> dict[str, dict]:
     return {check["name"]: check for check in asyncio.run(doctor.run(yard))}
 
 
 def test_doctor_all_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yard = _yard(tmp_path, ps=CADDY_PS)
-    monkeypatch.setattr(caddy, "request", lambda sock, method, path, body=b"": b"[]")
     usage = collections.namedtuple("usage", "total used free")(200, 100, 100)
     monkeypatch.setattr(shutil, "disk_usage", lambda path: usage)
     try:
-        yard.config.token_file.parent.mkdir(parents=True)
         yard.config.token_file.write_text("x")
         found = _run(yard)
         assert all(check["ok"] for check in found.values())
@@ -86,10 +99,12 @@ def test_doctor_flags_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yard = _yard(tmp_path)
     try:
         yard.store.create_repo("app")
-        yard.store.create_slot("heldso", "app", "main", "", "", "")
+        yard.store.create_slot("heldso", "app", "main")
 
         class _Dead(Podman):
-            async def run(self, *args: str, timeout: float | None = 20, env: dict | None = None) -> str:
+            async def run(
+                self, *args: str, timeout: float | None = 20, env: dict | None = None, stdin: bytes | None = None
+            ) -> str:
                 raise YardError(502, "podman", "podman is down")
 
         yard.podman = _Dead("podman", False)
@@ -110,15 +125,9 @@ def test_doctor_routes_and_certificates(tmp_path: Path, monkeypatch: pytest.Monk
     yard = _yard(tmp_path, ps=CADDY_PS)
     try:
         yard.store.create_repo("app")
-        yard.store.create_slot("heldso", "app", "main", "", "heldso.example.com", "")
-        routes = [{"match": [{"host": ["heldso.example.com"]}]}]
-        requests: list[tuple] = []
-
-        def fake_request(sock, method, path, body=b""):
-            requests.append((method, path))
-            return json.dumps(routes).encode()
-
-        monkeypatch.setattr(caddy, "request", fake_request)
+        yard.store.create_slot("heldso", "app", "main")
+        routes = [_route("heldso.example.com", "heldso:8000")]
+        _save(yard, routes)
         monkeypatch.setattr(doctor.socket, "getaddrinfo", lambda host, port: [(0, 0, 0, "", ("10.0.0.1", 443))])
 
         def refused(addr, timeout=0):
@@ -126,24 +135,25 @@ def test_doctor_routes_and_certificates(tmp_path: Path, monkeypatch: pytest.Monk
 
         monkeypatch.setattr(doctor.socket, "create_connection", refused)
         found = _run(yard)
-        assert requests == [("GET", "/config/apps/http/servers/yard/routes")]
         assert found["caddy routes"]["detail"] == "1 routes"
         assert found["dns heldso.example.com"]["detail"] == "10.0.0.1"
         assert found["certificate heldso.example.com"]["detail"] == "not issued yet"
         assert not found["certificate heldso.example.com"]["ok"]
 
         # The certificate file ages out of the not-issued state.
-        cert = tmp_path / "data" / "caddy" / "lib" / "caddy" / "certificates" / "acme" / "heldso.example.com"
+        cert = yard.config.caddy_data() / "caddy" / "certificates" / "acme" / "heldso.example.com"
         cert.mkdir(parents=True)
         (cert / "heldso.example.com.crt").write_text("pem")
         found = _run(yard)
         assert found["certificate heldso.example.com"]["ok"]
 
-        # A route missing on the host fails with the host names.
+        # A removed route leaves the count at zero. The host checks stop with it.
         routes.clear()
+        _save(yard, routes)
         found = _run(yard)
-        assert "heldso.example.com" in found["caddy routes"]["detail"]
-        assert not found["caddy routes"]["ok"]
+        assert found["caddy routes"]["ok"]
+        assert found["caddy routes"]["detail"] == "0 routes"
+        assert "dns heldso.example.com" not in found
     finally:
         yard.store.close()
 
@@ -153,9 +163,15 @@ def test_doctor_acme_and_https(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     try:
         yard.store.create_repo("app")
         yard.store.create_repo("yard")
-        yard.store.create_slot("yard", "yard", "origin/main", "", "yard.example.com", "")
-        yard.store.create_slot("heldso", "app", "main", "", "heldso.example.com", "")
-        monkeypatch.setattr(caddy, "request", lambda *a, **k: b"[]")
+        yard.store.create_slot("yard", "yard", "origin/main")
+        yard.store.create_slot("heldso", "app", "main")
+        _save(
+            yard,
+            [
+                _route("yard.example.com", "yard:8000"),
+                _route("heldso.example.com", "heldso:8000"),
+            ],
+        )
         monkeypatch.setattr(doctor.socket, "getaddrinfo", lambda host, port: [(0, 0, 0, "", ("10.0.0.1", 443))])
         sent: list[bytes] = []
 
@@ -194,8 +210,8 @@ def test_doctor_https_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yard = _yard(tmp_path, ps=CADDY_PS)
     try:
         yard.store.create_repo("app")
-        yard.store.create_slot("heldso", "app", "main", "", "heldso.example.com", "")
-        monkeypatch.setattr(caddy, "request", lambda *a, **k: b"[]")
+        yard.store.create_slot("heldso", "app", "main")
+        _save(yard, [_route("heldso.example.com", "heldso:8000")])
         monkeypatch.setattr(doctor.socket, "getaddrinfo", lambda host, port: [(0, 0, 0, "", ("10.0.0.1", 443))])
 
         def refused(addr, timeout=0):

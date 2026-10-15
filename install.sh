@@ -94,25 +94,22 @@ ensure_dir() {
 }
 
 ensure_dir "$root"
-# Yard's container writes checkouts/<repo> as the yard user; a root-owned
+# Yard's container writes projects/<slot>/worktree as the yard user. A root-owned
 # directory here would reject every deploy on a fresh host.
-ensure_dir "$root/checkouts"
-ensure_dir "$root/data"
-ensure_dir "$root/data/yard"
-ensure_dir "$root/data/caddy"
-ensure_dir "$root/data/caddy/lib"
+ensure_dir "$root/projects"
+ensure_dir "$root/projects/yard"
+ensure_dir "$root/projects/yard/caddy"
+ensure_dir "$root/projects/yard/caddy/config"
+ensure_dir "$root/projects/yard/caddy/data"
 ensure_dir "$root/repos"
-ensure_dir "$root/run"
-# The slot env files. Yard writes them with mode 600; the directory stays closed too.
-install -d -o yard -g yard -m 700 "$root/env"
-# The slot env file keeps whatever the operator added; only the domain line is managed here.
+install -d -o yard -g yard -m 700 "$root/projects/yard"
 if [ -n "$domain" ]; then
-  touch "$root/env/yard.env"
-  grep -v '^YARD_DOMAIN=' "$root/env/yard.env" > "$root/env/yard.env.tmp" || true
-  printf 'YARD_DOMAIN=%s\n' "$domain" >> "$root/env/yard.env.tmp"
-  mv "$root/env/yard.env.tmp" "$root/env/yard.env"
-  chown yard:yard "$root/env/yard.env"
-  chmod 600 "$root/env/yard.env"
+  touch "$root/projects/yard/env"
+  grep -v '^YARD_DOMAIN=' "$root/projects/yard/env" > "$root/projects/yard/env.tmp" || true
+  printf 'YARD_DOMAIN=%s\n' "$domain" >> "$root/projects/yard/env.tmp"
+  mv "$root/projects/yard/env.tmp" "$root/projects/yard/env"
+  chown yard:yard "$root/projects/yard/env"
+  chmod 600 "$root/projects/yard/env"
 fi
 
 if systemctl list-unit-files caddy.service >/dev/null 2>&1; then
@@ -311,23 +308,24 @@ run_yard git -C "$repo" fetch origin || die "Could not fetch origin." \
   "Hint: git -C ${repo} remote -v" \
   "Context: fetch failed for user yard."
 sha="$(run_yard git -C "$repo" rev-parse refs/remotes/origin/main)"
-# The image tag and the checkout leaf use the same twelve chars, like config.checkout.
 short="$(printf '%s' "$sha" | cut -c1-12)"
 
-src="$root/checkouts/yard/$short"
-if [ ! -d "$src" ]; then
-  mkdir -p "$src.tmp"
-  run_yard git -C "$repo" archive "$sha" | tar -x -C "$src.tmp" || die "Could not extract ${sha}." \
-    "The checkout is ${src}." \
-    "Hint: git -C ${repo} archive ${sha}" \
-    "Context: archive failed for user yard."
-  mv "$src.tmp" "$src"
-  chown -R yard:yard "$root/checkouts/yard"
+src="$root/projects/yard/worktree"
+if [ ! -e "$src/.git" ]; then
+  run_yard git -C "$repo" worktree add --detach "$src" "$sha" || die "Could not check out ${sha}." \
+    "The worktree is ${src}." \
+    "Hint: git -C ${repo} worktree add --detach ${src} ${sha}" \
+    "Context: worktree add failed for user yard."
+else
+  run_yard git -C "$src" checkout -f --detach "$sha" || die "Could not check out ${sha}." \
+    "The worktree is ${src}." \
+    "Hint: git -C ${src} checkout -f --detach ${sha}" \
+    "Context: checkout failed for user yard."
+  run_yard git -C "$src" clean -fd
 fi
 
-ensure_dir "$root/data/yard"
-ensure_dir "$root/data/caddy"
-ensure_dir "$root/data/caddy/lib"
+ensure_dir "$root/projects/yard/data"
+ensure_dir "$root/tokens"
 
 run_yard podman build -t localhost/yard-apply -f "$src/ops/apply/Containerfile" "$src/ops/apply" || die "Could not build the apply image." \
   "That image runs Compose. The build uses ${src}/ops/apply." \
@@ -336,23 +334,23 @@ run_yard podman build -t localhost/yard-apply -f "$src/ops/apply/Containerfile" 
 
 # One apply container builds and starts Yard, the same way Yard deploys slots.
 # The -e set matches what compose.apply passes for the yard slot.
-run_yard podman run --replace --name yard-apply-yard --network yard \
+run_yard podman run --replace --name up-yard --network yard \
   -v "$sock:/run/podman/podman.sock" -v "$root:$root" \
   -e COMPOSE_PROJECT_NAME=yard -e COMPOSE_FILE="$src/ops/compose.yml" -e PREVIOUS= \
-  -e APP_ENV="$root/env/yard.env" -e CHECKOUT="$src" -e DATA_DIR="$root/data/yard" \
-  -e IMAGE="localhost/yard:$short" -e SHA="$sha" -e SLOT_NAME=yard \
+  -e APP_ENV="$root/projects/yard/env" -e CHECKOUT="$src" -e DATA_DIR="$root/projects/yard/data" \
+  -e IMAGE="localhost/yard:$short" -e SHA="$sha" -e PROJECT_NAME=yard \
   -e YARD_ROOT="$root" -e YARD_PODMAN_SOCK="$sock" \
-  localhost/yard-apply up || die "The first deploy failed." "Hint: podman logs yard-apply-yard"
+  localhost/yard-apply up || die "The first deploy failed." "Hint: podman logs up-yard"
 
 i=0
-while [ ! -s "$root/data/yard/admin.token" ] && [ "$i" -lt 60 ]; do
+while [ ! -s "$root/tokens/admin.token" ] && [ "$i" -lt 60 ]; do
   i=$((i + 1))
   sleep 1
 done
-[ -s "$root/data/yard/admin.token" ] || die "Yard did not write its admin token." \
+[ -s "$root/tokens/admin.token" ] || die "Yard did not write its admin token." \
   "Hint: podman logs yard-app-1" \
   "Context: the file was missing or empty after 60 seconds."
-token="$(cat "$root/data/yard/admin.token")"
+token="$(cat "$root/tokens/admin.token")"
 echo "token: $token"
 if [ -n "$domain" ]; then
   echo "url: https://$domain"
@@ -360,4 +358,4 @@ else
   echo "url: pass --domain to publish this host"
 fi
 echo "local: http://127.0.0.1:8000"
-run_yard podman exec -e YARD_URL=http://127.0.0.1:8000 -e YARD_TOKEN="$token" yard-app-1 /workspace/.venv/bin/yard doctor || true
+run_yard podman exec -e YARD_URL=http://127.0.0.1:8000 -e YARD_TOKEN="$token" yard-app-1 /workspace/.venv/bin/yard status --full || true

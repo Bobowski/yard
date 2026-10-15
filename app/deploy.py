@@ -3,9 +3,9 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from app import compose, git
+from app import compose, git, podman
 from app.errors import YardError
-from app.store import Slot, Store
+from app.store import Slot
 
 if TYPE_CHECKING:
     from app.yard import Yard
@@ -20,57 +20,63 @@ class Outcome:
 
 
 async def deploy(yard: Yard, slot: Slot, sha: str) -> Outcome:
-    config, store = yard.config, yard.store
     image = compose.image_tag(slot.repo, slot.directory, sha)
-    deploy_id = store.begin_deploy(slot.name, sha, image)
+    previous = await _previous(yard, slot.name)
 
     # The checkout and the compose check. Any failure here stops before a build.
     try:
-        checkout = await git.checkout(config, slot.repo, slot.directory, sha)
-        project, lines = await compose.prepare(config, slot, checkout, image, sha)
+        checkout = await git.checkout(yard.config, slot.name, slot.repo, slot.directory, sha)
+        project, lines = await compose.prepare(yard.config, slot, checkout, image, sha)
     except Exception as exc:
-        return _finish(store, deploy_id, "failed", image, [str(exc)], str(exc))
+        return Outcome("failed", image, f"{exc}\n", str(exc))
 
     # One apply container runs the rest: build for a job slot, the whole
-    # start/health/revert sequence otherwise.
+    # start sequence otherwise. The up container is the record of this run.
     code, text = await compose.apply(
-        config,
+        yard.config,
         slot.name,
         "build" if slot.job else "up",
         project,
-        previous=slot.live_image,
+        previous=previous,
         detach=slot.name == "yard",
     )
     lines.append(text)
+    log = "\n".join(lines)
+    if not log.endswith("\n"):
+        log += "\n"
     if slot.name == "yard":
-        # Upgrading yard replaces this process, so that apply run is detached
-        # and the row stays running. The next process claims it on boot.
-        return Outcome("pending", image, "\n".join(lines))
-    built = compose.built_stamp(text)
-    if built:
-        store.mark_built(deploy_id, built)
+        # Upgrading yard replaces this process, so that apply run is detached.
+        return Outcome("pending", image, log)
     if code:
-        return _finish(store, deploy_id, "failed", image, lines, f"apply exited {code}")
-    store.set_image(slot.name, image)
+        return Outcome("failed", image, log, f"apply exited {code}")
     if slot.trigger == "push":
         try:
             lines.append(await yard.run_slot_locked(slot.name))
+            log = "\n".join(lines)
+            if not log.endswith("\n"):
+                log += "\n"
         except YardError as exc:
-            lines.append(str(exc))
-    return _finish(store, deploy_id, "ok", image, lines)
+            log += f"{exc}\n"
+    return Outcome("ok", image, log)
 
 
-def _finish(store: Store, deploy_id: int, status: str, image: str, lines: list[str], error: str = "") -> Outcome:
-    log = "\n".join(lines) + "\n"
-    store.finish_deploy(deploy_id, status, log)
-    return Outcome(status, image, log, error)
+async def _previous(yard: Yard, name: str) -> str:
+    """The image on the running app container. Apply reverts to it."""
+    try:
+        listed = podman.parse_ps(await yard.podman.run("ps", "-a", "--format", "json"))
+    except Exception:
+        return ""
+    for item in listed.values():
+        if item.slot == name and item.role == "app" and item.image:
+            return item.image
+    return ""
 
 
 async def start_service(yard: Yard, slot: Slot) -> str:
     """Start a down service from its saved project. Returns the apply output."""
     project = compose.saved_project(yard.config, slot)
     if project is None:
-        raise RuntimeError(f"slot {slot.name} has no saved project")
+        raise RuntimeError(f"project {slot.name} has no compose file")
     code, text = await compose.apply(
         yard.config,
         slot.name,
@@ -85,7 +91,7 @@ async def start_service(yard: Yard, slot: Slot) -> str:
 async def run_job(yard: Yard, slot: Slot) -> str:
     project = compose.saved_project(yard.config, slot)
     if project is None:
-        raise RuntimeError(f"slot {slot.name} has no saved project")
+        raise RuntimeError(f"project {slot.name} has no compose file")
     code, text = await compose.apply(
         yard.config,
         slot.name,

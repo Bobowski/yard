@@ -1,23 +1,15 @@
-"""Yard's SQLite state. One file, one process."""
+"""Yard's files. A project directory is the record. Git and Podman hold the rest."""
+
+from __future__ import annotations
 
 import hashlib
 import secrets
-import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NoReturn
 
 from app.errors import YardError
-from app.values import (
-    check_domain,
-    check_name,
-    check_ref,
-    check_slot_name,
-    clean_dir,
-    parse_duration,
-    parse_trigger,
-)
+from app.values import check_name, check_ref, check_slot_name, clean_dir, parse_duration, parse_trigger
 
 
 def now() -> str:
@@ -32,16 +24,6 @@ def token_hash(plain: str) -> str:
     return hashlib.sha256(plain.encode()).hexdigest()
 
 
-def _domain_taken(domain: str) -> NoReturn:
-    raise YardError(
-        409,
-        "domain_taken",
-        "domain already in use",
-        context={"domain": domain},
-        help_text="One domain belongs to one slot.",
-    )
-
-
 @dataclass(slots=True)
 class Repo:
     name: str
@@ -54,8 +36,6 @@ class Slot:
     repo: str
     ref: str
     directory: str
-    domain: str
-    live_image: str
     trigger: str
     created: str
 
@@ -76,168 +56,110 @@ class Token:
     created: str
 
 
-@dataclass(slots=True)
-class Deploy:
-    id: int
-    slot: str
-    sha: str
-    image: str
-    status: str
-    started: str
-    built: str
-    ended: str
-    log: str
-
-
 class Store:
-    def __init__(self, db: sqlite3.Connection) -> None:
-        self._db = db
+    """Projects and tokens on disk. The copy in memory follows the files."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self._slots: dict[str, Slot] = {}
+        self._mtime: dict[str, int] = {}
+        self.refresh()
 
     @classmethod
-    def open(cls, directory: Path) -> Store:
-        directory.mkdir(parents=True, exist_ok=True)
-        db = sqlite3.connect(directory / "yard.sqlite3", check_same_thread=False)
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA busy_timeout=5000")
-        db.execute("PRAGMA foreign_keys=ON")
-        store = cls(db)
-        store._schema()
-        return store
+    def open(cls, root: Path) -> Store:
+        (root / "projects").mkdir(parents=True, exist_ok=True)
+        tokens = root / "tokens"
+        tokens.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (root / "repos").mkdir(parents=True, exist_ok=True)
+        return cls(root)
 
     def close(self) -> None:
-        self._db.close()
+        return
 
-    def _schema(self) -> None:
-        self._db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS repos (
-                name TEXT PRIMARY KEY,
-                created TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS slots (
-                name TEXT PRIMARY KEY,
-                repo TEXT NOT NULL,
-                ref TEXT NOT NULL,
-                dir TEXT NOT NULL DEFAULT '',
-                domain TEXT NOT NULL,
-                live_image TEXT NOT NULL DEFAULT '',
-                trigger TEXT NOT NULL DEFAULT '',
-                created TEXT NOT NULL
-            );
-            -- An existing host has the old tokens table with parent and revoked columns.
-            -- Both default, so inserts under this flat shape still work there.
-            CREATE TABLE IF NOT EXISTS tokens (
-                name TEXT PRIMARY KEY,
-                hash TEXT NOT NULL,
-                created TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS deploys (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                slot TEXT NOT NULL,
-                sha TEXT NOT NULL,
-                image TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL,
-                started TEXT NOT NULL,
-                built TEXT NOT NULL DEFAULT '',
-                ended TEXT NOT NULL DEFAULT '',
-                log TEXT NOT NULL DEFAULT ''
-            );
-            """
-        )
-        self._db.execute("CREATE UNIQUE INDEX IF NOT EXISTS slots_domain ON slots(domain) WHERE domain != ''")
-
-        # An existing deploys table gains image, log, and built.
-        columns = {str(row["name"]) for row in self._db.execute("PRAGMA table_info(deploys)")}
-        for column in ("image", "log", "built"):
-            if column not in columns:
-                self._db.execute(f"ALTER TABLE deploys ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
-
-        # An existing slots table gains trigger.
-        slot_columns = {str(row["name"]) for row in self._db.execute("PRAGMA table_info(slots)")}
-        if "trigger" not in slot_columns:
-            self._db.execute("ALTER TABLE slots ADD COLUMN trigger TEXT NOT NULL DEFAULT ''")
-            if "every" in slot_columns:
-                self._db.execute("UPDATE slots SET trigger = 'every ' || every WHERE every != ''")
-
-        # A host from before flat tokens still has the revoked column. Drop the
-        # revoked rows once: under the flat shape nothing could set revoked back,
-        # so a revived row would wrongly become a live token again.
-        token_columns = {str(row["name"]) for row in self._db.execute("PRAGMA table_info(tokens)")}
-        if "revoked" in token_columns:
-            self._db.execute("DELETE FROM tokens WHERE revoked = 1")
-        self._db.commit()
-
-    def _one(self, sql: str, args: tuple = ()) -> sqlite3.Row | None:
-        return self._db.execute(sql, args).fetchone()
-
-    def _all(self, sql: str, args: tuple = ()) -> list[sqlite3.Row]:
-        return list(self._db.execute(sql, args))
-
-    def _write(self, sql: str, args: tuple = ()) -> sqlite3.Cursor:
-        try:
-            cur = self._db.execute(sql, args)
-            self._db.commit()
-        except sqlite3.IntegrityError as exc:
-            self._db.rollback()
-            _raise_integrity(exc)
-        return cur
+    def refresh(self) -> None:
+        """Reload a project file whose time changed. A removed directory drops out."""
+        base = self.root / "projects"
+        if not base.is_dir():
+            self._slots.clear()
+            self._mtime.clear()
+            return
+        seen: set[str] = set()
+        for path in base.iterdir():
+            file = path / "project"
+            if not path.is_dir() or not file.is_file():
+                continue
+            seen.add(path.name)
+            mtime = file.stat().st_mtime_ns
+            if self._mtime.get(path.name) == mtime and path.name in self._slots:
+                continue
+            self._slots[path.name] = _read_project(path.name, file.read_text())
+            self._mtime[path.name] = mtime
+        for name in list(self._slots):
+            if name not in seen:
+                self._slots.pop(name, None)
+                self._mtime.pop(name, None)
 
     def list_repos(self) -> list[Repo]:
-        rows = self._all("SELECT name, created FROM repos ORDER BY name")
-        return [Repo(str(row["name"]), str(row["created"])) for row in rows]
+        base = self.root / "repos"
+        if not base.is_dir():
+            return []
+        found = [self._repo(path) for path in base.iterdir() if path.is_dir() and path.name.endswith(".git")]
+        return sorted(found, key=lambda repo: repo.name)
 
     def repo(self, name: str) -> Repo:
-        row = self._one("SELECT name, created FROM repos WHERE name = ?", (name,))
-        if row is None:
+        path = self.root / "repos" / f"{name}.git"
+        if not path.is_dir():
             raise YardError(
                 404,
                 "not_found",
                 "repo does not exist",
                 context={"name": name},
-                help_text="Run yard repo list to see the repos on this host.",
+                help_text="Run yard repo ls to see the repos on this host.",
             )
-        return Repo(str(row["name"]), str(row["created"]))
+        return self._repo(path)
 
     def create_repo(self, name: str) -> None:
+        """Mark a bare repo directory. git init is the real create."""
         check_name(name)
-        self._write("INSERT INTO repos (name, created) VALUES (?, ?)", (name, now()))
+        path = self.root / "repos" / f"{name}.git"
+        path.mkdir(parents=True, exist_ok=True)
 
     def delete_repo(self, name: str) -> None:
-        count = self._one("SELECT COUNT(*) AS n FROM slots WHERE repo = ?", (name,))
-        if count and int(count["n"]) > 0:
+        if self.slots_for_repo(name):
             raise YardError(
                 409,
                 "repo_in_use",
-                "repo still has slots",
+                "repo still has projects",
                 context={"name": name},
-                help_text="Remove each slot that uses this repo, then delete the repo.",
-                example="yard slot rm heldso",
+                help_text="Remove each project that uses this repo, then delete the repo.",
+                example="yard project rm heldso",
             )
-        cur = self._write("DELETE FROM repos WHERE name = ?", (name,))
-        if cur.rowcount == 0:
+        path = self.root / "repos" / f"{name}.git"
+        if not path.is_dir():
             raise YardError(
                 404,
                 "not_found",
                 "repo does not exist",
                 context={"name": name},
-                help_text="Run yard repo list to see the repos on this host.",
+                help_text="Run yard repo ls to see the repos on this host.",
             )
 
     def list_slots(self) -> list[Slot]:
-        return [self._slot(row) for row in self._all(_SLOT_SQL + " ORDER BY name")]
+        self.refresh()
+        return [self._slots[name] for name in sorted(self._slots)]
 
     def slot(self, name: str) -> Slot:
-        row = self._one(_SLOT_SQL + " WHERE name = ?", (name,))
-        if row is None:
+        self.refresh()
+        found = self._slots.get(name)
+        if found is None:
             raise YardError(
                 404,
                 "not_found",
-                "slot does not exist",
+                "project does not exist",
                 context={"name": name},
-                help_text="Run yard slot list to see the apps on this host.",
+                help_text="Run yard project ls to see the apps on this host.",
             )
-        return self._slot(row)
+        return found
 
     def slots_for_repo(self, repo: str) -> list[Slot]:
         return [slot for slot in self.list_slots() if slot.repo == repo]
@@ -248,7 +170,6 @@ class Store:
         repo: str,
         ref: str = "",
         directory: str = "",
-        domain: str = "",
         trigger: str = "",
     ) -> Slot:
         check_slot_name(name)
@@ -256,25 +177,13 @@ class Store:
         ref = ref or "main"
         check_ref(ref)
         directory = clean_dir(directory)
-        self._domain_free(domain, "")
-        if self._one("SELECT 1 FROM repos WHERE name = ?", (repo,)) is None:
-            raise YardError(
-                404,
-                "not_found",
-                "repo does not exist",
-                context={"repo": repo},
-                help_text="Create the repo first.",
-                example=f"yard repo new {repo}",
-            )
+        self.repo(repo)
+        if name in self._slots or (self.root / "projects" / name / "project").is_file():
+            raise YardError(409, "exists", "already exists", help_text="Pick another name.")
         trigger = parse_trigger(trigger)
-        self._write(
-            """
-            INSERT INTO slots (name, repo, ref, dir, domain, trigger, created)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (name, repo, ref, directory, domain, trigger, now()),
-        )
-        return self.slot(name)
+        slot = Slot(name, repo, ref, directory, trigger, now())
+        self._write(slot)
+        return slot
 
     def update_slot(
         self,
@@ -282,7 +191,6 @@ class Store:
         *,
         ref: str | None = None,
         dir: str | None = None,
-        domain: str | None = None,
         trigger: str | None = None,
     ) -> Slot:
         slot = self.slot(name)
@@ -292,49 +200,46 @@ class Store:
             slot.ref = ref
         if dir is not None:
             slot.directory = clean_dir(dir)
-        if domain is not None:
-            self._domain_free(domain, name)
-            slot.domain = domain
         if trigger is not None:
             slot.trigger = parse_trigger(trigger)
-
-        self._write(
-            "UPDATE slots SET ref = ?, dir = ?, domain = ?, trigger = ? WHERE name = ?",
-            (slot.ref, slot.directory, slot.domain, slot.trigger, name),
-        )
+        self._write(slot)
         return self.slot(name)
 
-    def set_image(self, name: str, image: str) -> None:
-        self._write("UPDATE slots SET live_image = ? WHERE name = ?", (image, name))
-
     def delete_slot(self, name: str) -> None:
-        cur = self._write("DELETE FROM slots WHERE name = ?", (name,))
-        if cur.rowcount == 0:
+        if name not in self._slots and not (self.root / "projects" / name / "project").is_file():
             raise YardError(
                 404,
                 "not_found",
-                "slot does not exist",
+                "project does not exist",
                 context={"name": name},
-                help_text="Run yard slot list to see the apps on this host.",
+                help_text="Run yard project ls to see the apps on this host.",
             )
-
-    def _domain_free(self, domain: str, except_name: str) -> None:
-        check_domain(domain)
-        if not domain:
-            return
-        row = self._one("SELECT name FROM slots WHERE domain = ? AND name != ?", (domain, except_name))
-        if row is not None:
-            _domain_taken(domain)
+        file = self.root / "projects" / name / "project"
+        file.unlink(missing_ok=True)
+        self._slots.pop(name, None)
+        self._mtime.pop(name, None)
 
     def create_token(self, name: str) -> str:
         check_name(name)
+        path = self.root / "tokens" / name
+        if path.exists():
+            raise YardError(409, "exists", "already exists", help_text="Pick another name.")
         plain = secrets.token_hex(24)
-        self._write("INSERT INTO tokens (name, hash, created) VALUES (?, ?, ?)", (name, token_hash(plain), now()))
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.write_text(f"{now()}\n{token_hash(plain)}\n")
+        path.chmod(0o600)
         return plain
 
     def list_tokens(self) -> list[Token]:
-        rows = self._all("SELECT name, created FROM tokens ORDER BY name")
-        return [Token(str(row["name"]), str(row["created"])) for row in rows]
+        base = self.root / "tokens"
+        if not base.is_dir():
+            return []
+        found: list[Token] = []
+        for path in sorted(base.iterdir(), key=lambda item: item.name):
+            token = self._token(path)
+            if token is not None:
+                found.append(token)
+        return found
 
     def delete_token(self, name: str, actor: str = "") -> None:
         if name == actor:
@@ -345,118 +250,81 @@ class Store:
                 context={"name": name},
                 help_text="Ask another token to remove it.",
             )
-        cur = self._write("DELETE FROM tokens WHERE name = ?", (name,))
-        if cur.rowcount == 0:
+        path = self.root / "tokens" / name
+        if not path.is_file():
             raise YardError(
                 404,
                 "not_found",
                 "unknown token",
                 context={"name": name},
-                help_text="Run yard token list.",
+                help_text="Run yard token ls.",
             )
+        path.unlink()
 
     def token_ok(self, plain: str) -> Token | None:
         if not plain:
             return None
-        row = self._one("SELECT name, created FROM tokens WHERE hash = ?", (token_hash(plain),))
-        if row is None:
+        digest = token_hash(plain)
+        base = self.root / "tokens"
+        if not base.is_dir():
             return None
-        return Token(str(row["name"]), str(row["created"]))
+        for path in base.iterdir():
+            token = self._token(path)
+            if token is None:
+                continue
+            lines = path.read_text().splitlines()
+            if len(lines) >= 2 and lines[1] == digest:
+                return token
+        return None
 
-    def begin_deploy(self, slot: str, sha: str, image: str) -> int:
-        cur = self._write(
-            """
-            INSERT INTO deploys (slot, sha, image, status, started)
-            VALUES (?, ?, ?, 'running', ?)
-            """,
-            (slot, sha, image, now()),
+    def _write(self, slot: Slot) -> None:
+        directory = self.root / "projects" / slot.name
+        directory.mkdir(parents=True, exist_ok=True)
+        text = (
+            f"repo {slot.repo}\nref {slot.ref}\ndir {slot.directory}\ntrigger {slot.trigger}\ncreated {slot.created}\n"
         )
-        return int(cur.lastrowid or 0)
+        path = directory / "project"
+        temp = directory / "project.tmp"
+        temp.write_text(text)
+        temp.replace(path)
+        self._slots[slot.name] = slot
+        self._mtime[slot.name] = path.stat().st_mtime_ns
 
-    def mark_built(self, deploy_id: int, stamp: str) -> None:
-        self._write("UPDATE deploys SET built = ? WHERE id = ?", (stamp, deploy_id))
+    def _repo(self, path: Path) -> Repo:
+        stamp = datetime.fromtimestamp(path.stat().st_mtime, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return Repo(path.name.removesuffix(".git"), stamp)
 
-    def finish_deploy(self, deploy_id: int, status: str, log: str) -> None:
-        self._write(
-            "UPDATE deploys SET status = ?, log = ?, ended = ? WHERE id = ?",
-            (status, log, now(), deploy_id),
-        )
-
-    def interrupt_deploys(self) -> None:
-        self._write("UPDATE deploys SET status = 'interrupted', ended = ? WHERE status = 'running'", (now(),))
-
-    def deploy(self, deploy_id: int) -> Deploy:
-        row = self._one(_DEPLOY_SQL + " WHERE id = ?", (deploy_id,))
-        if row is None:
-            raise YardError(
-                404,
-                "not_found",
-                "deploy does not exist",
-                context={"id": deploy_id},
-                help_text="Run yard deploys <name> to see the ids.",
-            )
-        return self._deploy(row)
-
-    def list_deploys(self, slot: str, limit: int) -> list[Deploy]:
-        if limit <= 0 or limit > 100:
-            limit = 20
-        rows = self._all(_DEPLOY_SQL + " WHERE slot = ? ORDER BY id DESC LIMIT ?", (slot, limit))
-        return [self._deploy(row) for row in rows]
-
-    def last_deploy(self, slot: str) -> Deploy | None:
-        row = self._one(_DEPLOY_SQL + " WHERE slot = ? ORDER BY id DESC LIMIT 1", (slot,))
-        return None if row is None else self._deploy(row)
-
-    def _slot(self, row: sqlite3.Row) -> Slot:
-        return Slot(
-            name=str(row["name"]),
-            repo=str(row["repo"]),
-            ref=str(row["ref"]),
-            directory=str(row["dir"]),
-            domain=str(row["domain"]),
-            live_image=str(row["live_image"]),
-            trigger=str(row["trigger"]),
-            created=str(row["created"]),
-        )
-
-    def _deploy(self, row: sqlite3.Row) -> Deploy:
-        return Deploy(
-            int(row["id"]),
-            str(row["slot"]),
-            str(row["sha"]),
-            str(row["image"]),
-            str(row["status"]),
-            str(row["started"]),
-            str(row["built"] or ""),
-            str(row["ended"]),
-            str(row["log"] or ""),
-        )
+    def _token(self, path: Path) -> Token | None:
+        if not path.is_file() or path.suffix == ".token" or not check_name_ok(path.name):
+            return None
+        lines = path.read_text().splitlines()
+        if len(lines) < 2:
+            return None
+        return Token(path.name, lines[0])
 
 
-_SLOT_SQL = "SELECT name, repo, ref, dir, domain, live_image, trigger, created FROM slots"
-_DEPLOY_SQL = "SELECT id, slot, sha, image, status, started, built, ended, log FROM deploys"
+def check_name_ok(name: str) -> bool:
+    try:
+        check_name(name)
+    except YardError:
+        return False
+    return True
 
 
-def _raise_integrity(exc: sqlite3.IntegrityError) -> NoReturn:
-    text = str(exc)
-    if "slots_domain" in text or "slots.domain" in text:
-        raise YardError(
-            409,
-            "domain_taken",
-            "domain already in use",
-            help_text="One domain belongs to one slot.",
-        ) from exc
-    if "UNIQUE" in text:
-        raise YardError(409, "exists", "already exists", help_text="Pick another name.") from exc
-    raise exc
+def _read_project(name: str, text: str) -> Slot:
+    fields = {"repo": "", "ref": "main", "dir": "", "trigger": "", "created": ""}
+    for line in text.splitlines():
+        key, _, value = line.partition(" ")
+        if key in fields:
+            fields[key] = value.strip()
+    return Slot(name, fields["repo"], fields["ref"] or "main", fields["dir"], fields["trigger"], fields["created"])
 
 
-def ensure_admin(store: Store, directory: Path) -> str:
-    if store.list_tokens():
+def ensure_admin(store: Store) -> str:
+    if any(token.name == "admin" for token in store.list_tokens()):
         return ""
     plain = store.create_token("admin")
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / "admin.token"
+    path = store.root / "tokens" / "admin.token"
     path.write_text(plain + "\n")
     path.chmod(0o600)
     return plain

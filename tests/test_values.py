@@ -43,7 +43,7 @@ def _rel_dirs():
 
 
 def _env_keys():
-    return st.from_regex(r"[A-Z][A-Z0-9_]{1,12}", fullmatch=True).filter(lambda key: not key.startswith("SLOT_"))
+    return st.from_regex(r"[A-Z][A-Z0-9_]{1,12}", fullmatch=True).filter(lambda key: not key.startswith("PROJECT_"))
 
 
 def _env_values():

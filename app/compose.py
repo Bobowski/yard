@@ -3,13 +3,14 @@
 import asyncio
 import json
 import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from app.errors import YardError
 from app.store import Slot
-from app.values import image_sha, short_sha, slug
+from app.values import short_sha, slug
 
 if TYPE_CHECKING:
     from app.config import Config
@@ -47,7 +48,7 @@ def run_env(config: Config, slot: Slot, checkout: Path, image: str, sha: str) ->
     data = config.data(slot.name)
     data.mkdir(parents=True, exist_ok=True)
     env = {
-        "SLOT_NAME": slot.name,
+        "PROJECT_NAME": slot.name,
         "IMAGE": image,
         "SHA": sha,
         "CHECKOUT": str(checkout),
@@ -124,9 +125,9 @@ def check(slot: Slot, doc: dict[str, Any], text: str) -> list[str]:
 
     warnings: list[str] = []
     if "${APP_ENV}" not in text:
-        warnings.append("warning: compose: no service attaches env_file ${APP_ENV}; the slot env is not passed")
+        warnings.append("warning: compose: no service attaches env_file ${APP_ENV}; the project env is not passed")
     if "${DATA_DIR}" not in text:
-        warnings.append("warning: compose: no service mounts ${DATA_DIR}; the slot has no /data")
+        warnings.append("warning: compose: no service mounts ${DATA_DIR}; the project has no /data")
     return warnings
 
 
@@ -144,19 +145,35 @@ def _has_alias(doc: dict[str, Any], name: str) -> bool:
 
 
 def saved_project(config: Config, slot: Slot) -> Project | None:
-    """Rebuild the project from the live image's checkout."""
-    sha = image_sha(slot.live_image)
-    if not sha:
-        return None
-    checkout = config.checkout(slot.repo, slot.directory, sha)
+    """Rebuild the project from the slot worktree. The checkout SHA is the image tag."""
+    root = config.worktree(slot.name)
+    checkout = root / slot.directory if slot.directory else root
     if not checkout.is_dir():
         return None
-
+    sha = _head(root)
+    if not sha:
+        return None
+    image = image_tag(slot.repo, slot.directory, sha)
     compose_file = find_compose(checkout)
     files = [str(compose_file) if compose_file else DEFAULT_COMPOSE]
-    env = run_env(config, slot, checkout, slot.live_image, sha)
+    env = run_env(config, slot, checkout, image, sha)
     ensure_env(config.env(slot.name))
     return Project(slot.name, files, env)
+
+
+def _head(root: Path) -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return ""
+    if proc.returncode:
+        return ""
+    return proc.stdout.strip()
 
 
 async def apply(
@@ -170,9 +187,9 @@ async def apply(
 ) -> tuple[int, str]:
     """Run the apply script as one Podman container. A non-zero exit is the deploy log, not an exception."""
     sock = config.podman_sock or "/run/podman/podman.sock"
-    # The name is fixed so `podman logs yard-apply-<slot>` is the whole deploy
-    # story; --replace replaces the previous container and its log.
-    name = f"yard-apply-{slot}-job" if command == "job" else f"yard-apply-{slot}"
+    # The name is fixed so `podman logs up-<slot>` is the whole up story.
+    # --replace replaces the previous container and its log.
+    name = f"up-{slot}-job" if command == "job" else f"up-{slot}"
     argv = _podman(config) + [
         "run",
         "--replace",

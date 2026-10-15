@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0
+
+The store is files. One project is one directory. Move the host files once, then rerun `install.sh`.
+
+- `projects/<name>/project` holds repo, ref, dir, trigger, and created. Env is `projects/<name>/env`. Data is `projects/<name>/data`. The checkout is `projects/<name>/worktree`.
+- The command and the API say project. A container gets `PROJECT_NAME` and `PROJECT_DATA_DIR`.
+- A project write saves the file. `yard up` builds it. `yard clone --ref` adds a feature project, and a merge removes it.
+- Binds are `/api/v1/binds`. Caddy keeps its autosave under the yard project.
+- `yard prune` removes unused localhost images.
+
 ## 0.3.1
 
 Formatting only. `app/api.py` and `app/git.py` are reformatted under the locked ruff 0.17 so CI's `ruff format --check` agrees with the workspace's local run. No behavior change.

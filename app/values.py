@@ -107,7 +107,7 @@ def check_domain(domain: str) -> None:
             "bad_domain",
             "domain must be a hostname",
             context={"domain": domain},
-            help_text="Use a lowercase hostname. One domain belongs to one slot.",
+            help_text="Use a lowercase hostname.",
             example="heldso.example.com",
         )
 
@@ -200,7 +200,7 @@ def image_sha(image: str) -> str:
 
 
 def short_sha(sha: str) -> str:
-    """The image tag and checkout name. Twelve chars, the docker convention."""
+    """The image tag. Twelve chars, the docker convention."""
     return sha[:12]
 
 

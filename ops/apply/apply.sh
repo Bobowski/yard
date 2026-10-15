@@ -1,7 +1,7 @@
 #!/bin/sh
 # One apply container runs a whole deploy: build, start, the health probe,
 # and the revert when a step fails. The env is the only input. Every step
-# prints `==` so `podman logs yard-apply-<slot>` reads as the full story.
+# prints `==` so `podman logs up-<slot>` reads as the full story.
 set -eu
 
 : "${COMPOSE_PROJECT_NAME:?}" "${COMPOSE_FILE:?}"
@@ -41,17 +41,10 @@ revert() {
 up() {
   build
 
-  # Caddy's seed file lives on a stable path so compose leaves caddy alone;
-  # the running config comes from the admin socket and autosave anyway.
-  if [ -n "${YARD_ROOT:-}" ] && [ -f "$CHECKOUT/ops/caddy.json" ]; then
-    mkdir -p "$YARD_ROOT/run"
-    cp "$CHECKOUT/ops/caddy.json" "$YARD_ROOT/run/caddy.json"
-  fi
-
   echo "== start $IMAGE"
   dc up -d --wait --remove-orphans --no-build || revert
 
-  url="${HEALTH_URL:-http://${SLOT_NAME:?}:8000/}"
+  url="${HEALTH_URL:-http://${PROJECT_NAME:?}:8000/}"
   echo "== wait $url"
   try=0
   while [ "$try" -lt "${WAIT_SECONDS:-30}" ]; do

@@ -14,20 +14,21 @@ from app.yard import Yard
 def _yard(tmp_path: Path, ps: list[dict], stats: str = "[]", *, sock: bool = False, logs: str = "") -> Yard:
     config = Config(
         root=tmp_path,
-        caddy_sock=tmp_path / "run" / "caddy.sock" if sock else None,
         podman_sock="",
         podman_bin="podman",
         hook_url="http://127.0.0.1:8000",
         domain="",
         skip_deploy=True,
-        boot=False,
+        boot=sock,
         remote=False,
     )
-    store = Store.open(tmp_path / "db")
+    store = Store.open(tmp_path)
     yard = Yard(config, store)
 
     class _Fake(Podman):
-        async def run(self, *args: str, timeout: float | None = 20, env: dict | None = None) -> str:
+        async def run(
+            self, *args: str, timeout: float | None = 20, env: dict | None = None, stdin: bytes | None = None
+        ) -> str:
             if args and args[0] == "ps":
                 return json.dumps(ps)
             if args and args[0] == "stats":
@@ -58,12 +59,12 @@ def test_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         _app_container("heldso", "heldso-app", Status="Up 2 minutes (healthy)", StartedAt=1710000000),
         _app_container("heldso", "heldso-worker", State="exited", ExitCode=0),
         {
-            "Names": ["yard-apply-nightly-job"],
+            "Names": ["up-nightly-job"],
             "State": "exited",
             "ExitCode": 0,
         },
         {
-            "Names": ["yard-apply-heldso"],
+            "Names": ["up-heldso"],
             "State": "exited",
         },
         {"Names": ["caddy"], "State": "running"},
@@ -72,14 +73,13 @@ def test_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yard = _yard(tmp_path, ps, stats)
     try:
         yard.store.create_repo("app")
-        yard.store.create_slot("heldso", "app", "main", "", "heldso.example.com", "")
-        yard.store.create_slot("nightly", "app", "main", "", "", "every 5m")
-        yard.store.create_slot("gone", "app", "main", "", "", "")
-        yard.store.set_image("heldso", "localhost/heldso:abc")
-        deploy_id = yard.store.begin_deploy("heldso", "abc", "localhost/heldso:abc")
-        yard.store.finish_deploy(deploy_id, "ok", "")
-        (tmp_path / "data" / "heldso").mkdir(parents=True)
-        (tmp_path / "data" / "heldso" / "f").write_bytes(b"x" * 10)
+        yard.store.create_slot("heldso", "app", "main")
+        yard.store.create_slot("nightly", "app", "main", "", "every 5m")
+        yard.store.create_slot("gone", "app", "main")
+        _bind(yard, "heldso.example.com", "heldso:8000")
+        data = tmp_path / "projects" / "heldso" / "data"
+        data.mkdir(parents=True)
+        (data / "f").write_bytes(b"x" * 10)
 
         monkeypatch.setattr("app.status.git.tips", _a(lambda *args, **kw: {"main": "tip9"}))
         report = asyncio.run(status.report(yard))
@@ -93,7 +93,7 @@ def test_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             "data_used": 20,  # each heldso row reports the same 10-byte dir
         }
         rows = {row["container"]: row for row in report["rows"]}
-        assert rows["heldso-app"]["slot"] == "heldso"
+        assert rows["heldso-app"]["project"] == "heldso"
         assert rows["heldso-app"]["service"] == "app"
         assert rows["heldso-app"]["running"]
         assert rows["heldso-app"]["health"] == "healthy"
@@ -107,19 +107,19 @@ def test_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         assert rows["heldso-worker"]["state"] == "exited"
 
         # The job container shows on its job slot. Deploy containers are skipped.
-        assert rows["yard-apply-nightly-job"]["slot"] == "nightly"
-        assert rows["yard-apply-nightly-job"]["trigger"] == "every 5m"
-        assert "yard-apply-heldso" not in rows
+        assert rows["up-nightly-job"]["project"] == "nightly"
+        assert rows["up-nightly-job"]["trigger"] == "every 5m"
+        assert "up-heldso" not in rows
 
         # A slot with no container gets one absent row.
-        absent = [row for row in report["rows"] if row["slot"] == "gone"]
+        absent = [row for row in report["rows"] if row["project"] == "gone"]
         assert len(absent) == 1
         assert absent[0]["state"] == "absent"
         assert absent[0]["container"] == ""
         assert absent[0]["health"] == "down"
 
         # A container with no labels still shows.
-        assert rows["caddy"]["slot"] == ""
+        assert rows["caddy"]["project"] == ""
         assert rows["caddy"]["running"]
     finally:
         yard.store.close()
@@ -134,14 +134,30 @@ def test_report_running_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yard = _yard(tmp_path, ps)
     try:
         yard.store.create_repo("app")
-        yard.store.create_slot("heldso", "app", "main", "", "", "")
-        yard.store.create_slot("gone", "app", "main", "", "", "")
+        yard.store.create_slot("heldso", "app", "main")
+        yard.store.create_slot("gone", "app", "main")
         monkeypatch.setattr("app.status.git.tips", _a(lambda *args, **kw: {}))
         report = asyncio.run(status.report(yard, running_only=True))
         names = [row["container"] for row in report["rows"]]
         assert names == ["heldso-app"]
     finally:
         yard.store.close()
+
+
+def _bind(yard: Yard, host: str, dial: str) -> None:
+    path = yard.config.autosave()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "@id": f"yard-{host}",
+                    "match": [{"host": [host]}],
+                    "handle": [{"upstreams": [{"dial": dial}]}],
+                }
+            ]
+        )
+    )
 
 
 def _a(fn):
@@ -160,9 +176,9 @@ def test_report_probes_running_app_containers(tmp_path: Path, monkeypatch: pytes
     yard = _yard(tmp_path, ps, sock=True)
     try:
         yard.store.create_repo("app")
-        yard.store.create_slot("heldso", "app", "main", "", "", "")
-        yard.store.create_slot("nightly", "app", "main", "", "", "every 5m")
-        yard.store.create_slot("gone", "app", "main", "", "", "")
+        yard.store.create_slot("heldso", "app", "main")
+        yard.store.create_slot("nightly", "app", "main", "", "every 5m")
+        yard.store.create_slot("gone", "app", "main")
         answered = {"heldso": True}
 
         async def fake_probe(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -186,13 +202,8 @@ def test_slot_report_is_the_slot_page(tmp_path: Path, monkeypatch: pytest.Monkey
     yard = _yard(tmp_path, [_app_container("heldso", "heldso-app")], sock=True, logs=log)
     try:
         yard.store.create_repo("app")
-        yard.store.create_slot("heldso", "app", "main", "", "heldso.example.com", "")
-        yard.store.set_image("heldso", "localhost/heldso:abc")
-        for _ in range(6):
-            deploy_id = yard.store.begin_deploy("heldso", "abc", "localhost/heldso:abc")
-            yard.store.finish_deploy(deploy_id, "ok", "")
-        (tmp_path / "env").mkdir()
-        (tmp_path / "env" / "heldso.env").write_text("A=1\nB=2\n")
+        yard.store.create_slot("heldso", "app", "main")
+        _bind(yard, "heldso.example.com", "heldso:8000")
 
         async def fake_probe(host: str, port: int, timeout: float = 1.0) -> bool:
             return True
@@ -201,14 +212,13 @@ def test_slot_report_is_the_slot_page(tmp_path: Path, monkeypatch: pytest.Monkey
         monkeypatch.setattr("app.status.git.tips", _a(lambda *args, **kw: {"main": "tip9"}))
         found = asyncio.run(status.slot_report(yard, "heldso"))
 
-        assert found["slot"]["name"] == "heldso"
-        assert "env" not in found["slot"]
-        assert found["env_file"].endswith("env/heldso.env")
+        assert found["project"]["name"] == "heldso"
+        assert "env" not in found["project"]
+        assert found["env_file"].endswith("projects/heldso/env")
         assert found["route"] == {"host": "heldso.example.com", "dial": "heldso:8000"}
         assert [row["container"] for row in found["rows"]] == ["heldso-app"]
         assert found["rows"][0]["answers"] is True
-        assert len(found["deploys"]) == 5
-        assert found["deploys"][0]["id"] > found["deploys"][-1]["id"]
+        assert found["deploys"] == []
         assert "two" in found["log"]
     finally:
         yard.store.close()

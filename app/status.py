@@ -13,7 +13,7 @@ from app.compose import APP_PORT
 from app.config import Config
 from app.errors import YardError
 from app.podman import Container, Sample, format_stamp
-from app.store import Deploy, Slot
+from app.store import Slot
 from app.values import image_sha
 
 if TYPE_CHECKING:
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 @dataclass(slots=True)
 class Row:
-    slot: str = ""
+    project: str = ""
     container: str = ""
     service: str = ""
     state: str = ""
@@ -72,21 +72,24 @@ async def report(yard: Yard, running_only: bool = False) -> dict[str, Any]:
         else:
             other.append(item)
 
+    binds = caddy.routes_from_autosave(config.autosave())
     rows: list[Row] = []
     for slot in slots:
         items = [item for item in grouped.pop(slot.name, []) if _shows(item, slot)]
         tip = tips.get(slot.repo, {}).get(slot.ref, "")
-        rows += _slot_rows(config, slot, items, samples, tip, store.last_deploy(slot.name), running_only)
+        note = up_record(listed, slot.name)
+        bound = _host_for(binds, slot.name)
+        rows += _slot_rows(config, slot, items, samples, tip, note, bound, running_only)
     for name in sorted(grouped):
         for item in sorted(grouped[name], key=_age):
             if running_only and not item.running:
                 continue
-            rows.append(_row(config, item, None, samples.get(item.name), "", None))
+            rows.append(_row(config, item, None, samples.get(item.name), "", None, ""))
     for item in sorted(other, key=lambda one: one.name):
         if running_only and not item.running:
             continue
-        rows.append(_row(config, item, None, samples.get(item.name), "", None))
-    if config.caddy_sock is not None:
+        rows.append(_row(config, item, None, samples.get(item.name), "", None, ""))
+    if config.boot:
         await _probe_rows(rows)
     shown = [samples.get(row.container) for row in rows]
     return {
@@ -102,9 +105,41 @@ async def report(yard: Yard, running_only: bool = False) -> dict[str, Any]:
     }
 
 
+def up_record(listed: dict[str, Container], name: str) -> dict[str, Any] | None:
+    """The up container is the deploy. One row, or none."""
+    item = listed.get(f"up-{name}")
+    if item is None:
+        return None
+    if item.running:
+        state = "running"
+    elif item.exit_code == 0:
+        state = "ok"
+    else:
+        state = "failed"
+    return {
+        "id": 1,
+        "project": name,
+        "sha": image_sha(item.image),
+        "image": item.image,
+        "status": state,
+        "started": format_stamp(item.started) if item.started else "",
+        "built": "",
+        "ended": format_stamp(item.exited) if item.exited else "",
+        "log": "",
+    }
+
+
+def _host_for(binds: list[dict[str, str]], name: str) -> str:
+    for row in binds:
+        dial = row.get("dial", "").split(":", 1)[0]
+        if dial == name or dial.startswith(f"{name}-"):
+            return row.get("host", "")
+    return ""
+
+
 def _shows(item: Container, slot: Slot) -> bool:
     """The containers that count for a slot: its app services, and a job slot's last run."""
-    return item.role == "app" or (slot.job and item.name == f"yard-apply-{slot.name}-job" and item.role == "job")
+    return item.role == "app" or (slot.job and item.name == f"up-{slot.name}-job" and item.role == "job")
 
 
 def _slot_rows(
@@ -113,16 +148,17 @@ def _slot_rows(
     items: list[Container],
     samples: dict[str, Sample],
     tip: str,
-    deploy: Deploy | None,
+    note: dict[str, Any] | None,
+    host: str,
     running_only: bool,
 ) -> list[Row]:
     rows: list[Row] = []
     for item in sorted(items, key=_age):
         if running_only and not item.running:
             continue
-        rows.append(_row(config, item, slot, samples.get(item.name), tip, deploy))
+        rows.append(_row(config, item, slot, samples.get(item.name), tip, note, host))
     if not items and not running_only:
-        rows.append(_row(config, None, slot, None, tip, deploy))
+        rows.append(_row(config, None, slot, None, tip, note, host))
     return rows
 
 
@@ -137,17 +173,24 @@ async def slot_report(yard: Yard, name: str) -> dict[str, Any]:
         samples = {}
     tip = (await git.tips(config.repo(slot.repo))).get(slot.ref, "")
     items = [item for item in listed.values() if item.slot == name and _shows(item, slot)]
-    rows = _slot_rows(config, slot, items, samples, tip, store.last_deploy(name), False)
-    if config.caddy_sock is not None:
+    binds = caddy.routes_from_autosave(config.autosave())
+    host = _host_for(binds, slot.name)
+    note = up_record(listed, name)
+    rows = _slot_rows(config, slot, items, samples, tip, note, host, False)
+    if config.boot:
         await _probe_rows(rows)
-    route = next(iter(caddy.routes([slot], config.domain)), None)
+    route = next((row for row in binds if _host_for([row], slot.name)), None)
     page = await log_page(yard, name, "app", "", 20, "")
+    body = slot_json(slot)
+    if items and items[0].image:
+        body["image"] = items[0].image
+        body["sha"] = image_sha(items[0].image)
     return {
-        "slot": slot_json(slot),
+        "project": body,
         "env_file": str(config.env(name)),
         "rows": [asdict(row) for row in rows],
-        "route": asdict(route) if route else None,
-        "deploys": [asdict(row) for row in store.list_deploys(name, 5)],
+        "route": {"host": route["host"], "dial": route["dial"]} if route else None,
+        "deploys": [note] if note else [],
         "log": page["log"] if isinstance(page, dict) else "",
     }
 
@@ -158,17 +201,14 @@ def slot_json(slot: Slot) -> dict[str, Any]:
         "repo": slot.repo,
         "ref": slot.ref,
         "dir": slot.directory,
-        "domain": slot.domain,
         "trigger": slot.trigger,
-        "image": slot.live_image,
-        "sha": image_sha(slot.live_image),
         "created": slot.created,
     }
 
 
 async def _probe_rows(rows: list[Row]) -> None:
-    targets = [row for row in rows if row.container and row.running and row.slot and not row.trigger]
-    found = await asyncio.gather(*(probe(row.slot, APP_PORT) for row in targets))
+    targets = [row for row in rows if row.container and row.running and row.project and not row.trigger]
+    found = await asyncio.gather(*(probe(row.project, APP_PORT) for row in targets))
     for row, up in zip(targets, found, strict=True):
         row.answers = up
 
@@ -204,10 +244,11 @@ def _row(
     slot: Slot | None,
     sample: Sample | None,
     tip: str,
-    deploy: Deploy | None,
+    note: dict[str, Any] | None,
+    host: str,
 ) -> Row:
     """One rendered row. slot None means the container has no slot row behind it."""
-    image = (item.image if item and item.image else (slot.live_image if slot else "")) or ""
+    image = (item.image if item and item.image else "") or ""
     if item:
         health = _health(item)
     elif slot and slot.job:
@@ -216,7 +257,7 @@ def _row(
         health = "down"
     key = slot.name if slot else ((item.slot or item.name) if item else "")
     return Row(
-        slot=slot.name if slot else (item.slot if item else ""),
+        project=slot.name if slot else (item.slot if item else ""),
         container=item.name if item else "",
         service=item.service if item else "",
         state=item.state if item else "absent",
@@ -229,21 +270,12 @@ def _row(
         image=image,
         sha=image_sha(image),
         tip=tip,
-        domain=slot.domain if slot else "",
+        domain=host,
         trigger=slot.trigger if slot else "",
         cpu=sample.cpu if sample else "",
         mem=sample.mem if sample else "",
         data=dir_size(config.data(key)),
-        deploy={
-            "id": deploy.id,
-            "status": deploy.status,
-            "sha": deploy.sha,
-            "started": deploy.started,
-            "built": deploy.built,
-            "ended": deploy.ended,
-        }
-        if deploy
-        else None,
+        deploy=note,
     )
 
 
@@ -304,7 +336,7 @@ async def log_targets(yard: Yard, slot: str, role: str, service: str) -> list[tu
             "no_service",
             f"service {service} is not in {where}",
             help_text="The service name is the name in the compose file.",
-            example="yard logs --slot heldso --service app",
+            example="yard podman logs heldso-app-1",
         )
     return found
 

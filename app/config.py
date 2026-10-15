@@ -4,8 +4,6 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.values import short_sha, slug
-
 
 def hook_url(host: str, port: str) -> str:
     if host in {"0.0.0.0", "::"}:
@@ -16,7 +14,6 @@ def hook_url(host: str, port: str) -> str:
 @dataclass(frozen=True, slots=True)
 class Config:
     root: Path
-    caddy_sock: Path | None
     podman_sock: str
     podman_bin: str
     hook_url: str
@@ -26,26 +23,31 @@ class Config:
     remote: bool
 
     @property
-    def data_dir(self) -> Path:
-        return self.root / "data" / "yard"
-
-    @property
     def token_file(self) -> Path:
-        return self.data_dir / "admin.token"
+        return self.root / "tokens" / "admin.token"
 
     def repo(self, name: str) -> Path:
         return self.root / "repos" / f"{name}.git"
 
+    def project_dir(self, slot: str) -> Path:
+        return self.root / "projects" / slot
+
     def data(self, slot: str) -> Path:
-        return self.root / "data" / slot
+        return self.project_dir(slot) / "data"
 
     def env(self, slot: str) -> Path:
-        return self.root / "env" / f"{slot}.env"
+        return self.project_dir(slot) / "env"
 
-    def checkout(self, repo: str, directory: str, sha: str) -> Path:
-        # The leaf matches the image tag, so a live image maps back to its checkout.
-        name = short_sha(sha) if not directory else f"{short_sha(sha)}-{slug(directory)}"
-        return self.root / "checkouts" / repo / name
+    def worktree(self, slot: str) -> Path:
+        """One worktree for the slot. The next deploy checks out a new SHA here."""
+        return self.project_dir(slot) / "worktree"
+
+    def autosave(self) -> Path:
+        """Caddy writes this after an admin API change. The yard project owns it."""
+        return self.project_dir("yard") / "caddy" / "config" / "caddy" / "autosave.json"
+
+    def caddy_data(self) -> Path:
+        return self.project_dir("yard") / "caddy" / "data"
 
     @classmethod
     def from_env(cls) -> Config:
@@ -53,14 +55,10 @@ class Config:
         boot = os.environ.get("YARD_BOOT", "1") != "0"
         host = os.environ.get("STARIO_HOST", "127.0.0.1") or "127.0.0.1"
         port = os.environ.get("STARIO_PORT", "8000") or "8000"
-        sock = os.environ.get("YARD_CADDY_SOCK") or None
-        if sock is None and boot:
-            sock = str(root / "run" / "caddy.sock")
         podman_sock = os.environ.get("YARD_PODMAN_SOCK", "")
         remote = bool(podman_sock or os.environ.get("CONTAINER_HOST"))
         return cls(
             root=root,
-            caddy_sock=Path(sock) if sock else None,
             podman_sock=podman_sock,
             podman_bin=os.environ.get("YARD_PODMAN_BIN", "podman"),
             hook_url=os.environ.get("YARD_HOOK_URL") or hook_url(host, port),

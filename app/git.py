@@ -1,4 +1,4 @@
-"""Git on the host: bare repos, checkouts, and the smart-HTTP bridge."""
+"""Git on the host: bare repos, one worktree per slot, and the smart-HTTP bridge."""
 
 import asyncio
 import os
@@ -120,76 +120,41 @@ async def is_ancestor(path: Path, tip: str, into: str) -> bool:
     return True
 
 
-async def checkout(config: Config, repo: str, directory: str, sha: str) -> Path:
-    """Extract one revision into checkouts/. A finished extract stays for the next deploy of it."""
-    build = config.checkout(repo, directory, sha)
-    if build.is_dir():
-        return build
-    tmp = build.with_name(build.name + ".tmp")
-    shutil.rmtree(tmp, ignore_errors=True)
-    tmp.mkdir(parents=True)
-
-    sub = directory.strip("/")
-    args = ["archive", "--format=tar", sha]
-    strip = 0
-    if sub:
-        args.append(sub)
-        strip = len([part for part in sub.split("/") if part])
-    tar_args = ["tar", "-x", "-C", str(tmp)]
-    if strip:
-        tar_args.append(f"--strip-components={strip}")
-
-    env = os.environ.copy()
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    read_fd, write_fd = os.pipe()
-    try:
-        archive = await asyncio.create_subprocess_exec(
-            "git",
-            "-C",
-            str(config.repo(repo)),
-            *args,
-            stdout=write_fd,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
-    finally:
-        os.close(write_fd)
-    try:
-        tar = await asyncio.create_subprocess_exec(
-            *tar_args,
-            stdin=read_fd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except Exception:
-        archive.kill()
-        await archive.wait()
-        raise
-    finally:
-        os.close(read_fd)
-    assert archive.stderr is not None and tar.stderr is not None
-    git_raw, tar_raw, git_code, tar_code = await asyncio.gather(
-        archive.stderr.read(),
-        tar.stderr.read(),
-        archive.wait(),
-        tar.wait(),
-    )
-    git_err = git_raw.decode(errors="replace")
-    tar_err = tar_raw.decode(errors="replace")
-    if git_code or tar_code:
-        shutil.rmtree(tmp, ignore_errors=True)
-        if git_code:
-            detail = git_err.strip()
-            low = detail.lower()
-            if sub and ("pathspec" in low or "did not match" in low):
-                raise RuntimeError(f"directory {directory!r} is not in the repo at this revision")
-            raise RuntimeError(detail or "git archive failed")
-        raise RuntimeError(tar_err.strip() or "tar failed")
-
-    # The rename is the commit point. A stale extract is replaced whole.
-    shutil.rmtree(build, ignore_errors=True)
-    os.replace(tmp, build)
+async def checkout(config: Config, slot: str, repo: str, directory: str, sha: str) -> Path:
+    """Point the slot worktree at this SHA. The directory stays; the files change."""
+    bare = config.repo(repo)
+    tree = config.worktree(slot)
+    if not (tree / ".git").exists():
+        shutil.rmtree(tree, ignore_errors=True)
+        tree.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            await git("worktree", "prune", cwd=bare)
+        except RuntimeError:
+            pass
+        await git("worktree", "add", "--detach", str(tree), sha, cwd=bare)
+    else:
+        await git("checkout", "-f", "--detach", sha, cwd=tree)
+    await git("clean", "-fd", cwd=tree)
+    build = tree / directory if directory else tree
+    if not build.is_dir():
+        raise RuntimeError(f"directory {directory!r} is not in the repo at this revision")
     return build
+
+
+async def remove_worktree(config: Config, slot: str, repo: str) -> None:
+    """Drop the slot worktree. The bare repo stays."""
+    tree = config.worktree(slot)
+    if not tree.exists():
+        return
+    bare = config.repo(repo)
+    try:
+        await git("worktree", "remove", "--force", str(tree), cwd=bare)
+    except RuntimeError:
+        shutil.rmtree(tree, ignore_errors=True)
+        try:
+            await git("worktree", "prune", cwd=bare)
+        except RuntimeError:
+            return
 
 
 def slot_ref(ref: str) -> str:

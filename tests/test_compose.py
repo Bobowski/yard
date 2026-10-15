@@ -1,6 +1,8 @@
 import asyncio
+import os
 import re
 import stat
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -11,14 +13,13 @@ from app.compose import APPLY_DIR, DEFAULT_COMPOSE, built_stamp, check, image_ta
 from app.config import Config
 from app.store import Slot
 
-ALIASED = "services:\n  app:\n    networks:\n      yard:\n        aliases:\n          - ${SLOT_NAME}\n"
+ALIASED = "services:\n  app:\n    networks:\n      yard:\n        aliases:\n          - ${PROJECT_NAME}\n"
 FULL = ALIASED + "    env_file:\n      - ${APP_ENV}\n    volumes:\n      - ${DATA_DIR}:/data\n"
 
 
 def _config(root: Path) -> Config:
     return Config(
         root=root,
-        caddy_sock=None,
         podman_sock="/run/podman.sock",
         podman_bin="podman",
         hook_url="http://127.0.0.1:8000",
@@ -29,8 +30,8 @@ def _config(root: Path) -> Config:
     )
 
 
-def _slot(name: str, trigger: str = "", image: str = "") -> Slot:
-    return Slot(name, "heldso", "main", "", "", image, trigger, "")
+def _slot(name: str, trigger: str = "") -> Slot:
+    return Slot(name, "heldso", "main", "", trigger, "")
 
 
 def _prepare(config: Config, slot: Slot, checkout: Path, image: str, sha: str) -> tuple[compose.Project, list[str]]:
@@ -38,13 +39,30 @@ def _prepare(config: Config, slot: Slot, checkout: Path, image: str, sha: str) -
 
 
 def _checkout(root: Path, files: dict[str, str]) -> Path:
-    directory = root / "checkouts" / "heldso" / "abc"
+    directory = root / "src" / "heldso" / "abc"
     directory.mkdir(parents=True)
     for name, text in files.items():
         path = directory / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
     return directory
+
+
+def _git(checkout: Path) -> None:
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Yard",
+        "GIT_AUTHOR_EMAIL": "yard@example.com",
+        "GIT_COMMITTER_NAME": "Yard",
+        "GIT_COMMITTER_EMAIL": "yard@example.com",
+    }
+    subprocess.run(["git", "-C", str(checkout), "init", "-b", "main"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(checkout), "add", "."], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(checkout), "commit", "-m", "one"], check=True, capture_output=True, env=env)
+
+
+def _git_out(checkout: Path, *args: str) -> str:
+    return subprocess.check_output(["git", "-C", str(checkout), *args], text=True).strip()
 
 
 def _mode(path: Path) -> int:
@@ -69,15 +87,15 @@ def test_run_env_is_the_interpolation_env(tmp_path: Path):
     env = run_env(config, _slot("heldso"), checkout, "localhost/heldso:abc", "abc")
 
     assert env == {
-        "SLOT_NAME": "heldso",
+        "PROJECT_NAME": "heldso",
         "IMAGE": "localhost/heldso:abc",
         "SHA": "abc",
         "CHECKOUT": str(checkout),
-        "DATA_DIR": str(tmp_path / "data" / "heldso"),
-        "APP_ENV": str(tmp_path / "env" / "heldso.env"),
+        "DATA_DIR": str(tmp_path / "projects" / "heldso" / "data"),
+        "APP_ENV": str(tmp_path / "projects" / "heldso" / "env"),
         "DOCKERFILE": "Containerfile",
     }
-    assert (tmp_path / "data" / "heldso").is_dir()
+    assert (tmp_path / "projects" / "heldso" / "data").is_dir()
     assert not any(key.startswith("STARIO") for key in env)
 
 
@@ -89,10 +107,10 @@ def test_prepare_with_the_default_compose(tmp_path: Path):
     assert project.files == [DEFAULT_COMPOSE]
     assert warnings == []
     assert project.env["DOCKERFILE"] == "Containerfile"
-    assert project.env["APP_ENV"] == str(tmp_path / "env" / "heldso.env")
+    assert project.env["APP_ENV"] == str(tmp_path / "projects" / "heldso" / "env")
 
     # The env file exists for compose, closed to other users. Nothing else is written.
-    env_file = tmp_path / "env" / "heldso.env"
+    env_file = tmp_path / "projects" / "heldso" / "env"
     assert env_file.read_text() == ""
     assert _mode(env_file) == 0o600
     assert not (tmp_path / "run").exists()
@@ -131,8 +149,8 @@ def test_prepare_fails_without_the_alias(tmp_path: Path, monkeypatch: pytest.Mon
     # A job slot is not dialed, so it needs no alias.
     _project, warnings = _prepare(config, _slot("nightly", trigger="every 5m"), checkout, "img", "abc")
     assert warnings == [
-        "warning: compose: no service attaches env_file ${APP_ENV}; the slot env is not passed",
-        "warning: compose: no service mounts ${DATA_DIR}; the slot has no /data",
+        "warning: compose: no service attaches env_file ${APP_ENV}; the project env is not passed",
+        "warning: compose: no service mounts ${DATA_DIR}; the project has no /data",
     ]
 
 
@@ -140,11 +158,11 @@ def test_check_warns_on_the_soft_rules(tmp_path: Path):
     doc = _doc({"app": ["heldso"]})
     assert check(_slot("heldso"), doc, FULL) == []
     assert check(_slot("heldso"), doc, ALIASED) == [
-        "warning: compose: no service attaches env_file ${APP_ENV}; the slot env is not passed",
-        "warning: compose: no service mounts ${DATA_DIR}; the slot has no /data",
+        "warning: compose: no service attaches env_file ${APP_ENV}; the project env is not passed",
+        "warning: compose: no service mounts ${DATA_DIR}; the project has no /data",
     ]
     assert check(_slot("heldso"), doc, ALIASED + "    env_file: [${APP_ENV}]\n") == [
-        "warning: compose: no service mounts ${DATA_DIR}; the slot has no /data",
+        "warning: compose: no service mounts ${DATA_DIR}; the project has no /data",
     ]
 
     # The alias may sit on any service. A document without services has none.
@@ -170,16 +188,20 @@ def test_the_yard_slot_gets_its_host_paths_from_config(tmp_path: Path, monkeypat
     assert "YARD_PODMAN_SOCK" not in other.env
 
 
-def test_saved_project_rebuilds_from_the_live_image(tmp_path: Path):
+def test_saved_project_rebuilds_from_the_worktree(tmp_path: Path):
     config = _config(tmp_path)
-    checkout = _checkout(tmp_path, {"Containerfile": "FROM scratch\n"})
-    live = _slot("heldso", image="localhost/heldso:abc")
+    checkout = config.worktree("heldso")
+    checkout.mkdir(parents=True)
+    (checkout / "Containerfile").write_text("FROM scratch\n")
+    _git(checkout)
+    sha = _git_out(checkout, "rev-parse", "HEAD")
+    live = _slot("heldso")
     found = saved_project(config, live)
     assert found is not None
     assert found.files == [DEFAULT_COMPOSE]
     assert found.env["CHECKOUT"] == str(checkout)
-    assert found.env["IMAGE"] == "localhost/heldso:abc"
-    assert found.env["SHA"] == "abc"
+    assert found.env["IMAGE"] == image_tag("heldso", "", sha)
+    assert found.env["SHA"] == sha
 
     # A repo compose is the one file.
     (checkout / "compose.yml").write_text(FULL)
@@ -187,9 +209,8 @@ def test_saved_project_rebuilds_from_the_live_image(tmp_path: Path):
     assert found is not None
     assert found.files == [str(checkout / "compose.yml")]
 
-    # No live image or a missing checkout means nothing to run.
-    assert saved_project(config, _slot("heldso")) is None
-    assert saved_project(config, _slot("heldso", image="localhost/heldso:zzz")) is None
+    # A missing worktree means nothing to run.
+    assert saved_project(config, _slot("other")) is None
 
 
 def test_apply_runs_one_podman_container(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -206,7 +227,7 @@ def test_apply_runs_one_podman_container(tmp_path: Path, monkeypatch: pytest.Mon
     project = compose.Project(
         "heldso",
         ["/checkout/compose.yml"],
-        {"DATA_DIR": f"{tmp_path}/data/heldso", "IMAGE": "localhost/heldso:abc", "SLOT_NAME": "heldso"},
+        {"DATA_DIR": f"{tmp_path}/data/heldso", "IMAGE": "localhost/heldso:abc", "PROJECT_NAME": "heldso"},
     )
 
     code, text = asyncio.run(
@@ -227,7 +248,7 @@ def test_apply_runs_one_podman_container(tmp_path: Path, monkeypatch: pytest.Mon
         "run",
         "--replace",
         "--name",
-        "yard-apply-heldso",
+        "up-heldso",
         "--network",
         "yard",
         "-v",
@@ -245,7 +266,7 @@ def test_apply_runs_one_podman_container(tmp_path: Path, monkeypatch: pytest.Mon
         "-e",
         "IMAGE=localhost/heldso:abc",
         "-e",
-        "SLOT_NAME=heldso",
+        "PROJECT_NAME=heldso",
         "localhost/yard-apply",
         "up",
     ]
@@ -256,7 +277,7 @@ def test_apply_runs_one_podman_container(tmp_path: Path, monkeypatch: pytest.Mon
     asyncio.run(compose.apply(config, "nightly", "job", project))
     argv, _env = calls[-1]
     assert argv[-2:] == ["localhost/yard-apply", "job"]
-    assert "yard-apply-nightly-job" in argv
+    assert "up-nightly-job" in argv
 
     # The yard slot detaches.
     asyncio.run(compose.apply(config, "yard", "up", project, detach=True))
@@ -267,7 +288,7 @@ def test_apply_runs_one_podman_container(tmp_path: Path, monkeypatch: pytest.Mon
 def test_install_sh_runs_the_first_apply():
     # install.sh prepares the host, then starts the first apply container by hand.
     spec = (Path(__file__).resolve().parents[1] / "install.sh").read_text()
-    for part in ("git clone --bare", "localhost/yard-apply", "yard doctor", "admin.token"):
+    for part in ("git clone --bare", "localhost/yard-apply", "yard status --full", "admin.token"):
         assert part in spec
     for gone in ("prepare_source", "autosave", "HEALTH_URL", "yard:bootstrap", "app.main bootstrap"):
         assert gone not in spec
@@ -334,12 +355,12 @@ def test_the_default_compose_meets_the_contract():
     # The file Yard ships passes its own check, and no app container carries yard labels.
     ops = Path(__file__).resolve().parents[1] / "ops"
     text = (ops / "apply" / "default.compose.yml").read_text()
-    assert "- ${SLOT_NAME}" in text
+    assert "- ${PROJECT_NAME}" in text
     assert "- ${APP_ENV}" in text
     assert "- ${DATA_DIR}:/data" in text
     for line in (
-        "SLOT_NAME: ${SLOT_NAME}",
-        "SLOT_DATA_DIR: /data",
+        "PROJECT_NAME: ${PROJECT_NAME}",
+        "PROJECT_DATA_DIR: /data",
         "SHA: ${SHA}",
         'PORT: "8000"',
         "STARIO_HOST: 0.0.0.0",
@@ -352,7 +373,7 @@ def test_the_default_compose_meets_the_contract():
     assert "yard." not in text
 
     own = (ops / "compose.yml").read_text()
-    assert "yard." not in own
+    assert "labels:" not in own
     assert "path: ${APP_ENV}" in own
     assert "required: false" in own
     files = sorted(path.name for path in (ops / "apply").iterdir())

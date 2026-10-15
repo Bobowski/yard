@@ -37,8 +37,8 @@ def test_parse_ps_reads_name_and_labels():
     raw = """[
         {"Id":"app","Names":["heldso-app-1"],
          "Labels":{"com.docker.compose.project":"heldso","com.docker.compose.service":"app"}},
-        {"Id":"run","Names":["yard-apply-backup-job"]},
-        {"Id":"build","Names":["yard-apply-backup"]},
+        {"Id":"run","Names":["up-backup-job"]},
+        {"Id":"build","Names":["up-backup"]},
         {"Id":"bare","Names":["caddy"]}
     ]"""
     got = parse_ps(raw)
@@ -49,11 +49,11 @@ def test_parse_ps_reads_name_and_labels():
     assert got["heldso-app-1"].role == "app"
 
     # The apply containers are known by name: -job runs a job, the rest deploy.
-    assert got["yard-apply-backup-job"].slot == "backup"
-    assert got["yard-apply-backup-job"].service == ""
-    assert got["yard-apply-backup-job"].role == "job"
-    assert got["yard-apply-backup"].slot == "backup"
-    assert got["yard-apply-backup"].role == "deploy"
+    assert got["up-backup-job"].slot == "backup"
+    assert got["up-backup-job"].service == ""
+    assert got["up-backup-job"].role == "job"
+    assert got["up-backup"].slot == "backup"
+    assert got["up-backup"].role == "deploy"
 
     # A container with no compose labels has no slot.
     assert got["caddy"].slot == ""

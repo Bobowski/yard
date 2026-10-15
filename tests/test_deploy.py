@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -7,6 +9,7 @@ import pytest
 
 from app import deploy
 from app import yard as yard_mod
+from app.compose import image_tag
 from app.config import Config
 from app.errors import YardError
 from app.podman import Podman
@@ -17,7 +20,6 @@ from app.yard import Yard
 def _yard(tmp_path: Path) -> Yard:
     config = Config(
         root=tmp_path,
-        caddy_sock=None,
         podman_sock="",
         podman_bin="podman",
         hook_url="http://127.0.0.1:8000",
@@ -26,21 +28,39 @@ def _yard(tmp_path: Path) -> Yard:
         boot=False,
         remote=False,
     )
-    store = Store.open(tmp_path / "db")
-    return Yard(config, store)
+    store = Store.open(tmp_path)
+    yard = Yard(config, store)
+    _pod(yard)
+    return yard
 
 
-def _slot(yard: Yard, name: str = "heldso", job: bool = False, image: str = "", trigger: str = "") -> None:
+def _slot(yard: Yard, name: str = "heldso", job: bool = False, trigger: str = "") -> None:
     try:
         yard.store.create_repo("app")
     except YardError:
         pass
-    yard.store.create_slot(name, "app", "main", "", "", trigger or ("every 5m" if job else ""))
-    if image:
-        yard.store.set_image(name, image)
+    yard.store.create_slot(name, "app", "main", "", trigger or ("every 5m" if job else ""))
 
 
-ALIASED = "services:\n  app:\n    networks:\n      yard:\n        aliases:\n          - ${SLOT_NAME}\n"
+def _tree(yard: Yard, name: str) -> str:
+    """A worktree with one commit. The HEAD is the saved image."""
+    root = yard.config.worktree(name)
+    root.mkdir(parents=True)
+    (root / "Containerfile").write_text("FROM scratch\n")
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Yard",
+        "GIT_AUTHOR_EMAIL": "yard@example.com",
+        "GIT_COMMITTER_NAME": "Yard",
+        "GIT_COMMITTER_EMAIL": "yard@example.com",
+    }
+    subprocess.run(["git", "-C", str(root), "init", "-b", "main"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(root), "add", "."], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-m", "one"], check=True, capture_output=True, env=env)
+    return subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+
+
+ALIASED = "services:\n  app:\n    networks:\n      yard:\n        aliases:\n          - ${PROJECT_NAME}\n"
 
 
 def _resolved(doc: dict):
@@ -50,8 +70,8 @@ def _resolved(doc: dict):
     return fake
 
 
-def _checkout(tmp_path: Path) -> Path:
-    checkout = tmp_path / "checkouts" / "app" / "abc"
+def _checkout(tmp_path: Path, name: str = "heldso") -> Path:
+    checkout = tmp_path / "worktree" / name
     checkout.mkdir(parents=True)
     (checkout / "Containerfile").write_text("FROM scratch\n")
     return checkout
@@ -120,18 +140,12 @@ def test_deploy_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         assert call["project"].env["IMAGE"] == "localhost/app:abc"
         assert call["detach"] is False
 
-        row = yard.store.last_deploy("heldso")
-        assert row is not None
-        assert row.status == "ok"
-        # The built stamp comes from the apply log, not the clock.
-        assert row.built == "2026-10-05T10:00:00Z"
-        assert row.ended
-        assert "== ready" in row.log
-        assert yard.store.slot("heldso").live_image == "localhost/app:abc"
+        assert "built 2026-10-05T10:00:00Z" in outcome.log
+        assert "== ready" in outcome.log
 
-        # A deploy writes no compose file. The env file and the data dir are all it leaves.
-        assert sorted(path.name for path in tmp_path.iterdir()) == ["checkouts", "data", "db", "env"]
-        assert (tmp_path / "env" / "heldso.env").read_text() == ""
+        # A deploy writes the project file. The checkout in this test is a stand-in.
+        assert sorted(path.name for path in tmp_path.iterdir()) == ["projects", "repos", "tokens", "worktree"]
+        assert (tmp_path / "projects" / "heldso" / "project").is_file()
         assert not (tmp_path / "run").exists()
     finally:
         yard.store.close()
@@ -156,21 +170,18 @@ def test_deploy_with_a_repo_compose(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         assert recorder.calls[0]["project"].env["IMAGE"] == "localhost/app:abc"
 
         # The warnings open the log; the apply output follows.
-        row = yard.store.last_deploy("heldso")
-        assert row is not None
-        assert row.log.splitlines()[:3] == [
-            "warning: compose: no service attaches env_file ${APP_ENV}; the slot env is not passed",
-            "warning: compose: no service mounts ${DATA_DIR}; the slot has no /data",
+        assert outcome.log.splitlines()[:3] == [
+            "warning: compose: no service attaches env_file ${APP_ENV}; the project env is not passed",
+            "warning: compose: no service mounts ${DATA_DIR}; the project has no /data",
             "== build localhost/app:abc",
         ]
-        assert outcome.log == row.log
     finally:
         yard.store.close()
 
 
 def test_deploy_fails_before_apply_without_the_alias(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yard = _yard(tmp_path)
-    _slot(yard, image="localhost/app:old9")
+    _slot(yard)
     recorder = _Apply()
     checkout = _checkout(tmp_path)
     (checkout / "compose.yml").write_text("services:\n  app: {}\n")
@@ -185,19 +196,15 @@ def test_deploy_fails_before_apply_without_the_alias(tmp_path: Path, monkeypatch
             "compose: no service on network yard with alias heldso; the health probe dials http://heldso:8000/"
         )
         assert recorder.calls == []
-
-        row = yard.store.last_deploy("heldso")
-        assert row is not None
-        assert row.status == "failed"
-        assert row.log == outcome.error + "\n"
-        assert yard.store.slot("heldso").live_image == "localhost/app:old9"
+        assert outcome.log == outcome.error + "\n"
     finally:
         yard.store.close()
 
 
 def test_deploy_apply_failure_keeps_the_previous_image(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yard = _yard(tmp_path)
-    _slot(yard, image="localhost/app:old9")
+    _slot(yard)
+    _pod(yard, _ps_app("heldso", "localhost/app:old9"))
     recorder = _stub(monkeypatch, tmp_path, code=1, text="== start localhost/app:abc\nboom\n")
     slot = yard.store.slot("heldso")
     try:
@@ -207,11 +214,6 @@ def test_deploy_apply_failure_keeps_the_previous_image(tmp_path: Path, monkeypat
         assert "boom" in outcome.log
         # The failing apply saw the previous image for its revert.
         assert recorder.calls[0]["previous"] == "localhost/app:old9"
-
-        row = yard.store.last_deploy("heldso")
-        assert row is not None
-        assert row.status == "failed"
-        assert yard.store.slot("heldso").live_image == "localhost/app:old9"
     finally:
         yard.store.close()
 
@@ -245,36 +247,28 @@ def test_deploy_job_slot_builds_only(tmp_path: Path, monkeypatch: pytest.MonkeyP
         outcome = asyncio.run(deploy.deploy(yard, slot, "abc"))
         assert outcome.status == "ok"
         assert recorder.calls[0]["command"] == "build"
-        assert yard.store.slot("nightly").live_image == "localhost/app:abc"
-        row = yard.store.last_deploy("nightly")
-        assert row is not None
-        assert row.built == "2026-10-05T10:00:00Z"
+        assert "built 2026-10-05T10:00:00Z" in outcome.log
     finally:
         yard.store.close()
 
 
 def test_deploy_yard_slot_returns_pending(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yard = _yard(tmp_path)
-    _slot(yard, name="yard", image="localhost/app:old9")
+    _slot(yard, name="yard")
     recorder = _stub(monkeypatch, tmp_path)
     slot = yard.store.slot("yard")
     try:
         outcome = asyncio.run(deploy.deploy(yard, slot, "abc"))
         assert outcome.status == "pending"
         assert recorder.calls[0]["detach"] is True
-
-        # The row stays running. The next process claims it on boot.
-        row = yard.store.last_deploy("yard")
-        assert row is not None
-        assert row.status == "running"
-        assert row.ended == ""
     finally:
         yard.store.close()
 
 
 def test_run_job_uses_the_saved_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yard = _yard(tmp_path)
-    _slot(yard, name="nightly", job=True, image="localhost/app:abc")
+    _slot(yard, name="nightly", job=True)
+    sha = _tree(yard, "nightly")
     recorder = _stub(monkeypatch, tmp_path)
     slot = yard.store.slot("nightly")
     try:
@@ -284,8 +278,8 @@ def test_run_job_uses_the_saved_project(tmp_path: Path, monkeypatch: pytest.Monk
         assert out == OK_LOG
         call = recorder.calls[0]
         assert call["command"] == "job"
-        assert call["project"].env["IMAGE"] == "localhost/app:abc"
-        assert call["project"].env["SHA"] == "abc"
+        assert call["project"].env["IMAGE"] == image_tag("app", "", sha)
+        assert call["project"].env["SHA"] == sha
 
         # A non-zero apply is a job failure, not silent.
         recorder.code = 7
@@ -293,8 +287,8 @@ def test_run_job_uses_the_saved_project(tmp_path: Path, monkeypatch: pytest.Monk
             asyncio.run(deploy.run_job(yard, slot))
 
         # No saved project means nothing to run.
-        yard.store.create_slot("heldso", "app", "main", "", "", "every 5m")
-        with pytest.raises(RuntimeError, match="no saved project"):
+        yard.store.create_slot("heldso", "app", "main", "", "every 5m")
+        with pytest.raises(RuntimeError, match="no compose file"):
             asyncio.run(deploy.run_job(yard, yard.store.slot("heldso")))
     finally:
         yard.store.close()
@@ -304,15 +298,19 @@ def test_run_deploy_coalesces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yard = _yard(tmp_path)
     _slot(yard)
     _stub(monkeypatch, tmp_path)
+    ps = {"text": "[]"}
+    _job_pod(yard, ps)
     try:
-        # A finished deploy of the same sha is current, not a new build.
+        # A container that already has this image is current, not a new build.
         slot = yard.store.slot("heldso")
         asyncio.run(deploy.deploy(yard, slot, "abc"))
+        ps["text"] = _ps_app("heldso", "localhost/app:abc")
         outcome = asyncio.run(yard.run_deploy("heldso", "abc"))
         assert outcome.status == "current"
         assert outcome.image == "localhost/app:abc"
 
         # A newer tip already on the ref supersedes this call.
+        ps["text"] = "[]"
         monkeypatch.setattr("app.yard.git.resolve", _a(lambda *args, **kw: "def"))
         outcome = asyncio.run(yard.run_deploy("heldso", "eee"))
         assert outcome.status == "superseded"
@@ -360,26 +358,26 @@ def test_follow_origin_leaves_a_diverged_main(tmp_path: Path, monkeypatch: pytes
         yard.store.close()
 
 
-def test_boot_claims_the_first_deploy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    # install.sh ran `up` by hand; the first boot records that deploy as ok.
+def test_boot_ensures_the_yard_slot(tmp_path: Path):
     yard = _yard(tmp_path)
     try:
+        yard.ensure_host_slot()
+        with pytest.raises(YardError) as caught:
+            yard.store.slot("yard")
+        assert caught.value.code == "not_found"
         yard.store.create_repo("yard")
-        yard.store.create_slot("yard", "yard", "origin/main", "", "", "")
-        monkeypatch.setenv("SHA", "abc")
-        monkeypatch.setenv("IMAGE", "localhost/yard:abc")
-        asyncio.run(yard._claim_yard_deploy())
-        row = yard.store.last_deploy("yard")
-        assert row is not None
-        assert row.status == "ok"
-        assert yard.store.slot("yard").live_image == "localhost/yard:abc"
+        yard.ensure_host_slot()
+        slot = yard.store.slot("yard")
+        assert slot.repo == "yard"
+        assert slot.ref == "main"
+        assert (tmp_path / "projects" / "yard" / "env").is_file()
     finally:
         yard.store.close()
 
 
 def _pod(yard: Yard, ps: str = "[]") -> None:
     class _Fake(Podman):
-        async def run(self, *args: str, timeout=None, env=None) -> str:
+        async def run(self, *args: str, timeout=None, env=None, stdin: bytes | None = None) -> str:
             return ps if args[:1] == ("ps",) else ""
 
     yard.podman = _Fake("podman", False)
@@ -389,9 +387,23 @@ def _container(slot: str) -> str:
     return '[{"Names":["' + slot + '-app"],"State":"running","Labels":{"com.docker.compose.project":"' + slot + '"}}]'
 
 
+def _ps_app(slot: str, image: str) -> str:
+    return json.dumps(
+        [
+            {
+                "Names": [f"{slot}-app"],
+                "State": "running",
+                "Image": image,
+                "Labels": {"com.docker.compose.project": slot, "com.docker.compose.service": "app"},
+            }
+        ]
+    )
+
+
 def test_run_slot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yard = _yard(tmp_path)
-    _slot(yard, name="nightly", job=True, image="localhost/app:abc")
+    _slot(yard, name="nightly", job=True)
+    _tree(yard, "nightly")
     _slot(yard)
     _pod(yard)
     try:
@@ -427,7 +439,8 @@ def test_run_slot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 def test_run_slot_takes_the_slot_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yard = _yard(tmp_path)
-    _slot(yard, name="nightly", job=True, image="localhost/app:abc")
+    _slot(yard, name="nightly", job=True)
+    _tree(yard, "nightly")
     busy = {"on": False, "count": 0}
 
     async def fake_job(y, slot):
@@ -437,7 +450,7 @@ def test_run_slot_takes_the_slot_lock(tmp_path: Path, monkeypatch: pytest.Monkey
         return "ran\n"
 
     class _Fake(Podman):
-        async def run(self, *args: str, timeout=None, env=None) -> str:
+        async def run(self, *args: str, timeout=None, env=None, stdin: bytes | None = None) -> str:
             return _container("nightly") if busy["on"] else "[]"
 
     monkeypatch.setattr(deploy, "run_job", fake_job)
@@ -461,7 +474,7 @@ def test_run_slot_takes_the_slot_lock(tmp_path: Path, monkeypatch: pytest.Monkey
 def _job_ps(created: str = "") -> str:
     if not created:
         return "[]"
-    return json.dumps([{"Names": ["yard-apply-nightly-job"], "State": "exited", "Created": created}])
+    return json.dumps([{"Names": ["up-nightly-job"], "State": "exited", "Created": created}])
 
 
 def _clock(monkeypatch: pytest.MonkeyPatch, start: datetime) -> dict:
@@ -474,7 +487,7 @@ def _job_pod(yard: Yard, ps: dict) -> None:
     """Podman whose ps answer the test can change after each run."""
 
     class _Fake(Podman):
-        async def run(self, *args: str, timeout=None, env=None) -> str:
+        async def run(self, *args: str, timeout=None, env=None, stdin: bytes | None = None) -> str:
             return ps["text"] if args[:1] == ("ps",) else ""
 
     yard.podman = _Fake("podman", False)
@@ -608,6 +621,7 @@ def test_a_shorter_interval_already_due_runs_at_once(tmp_path: Path, monkeypatch
 def test_deploy_push_slot_runs_the_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yard = _yard(tmp_path)
     _slot(yard, name="nightly", trigger="push")
+    _tree(yard, "nightly")
     recorder = _stub(monkeypatch, tmp_path)
     _pod(yard)
     monkeypatch.setattr(deploy, "run_job", _a(lambda *a, **k: "== run localhost/app:abc\noutput\n"))
@@ -617,9 +631,6 @@ def test_deploy_push_slot_runs_the_job(tmp_path: Path, monkeypatch: pytest.Monke
         assert outcome.status == "ok"
         assert recorder.calls[0]["command"] == "build"
         assert "output" in outcome.log
-        row = yard.store.last_deploy("nightly")
-        assert row is not None
-        assert "output" in row.log
     finally:
         yard.store.close()
 
@@ -627,8 +638,7 @@ def test_deploy_push_slot_runs_the_job(tmp_path: Path, monkeypatch: pytest.Monke
 def test_run_slot_starts_a_down_service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yard = _yard(tmp_path)
     _slot(yard)
-    yard.store.set_image("heldso", "localhost/app:abc")
-    _checkout(tmp_path)
+    _tree(yard, "heldso")
     _pod(yard)
     calls: dict[str, str] = {}
 
@@ -648,6 +658,7 @@ def test_run_deploy_on_a_push_slot_does_not_deadlock(tmp_path: Path, monkeypatch
     # run_deploy holds the slot lock; the push run must not take it again.
     yard = _yard(tmp_path)
     _slot(yard, name="nightly", trigger="push")
+    _tree(yard, "nightly")
     recorder = _stub(monkeypatch, tmp_path)
     _pod(yard)
     monkeypatch.setattr(deploy, "run_job", _a(lambda *a, **k: "== run localhost/app:abc\noutput\n"))

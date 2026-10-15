@@ -6,7 +6,6 @@ from pathlib import Path
 
 from app import deploy
 from app.podman import Podman
-from app.store import Store
 from tests.conftest import auth, local
 
 
@@ -25,7 +24,7 @@ async def test_slot_name_is_required(yard):
         {"name": " ", "repo": "base"},
         {"repo": "base"},
     ):
-        res = await client.post("/api/v1/slots", json=body, headers=auth(token))
+        res = await client.post("/api/v1/projects", json=body, headers=auth(token))
         assert res.status_code == 400
         assert res.json()["error"]["code"] == "bad_json"
 
@@ -45,26 +44,25 @@ async def test_repo_and_slot(yard):
     assert head.strip() == "refs/heads/main"
 
     res = await client.post(
-        "/api/v1/slots",
-        json={"name": "heldso", "repo": "heldso", "domain": "heldso.example.com"},
+        "/api/v1/projects",
+        json={"name": "heldso", "repo": "heldso"},
         headers=auth(token),
     )
     assert res.status_code == 200
-    slot = res.json()["slot"]
+    slot = res.json()["project"]
     assert slot["ref"] == "main"
-    assert slot["domain"] == "heldso.example.com"
-    assert res.json()["deploy"]["status"] == "waiting"
+    assert "domain" not in slot
+    assert "deploy" not in res.json()
 
     res = await client.post(
-        "/api/v1/slots",
-        json={"name": "other", "repo": "heldso", "domain": "heldso.example.com"},
+        "/api/v1/projects",
+        json={"name": "other", "repo": "heldso", "ref": "side"},
         headers=auth(token),
     )
-    assert res.status_code == 409
-    assert "domain_taken" in res.text
+    assert res.status_code == 200
 
     res = await client.post(
-        "/api/v1/slots",
+        "/api/v1/projects",
         json={"name": "yard-sampler", "repo": "heldso"},
         headers=auth(token),
     )
@@ -74,7 +72,7 @@ async def test_repo_and_slot(yard):
     res = await client.post("/api/v1/repos", json={"name": "caddy"}, headers=auth(token))
     assert res.status_code == 200
     res = await client.post(
-        "/api/v1/slots",
+        "/api/v1/projects",
         json={"name": "caddy", "repo": "caddy"},
         headers=auth(token),
     )
@@ -82,13 +80,12 @@ async def test_repo_and_slot(yard):
     assert "bad_name" in res.text
 
     res = await client.patch(
-        "/api/v1/slots/heldso",
-        json={"domain": "app.example.com", "ref": "release"},
+        "/api/v1/projects/heldso",
+        json={"ref": "release"},
         headers=auth(token),
     )
     assert res.status_code == 200
-    assert res.json()["slot"]["domain"] == "app.example.com"
-    assert res.json()["slot"]["ref"] == "release"
+    assert res.json()["project"]["ref"] == "release"
 
     res = await client.delete("/api/v1/repos/heldso", headers=auth(token))
     assert res.status_code == 409
@@ -113,9 +110,9 @@ async def test_repo_and_slot(yard):
         json={"repo": "heldso", "new": "abc", "ref": "refs/heads/main"},
         headers=local(token),
     )
-    assert "no slot watches" in res.text
+    assert "no project watches" in res.text
 
-    res = await client.get("/api/v1/slots")
+    res = await client.get("/api/v1/projects")
     assert res.status_code == 401
     assert "unauthorized" in res.text
 
@@ -125,63 +122,63 @@ async def test_slot_trigger(yard):
     res = await client.post("/api/v1/repos", json={"name": "heldso"}, headers=auth(token))
     assert res.status_code == 200
     res = await client.post(
-        "/api/v1/slots",
+        "/api/v1/projects",
         json={"name": "backup", "repo": "heldso", "trigger": "tomorrow"},
         headers=auth(token),
     )
     assert res.status_code == 400
     res = await client.post(
-        "/api/v1/slots",
+        "/api/v1/projects",
         json={"name": "backup", "repo": "heldso", "trigger": "every 5m"},
         headers=auth(token),
     )
     assert res.status_code == 200
-    assert res.json()["slot"]["trigger"] == "every 5m"
-    res = await client.patch("/api/v1/slots/backup", json={"trigger": ""}, headers=auth(token))
+    assert res.json()["project"]["trigger"] == "every 5m"
+    res = await client.patch("/api/v1/projects/backup", json={"trigger": ""}, headers=auth(token))
     assert res.status_code == 200
-    assert res.json()["slot"]["trigger"] == ""
+    assert res.json()["project"]["trigger"] == ""
 
 
 async def test_slot_env_round_trip(yard):
     client, token, root = yard
     assert (await client.post("/api/v1/repos", json={"name": "heldso"}, headers=auth(token))).status_code == 200
     res = await client.post(
-        "/api/v1/slots",
-        json={"name": "heldso", "repo": "heldso", "domain": "heldso.example.com"},
+        "/api/v1/projects",
+        json={"name": "heldso", "repo": "heldso"},
         headers=auth(token),
     )
     assert res.status_code == 200
-    assert res.json()["slot"]["env"] == {}
-    vals = (await client.get("/api/v1/slots/heldso", headers=auth(token))).json()
+    assert res.json()["project"]["env"] == {}
+    vals = (await client.get("/api/v1/projects/heldso", headers=auth(token))).json()
     assert vals["name"] == "heldso"
-    assert vals["domain"] == "heldso.example.com"
+    assert "domain" not in vals
 
     # The slot env is a file on the host, closed to other users. The CLI quoting rule applies.
-    env_file = root / "env" / "heldso.env"
+    env_file = root / "projects" / "heldso" / "env"
     assert env_file.read_text() == ""
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
     res = await client.patch(
-        "/api/v1/slots/heldso",
+        "/api/v1/projects/heldso",
         json={"ref": "login", "env": {"API_TOKEN": "secret", "GREETING": "hi there"}},
         headers=auth(token),
     )
     assert res.status_code == 200
-    assert res.json()["slot"]["env"] == {"API_TOKEN": "secret", "GREETING": "hi there"}
+    assert res.json()["project"]["env"] == {"API_TOKEN": "secret", "GREETING": "hi there"}
     assert env_file.read_text() == 'API_TOKEN=secret\nGREETING="hi there"\n'
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
-    vals = (await client.get("/api/v1/slots/heldso", headers=auth(token))).json()
+    vals = (await client.get("/api/v1/projects/heldso", headers=auth(token))).json()
     assert vals["ref"] == "login"
     assert vals["repo"] == "heldso"
-    assert vals["domain"] == "heldso.example.com"
+    assert "domain" not in vals
     assert vals["env"] == {"API_TOKEN": "secret", "GREETING": "hi there"}
 
     # The list hides the env; only the single GET shows it.
-    listed = (await client.get("/api/v1/slots", headers=auth(token))).json()
+    listed = (await client.get("/api/v1/projects", headers=auth(token))).json()
     assert listed[0]["name"] == "heldso"
     assert "env" not in listed[0]
 
     # Deleting the slot removes the file.
-    assert (await client.delete("/api/v1/slots/heldso", headers=auth(token))).status_code == 200
+    assert (await client.delete("/api/v1/projects/heldso", headers=auth(token))).status_code == 200
     assert not env_file.exists()
 
 
@@ -210,17 +207,15 @@ async def test_slot_deploys_existing_revision(yard):
     assert (await client.post("/api/v1/repos", json={"name": "app"}, headers=auth(token))).status_code == 200
     sha = _commit_empty(root / "repos" / "app.git")
     res = await client.post(
-        "/api/v1/slots",
+        "/api/v1/projects",
         json={"name": "app", "repo": "app", "ref": "main"},
         headers=auth(token),
     )
     assert res.status_code == 200
-    deploy = res.json()["deploy"]
-    assert deploy["status"] == "skipped"
-    assert sha[:12] in deploy["image"]
-    vals = (await client.get("/api/v1/slots/app", headers=auth(token))).json()
-    assert vals["sha"] == ""
-    again = await client.post("/api/v1/slots/app/deploy", headers=auth(token))
+    assert "deploy" not in res.json()
+    vals = (await client.get("/api/v1/projects/app", headers=auth(token))).json()
+    assert vals["name"] == "app"
+    again = await client.post("/api/v1/projects/app/deploy", headers=auth(token))
     assert again.status_code == 200
     assert again.json()["deploy"]["status"] == "skipped"
     assert sha in again.text
@@ -258,21 +253,21 @@ async def test_slot_leaves_when_branch_merges(yard):
     sha = _seed_merged_feature(bare)
     assert (
         await client.post(
-            "/api/v1/slots",
+            "/api/v1/projects",
             json={"name": "shop", "repo": "shop", "ref": "main"},
             headers=auth(token),
         )
     ).status_code == 200
     res = await client.post(
-        "/api/v1/slots",
-        json={"name": "shop-wip", "repo": "shop", "ref": "feature", "domain": "wip.example.com"},
+        "/api/v1/projects",
+        json={"name": "shop-wip", "repo": "shop", "ref": "feature"},
         headers=auth(token),
     )
     assert res.status_code == 200
-    assert res.json()["slot"]["domain"] == "wip.example.com"
+    assert res.json()["project"]["ref"] == "feature"
     assert (
         await client.post(
-            "/api/v1/slots",
+            "/api/v1/projects",
             json={"name": "shop-also", "repo": "shop", "ref": "feature"},
             headers=auth(token),
         )
@@ -283,15 +278,15 @@ async def test_slot_leaves_when_branch_merges(yard):
         headers=local(token),
     )
     assert res.status_code == 200
-    assert "slot shop-wip removed: branch feature is in main" in res.text
-    assert "slot shop-also removed" in res.text
-    assert (await client.get("/api/v1/slots/shop-wip", headers=auth(token))).status_code == 404
-    assert (await client.get("/api/v1/slots/shop-also", headers=auth(token))).status_code == 404
-    assert (await client.get("/api/v1/slots/shop", headers=auth(token))).status_code == 200
+    assert "project shop-wip removed: branch feature is in main" in res.text
+    assert "project shop-also removed" in res.text
+    assert (await client.get("/api/v1/projects/shop-wip", headers=auth(token))).status_code == 404
+    assert (await client.get("/api/v1/projects/shop-also", headers=auth(token))).status_code == 404
+    assert (await client.get("/api/v1/projects/shop", headers=auth(token))).status_code == 200
 
     assert (
         await client.post(
-            "/api/v1/slots",
+            "/api/v1/projects",
             json={"name": "shop-wip", "repo": "shop", "ref": "feature"},
             headers=auth(token),
         )
@@ -303,9 +298,9 @@ async def test_slot_leaves_when_branch_merges(yard):
         headers=local(token),
     )
     assert res.status_code == 200
-    assert "slot shop-wip removed: branch feature was deleted" in res.text
-    assert (await client.get("/api/v1/slots/shop-wip", headers=auth(token))).status_code == 404
-    assert (await client.get("/api/v1/slots/shop", headers=auth(token))).status_code == 200
+    assert "project shop-wip removed: branch feature was deleted" in res.text
+    assert (await client.get("/api/v1/projects/shop-wip", headers=auth(token))).status_code == 404
+    assert (await client.get("/api/v1/projects/shop", headers=auth(token))).status_code == 200
 
 
 async def test_repo_git_reads_a_commit_and_fetch_needs_origin(yard):
@@ -320,7 +315,18 @@ async def test_repo_git_reads_a_commit_and_fetch_needs_origin(yard):
     )
     assert res.status_code == 200
     assert sha[:7] in res.json()["output"]
-    refused = await client.post("/api/v1/repos/heldso/git", json={"args": ["fetch"]}, headers=auth(token))
+    bare = await client.post(
+        "/api/v1/repos/heldso/git",
+        json={"args": ["rev-parse", "--is-bare-repository"]},
+        headers=auth(token),
+    )
+    assert bare.status_code == 200
+    assert "true" in bare.json()["output"]
+    refused = await client.post(
+        "/api/v1/repos/heldso/git",
+        json={"args": ["fetch", "origin"]},
+        headers=auth(token),
+    )
     assert refused.status_code == 400
     assert refused.json()["error"]["code"] == "git_failed"
 
@@ -355,6 +361,14 @@ def _git_value(key: str) -> str:
     if found.returncode != 0:
         return ""
     return found.stdout.strip()
+
+
+def _commit_worktree(directory: Path) -> None:
+    directory.mkdir(parents=True)
+    (directory / "Containerfile").write_text("FROM scratch\n")
+    _git(directory, "init", "-b", "main")
+    _git(directory, "add", ".")
+    _git(directory, "commit", "-m", "one")
 
 
 def _commit_empty(directory: Path) -> str:
@@ -420,20 +434,32 @@ async def test_slot_status_and_doctor(yard, monkeypatch):
     res = await client.post("/api/v1/repos", json={"name": "app"}, headers=auth(token))
     assert res.status_code == 200
     res = await client.post(
-        "/api/v1/slots",
-        json={"name": "heldso", "repo": "app", "ref": "main", "domain": "heldso.example.com"},
+        "/api/v1/projects",
+        json={"name": "heldso", "repo": "app", "ref": "main"},
         headers=auth(token),
     )
     assert res.status_code == 200
+    autosave = _root / "projects" / "yard" / "caddy" / "config" / "caddy" / "autosave.json"
+    autosave.parent.mkdir(parents=True)
+    autosave.write_text(
+        json.dumps(
+            [
+                {
+                    "match": [{"host": ["heldso.example.com"]}],
+                    "handle": [{"upstreams": [{"dial": "heldso:8000"}]}],
+                }
+            ]
+        )
+    )
 
-    page = (await client.get("/api/v1/slots/heldso/status", headers=auth(token))).json()
-    assert page["slot"]["name"] == "heldso"
-    assert "env" not in page["slot"]
+    page = (await client.get("/api/v1/projects/heldso/status", headers=auth(token))).json()
+    assert page["project"]["name"] == "heldso"
+    assert "env" not in page["project"]
     assert page["route"] == {"host": "heldso.example.com", "dial": "heldso:8000"}
     assert [row["container"] for row in page["rows"]] == ["heldso-app-1"]
     assert page["rows"][0]["answers"] is None
     assert "one" in page["log"]
-    res = await client.get("/api/v1/slots/nope/status", headers=auth(token))
+    res = await client.get("/api/v1/projects/nope/status", headers=auth(token))
     assert res.status_code == 404
 
     checks = {check["name"]: check for check in (await client.get("/api/v1/doctor", headers=auth(token))).json()}
@@ -447,28 +473,24 @@ async def test_slot_run(yard, monkeypatch):
     res = await client.post("/api/v1/repos", json={"name": "app"}, headers=auth(token))
     assert res.status_code == 200
     res = await client.post(
-        "/api/v1/slots",
+        "/api/v1/projects",
         json={"name": "nightly", "repo": "app", "trigger": "manual"},
         headers=auth(token),
     )
     assert res.status_code == 200
-    assert res.json()["slot"]["trigger"] == "manual"
+    assert res.json()["project"]["trigger"] == "manual"
 
     async def no_ps(self, *args, **kw):
         return "[]"
 
     monkeypatch.setattr(Podman, "run", no_ps)
-    res = await client.post("/api/v1/slots/nightly/run", headers=auth(token))
+    res = await client.post("/api/v1/projects/nightly/run", headers=auth(token))
     assert res.status_code == 409
 
-    store = Store.open(root / "data" / "yard")
-    try:
-        store.set_image("nightly", "localhost/app:abc")
-    finally:
-        store.close()
+    _commit_worktree(root / "projects" / "nightly" / "worktree")
 
     monkeypatch.setattr(deploy, "run_job", lambda *a, **k: _fake_job())
-    res = await client.post("/api/v1/slots/nightly/run", headers=auth(token))
+    res = await client.post("/api/v1/projects/nightly/run", headers=auth(token))
     assert res.status_code == 200
     assert res.json()["output"] == "ran nightly\n"
 
@@ -495,5 +517,43 @@ async def test_prune(yard, monkeypatch):
     body = res.json()
     assert body["days"] == 3
     assert body["dry"]
-    assert body["checkouts"] == []
+    assert "checkouts" not in body
     assert body["images"] == []
+
+
+async def test_route_commands_check_the_values(yard):
+    client, token, _root = yard
+    res = await client.get("/api/v1/binds", headers=auth(token))
+    assert res.status_code == 200
+    assert res.json() == []
+
+    res = await client.put(
+        "/api/v1/binds",
+        json={"host": "NOT A HOST", "dial": "heldso"},
+        headers=auth(token),
+    )
+    assert res.status_code == 400
+    assert res.json()["error"]["code"] == "bad_domain"
+
+    res = await client.put(
+        "/api/v1/binds",
+        json={"host": "heldso.example.com", "dial": "bad dial"},
+        headers=auth(token),
+    )
+    assert res.json()["error"]["code"] == "bad_dial"
+
+    res = await client.put(
+        "/api/v1/binds",
+        json={"host": "heldso.example.com", "dial": "heldso", "try": "soon"},
+        headers=auth(token),
+    )
+    assert res.json()["error"]["code"] == "bad_window"
+
+    res = await client.post("/api/v1/caddy", json={"args": []}, headers=auth(token))
+    assert res.json()["error"]["code"] == "bad_args"
+
+    res = await client.post("/api/v1/caddy", json={"args": ["version;rm"]}, headers=auth(token))
+    assert res.json()["error"]["code"] == "bad_args"
+
+    res = await client.post("/api/v1/podman", json={"args": []}, headers=auth(token))
+    assert res.json()["error"]["code"] == "bad_args"

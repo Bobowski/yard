@@ -1,14 +1,12 @@
-"""`yard doctor`: the host checks. Each returns ok and a one-line detail."""
+"""Host checks for `yard status --full`. Each returns ok and a one-line detail."""
 
 import asyncio
-import json
 import shutil
 import socket
 import ssl
 import stat
 import time
 from datetime import timedelta
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from app import caddy, podman
@@ -30,19 +28,23 @@ async def run(yard: Yard) -> list[dict]:
     ]
 
     slots = store.list_slots()
-    hosts = [route.host for route in caddy.routes(slots, config.domain)]
-    if config.caddy_sock is None:
+    if not config.boot:
         # A laptop run has no host network; the proxy checks do not apply.
         checks += [
             _row("caddy", (True, "skipped: no host")),
             _row("caddy routes", (True, "skipped: no host")),
             _row("acme", (True, "skipped: no host")),
         ]
+        hosts: list[str] = []
+        yard_hosts: set[str] = set()
     else:
         checks.append(_row("caddy", await _caddy_up(yard)))
-        checks.append(_row("caddy routes", await _routes(yard, config.caddy_sock, hosts)))
+        ok, detail, found = _routes(config)
+        checks.append(_row("caddy routes", (ok, detail)))
         checks.append(_row("acme", await _acme()))
-        yard_hosts = {slot.domain for slot in slots if slot.name == "yard"}
+        hosts = [row["host"] for row in found]
+        yard_hosts = {row["host"] for row in found if row["dial"].split(":", 1)[0] == "yard"}
+    if config.boot:
         for host in hosts:
             checks.append(_row(f"dns {host}", await _dns(host)))
             checks.append(_row(f"certificate {host}", _certificate(config, host)))
@@ -89,40 +91,9 @@ async def _caddy_up(yard: Yard) -> tuple[bool, str]:
     return (True, "running") if found.running else (False, f"{found.state} not running")
 
 
-async def _routes(yard: Yard, sock: Path, hosts: list[str]) -> tuple[bool, str]:
-    try:
-        raw = await asyncio.to_thread(
-            caddy.request,
-            sock,
-            "GET",
-            "/config/apps/http/servers/yard/routes",
-        )
-        found = _route_hosts(raw)
-    except Exception as exc:
-        return False, str(exc)
-    missing = sorted(set(hosts) - found)
-    extra = sorted(found - set(hosts))
-    if missing or extra:
-        parts = [f"missing: {', '.join(missing)}" if missing else "", f"extra: {', '.join(extra)}" if extra else ""]
-        return False, "  ".join(part for part in parts if part)
-    return True, f"{len(found)} routes"
-
-
-def _route_hosts(raw: bytes) -> set[str]:
-    try:
-        routes = json.loads(raw)
-    except json.JSONDecodeError:
-        return set()
-    found = set()
-    for route in routes if isinstance(routes, list) else []:
-        if not isinstance(route, dict):
-            continue
-        match = route.get("match")
-        if isinstance(match, list) and match and isinstance(match[0], dict):
-            names = match[0].get("host")
-            if isinstance(names, list) and names:
-                found.add(str(names[0]))
-    return found
+def _routes(config: Config) -> tuple[bool, str, list[dict[str, str]]]:
+    found = caddy.routes_from_autosave(config.autosave())
+    return True, f"{len(found)} routes", found
 
 
 async def _acme() -> tuple[bool, str]:
@@ -163,7 +134,7 @@ async def _dns(host: str) -> tuple[bool, str]:
 
 def _certificate(config: Config, host: str) -> tuple[bool, str]:
     # Caddy's /data volume is lib/, and it writes under a caddy/ directory in it.
-    root = config.data("caddy") / "lib" / "caddy" / "certificates"
+    root = config.caddy_data() / "caddy" / "certificates"
     found = list(root.glob(f"*/{host}/{host}.crt")) if root.is_dir() else []
     if not found:
         return False, "not issued yet"

@@ -51,10 +51,10 @@ def test_format_status_drops_empty_columns():
 
 def test_format_status_deploy_failed_hint():
     report = status_report()
-    assert status_hint(report) == "yard deploys shop"
+    assert status_hint(report) == "yard podman logs up-shop"
     for row in report["rows"]:
         row["deploy"] = None
-    assert status_hint(report) == "yard logs --slot shop"
+    assert status_hint(report) == "yard podman logs shop-app"
 
 
 def test_state_text_marks_no_answer_and_restarts():
@@ -78,14 +78,14 @@ def test_status_hint_points_a_dead_probe_at_logs():
         row["state"] = "running"
         row["health"] = ""
         row["answers"] = False
-    assert status_hint(report) == "yard logs --slot heldso"
+    assert status_hint(report) == "yard podman logs heldso-app"
 
 
 def test_format_slot_status():
     report = status_report()
     row = report["rows"][0]
     page = {
-        "slot": {
+        "project": {
             "name": "heldso",
             "repo": "heldso",
             "ref": "main",
@@ -103,7 +103,7 @@ def test_format_slot_status():
         "deploys": [
             {
                 "id": 12,
-                "slot": "heldso",
+                "project": "heldso",
                 "sha": "abc1234",
                 "status": "ok",
                 "started": stamp(days=4, minutes=2),
@@ -113,7 +113,7 @@ def test_format_slot_status():
             },
             {
                 "id": 11,
-                "slot": "heldso",
+                "project": "heldso",
                 "sha": "def5678",
                 "status": "failed",
                 "started": stamp(days=5, minutes=0, seconds=40),
@@ -144,9 +144,9 @@ def test_format_slot_status():
 
 def test_format_slot_status_minimal():
     page = {
-        "slot": {"name": "heldso", "sha": "", "image": "", "env": {}},
+        "project": {"name": "heldso", "sha": "", "image": "", "env": {}},
         "env_file": "/srv/yard/env/heldso.env",
-        "rows": [{"slot": "heldso", "state": "absent", "health": "down"}],
+        "rows": [{"project": "heldso", "state": "absent", "health": "down"}],
         "route": None,
         "deploys": [],
         "log": "",
@@ -178,20 +178,19 @@ def test_format_slot_and_parse_slot_round_trip():
         "env": {"API_TOKEN": "secret", "GREETING": "hi there"},
     }
     text = format_slot(slot)
-    assert text.startswith("# slot heldso\n# image localhost/heldso:a1b2c3d\n")
-    assert "# Yard sets SLOT_NAME SLOT_DATA_DIR SHA PORT in the container.\n" in text
-    assert "# The file is /srv/yard/env/heldso.env on the host.\n" in text
+    assert text.startswith("# project heldso\n# image localhost/heldso:a1b2c3d\n")
+    assert "# Yard sets PROJECT_NAME PROJECT_DATA_DIR SHA PORT in the container.\n" in text
+    assert "# The file is /srv/yard/projects/heldso/env on the host.\n" in text
     assert "STARIO" not in text
     assert 'GREETING="hi there"' in text
     assert "REPO=heldso" in text
     assert "REF=main" in text
-    assert "DOMAIN=heldso.example.com" in text
+    assert "DOMAIN=" not in text
     fields, env = parse_slot(text)
     assert fields == {
         "repo": "heldso",
         "ref": "main",
         "dir": "",
-        "domain": "heldso.example.com",
         "trigger": "",
     }
     assert env == {"API_TOKEN": "secret", "GREETING": "hi there"}
@@ -201,7 +200,9 @@ def test_slot_edit_patch():
     current = {"env": {"API_TOKEN": "secret", "OLD": "x"}, "repo": "heldso"}
     patch = slot_edit_patch(current, ["REF=dev", "API_TOKEN=rotated", "OLD="])
     assert patch == {"ref": "dev", "env": {"API_TOKEN": "rotated"}}
-    assert slot_edit_patch(current, ["DOMAIN=heldso.example.com"]) == {"domain": "heldso.example.com"}
+    assert slot_edit_patch(current, ["DOMAIN=heldso.example.com"]) == {
+        "env": {"API_TOKEN": "secret", "OLD": "x", "DOMAIN": "heldso.example.com"}
+    }
     assert slot_edit_patch(current, ["KEEP"]) == {"env": {"API_TOKEN": "secret", "OLD": "x"}}
 
 
@@ -209,7 +210,7 @@ def test_format_deploys():
     rows = [
         {
             "id": 3,
-            "slot": "heldso",
+            "project": "heldso",
             "sha": "abc1234567",
             "image": "localhost/heldso:abc1234",
             "status": "ok",

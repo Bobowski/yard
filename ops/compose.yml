@@ -38,13 +38,11 @@ services:
     ports:
       - "8443:8443"
     volumes:
-      - ${YARD_ROOT}/data/caddy:/config/caddy
-      - ${YARD_ROOT}/data/caddy/lib:/data
-      - ${YARD_ROOT}/run:/run/caddy
+      - ${YARD_ROOT}/projects/yard/caddy/config:/config
+      - ${YARD_ROOT}/projects/yard/caddy/data:/data
+      - ${CHECKOUT}/ops/caddy.json:/etc/caddy/yard.json:ro
     entrypoint: ["caddy"]
-    # The seed file lives inside the /run/caddy mount: a file bind source that
-    # goes missing becomes an empty directory on the host.
-    command: ["run", "--config", "/run/caddy/caddy.json", "--resume"]
+    command: ["run", "--config", "/etc/caddy/yard.json", "--resume"]
 
 networks:
   yard:
