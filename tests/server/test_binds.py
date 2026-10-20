@@ -65,7 +65,20 @@ def test_put_replaces_a_stored_id(tmp_path: Path):
     asyncio.run(binds.put_bind(yard, "heldso.example.com", "heldso:9000", "30s"))
     calls = [(m, p) for m, p, _b in _calls(yard)]
     assert ("GET", caddy.ROUTES_PATH) in calls
-    assert ("PUT", "/id/yard-heldso.example.com") in calls
+    assert ("PATCH", "/id/yard-heldso.example.com") in calls
+    assert _routes_for(yard, "heldso.example.com") == [
+        {"host": "heldso.example.com", "dial": "heldso:9000", "id": "yard-heldso.example.com", "try": "30s"}
+    ]
+
+
+def test_put_twice_replaces_under_a_stored_id(tmp_path: Path):
+    routes = [{"@id": "yard-heldso.example.com", "match": [{"host": ["heldso.example.com"]}]}]
+    yard = _yard(tmp_path, routes)
+    asyncio.run(binds.put_bind(yard, "heldso.example.com", "heldso:9000", "30s"))
+    asyncio.run(binds.put_bind(yard, "heldso.example.com", "heldso:9100", "45s"))
+    assert _routes_for(yard, "heldso.example.com") == [
+        {"host": "heldso.example.com", "dial": "heldso:9100", "id": "yard-heldso.example.com", "try": "45s"}
+    ]
 
 
 def test_put_adopts_a_route_without_an_id(tmp_path: Path):
@@ -76,7 +89,25 @@ def test_put_adopts_a_route_without_an_id(tmp_path: Path):
     yard = _yard(tmp_path, routes)
     asyncio.run(binds.put_bind(yard, "heldso.example.com", "heldso", "10s"))
     calls = [(m, p) for m, p, _b in _calls(yard)]
-    assert ("PUT", f"{caddy.ROUTES_PATH}/1") in calls
+    assert ("PATCH", f"{caddy.ROUTES_PATH}/1") in calls
+    assert _routes_for(yard, "heldso.example.com") == [
+        {"host": "heldso.example.com", "dial": "heldso:8000", "id": "yard-heldso.example.com", "try": "10s"}
+    ]
+    # The other route is untouched, at its index.
+    assert routes[0]["match"] == [{"host": ["other.example.com"]}]
+
+
+def test_put_twice_keeps_one_route_adopted_by_index(tmp_path: Path):
+    routes = [{"match": [{"host": ["heldso.example.com"]}]}]
+    yard = _yard(tmp_path, routes)
+    asyncio.run(binds.put_bind(yard, "heldso.example.com", "heldso:9000", "30s"))
+    asyncio.run(binds.put_bind(yard, "heldso.example.com", "heldso:9100", "45s"))
+    assert _routes_for(yard, "heldso.example.com") == [
+        {"host": "heldso.example.com", "dial": "heldso:9100", "id": "yard-heldso.example.com", "try": "45s"}
+    ]
+    calls = [(m, p) for m, p, _b in _calls(yard)]
+    assert ("PATCH", f"{caddy.ROUTES_PATH}/0") in calls
+    assert ("PATCH", "/id/yard-heldso.example.com") in calls
 
 
 def test_delete_uses_the_id(tmp_path: Path):
@@ -183,6 +214,7 @@ def test_put_keeps_the_other_host(tmp_path: Path):
     calls = [(m, p) for m, p, _b in _calls(yard)]
     assert ("DELETE", "/id/yard-old.example.com") not in calls
     assert ("POST", caddy.ROUTES_PATH) in calls
+    assert [row["match"][0]["host"][0] for row in routes] == ["old.example.com", "new.example.com"]
 
 
 def test_a_dead_socket_is_a_caddy_error(tmp_path: Path):
@@ -196,3 +228,8 @@ def test_a_dead_socket_is_a_caddy_error(tmp_path: Path):
 
 def _calls(yard: Yard) -> list[tuple[str, str, bytes | None]]:
     return cast(FakeCaddy, yard.caddy).calls
+
+
+def _routes_for(yard: Yard, host: str) -> list[dict[str, str]]:
+    rows = caddy.read_routes(json.dumps(cast(FakeCaddy, yard.caddy).routes))
+    return [row for row in rows if row["host"] == host]

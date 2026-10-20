@@ -45,9 +45,10 @@ async def put_bind(yard: Yard, host: str, dial: str, window: str, *, actor: str 
         await yard.caddy.request("POST", caddy.ROUTES_PATH, body)
     else:
         # A stored id is one object. An older route has no id, so the write uses its index.
+        # PATCH replaces. PUT would insert into the array or strictly create under /id.
         index, ident = found
         path = f"/id/{quote(ident, safe='')}" if ident else f"{caddy.ROUTES_PATH}/{index}"
-        await yard.caddy.request("PUT", path, body)
+        await yard.caddy.request("PATCH", path, body)
     bind = Bind(host, target, caddy.route_id(host), span)
     bind.state = _state(target.split(":", 1)[0], await _containers(yard))
     journal.send(yard.config, "bind.put", f"bind {host}", host=host, dial=target, actor=actor)
