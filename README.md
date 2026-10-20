@@ -106,7 +106,7 @@ Install on the VM, as root:
 ./install.sh --domain yard.example.com
 ```
 
-`install.sh` prepares the host, configures journald and Podman's journald settings, clones the Yard repo, builds the apply image, and runs the first apply. The `deploy-yard` container is that deploy. A second run repairs. It never asks questions; at the end it prints the next steps.
+`install.sh` prepares the host, installs a pinned Podman (static build, currently 6.1.4) for the yard user — Ubuntu's 4.9 drops container labels on the compat list endpoint, so Compose would recreate every container on every up — configures journald and Podman's journald settings, clones the Yard repo, builds the apply image, and runs the first apply. The `deploy-yard` container is that deploy. A second run repairs. It never asks questions; at the end it prints the next steps.
 
 The script prints an admin token. Use it with `yard login`, then run `yard forge setup origin` or `yard forge setup github`, and point the yard app at its repo with `yard app set` so pushes to Yard deploy Yard itself.
 

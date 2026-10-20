@@ -7,12 +7,13 @@ RUN apt-get update && \
 RUN mkdir -p /out/usr/bin
 
 ADD https://github.com/stunnel/static-curl/releases/download/8.22.0/curl-linux-x86_64-glibc-8.22.0.tar.xz /tmp/curl.tar.xz
-ADD https://github.com/containers/podman/releases/download/v4.9.3/podman-remote-static-linux_amd64.tar.gz /tmp/podman-remote.tar.gz
+ADD https://github.com/containers/podman/releases/download/v6.1.4/podman-remote-static-linux_amd64.tar.gz /tmp/podman-remote.tar.gz
 ADD https://github.com/docker/compose/releases/download/v5.3.1/docker-compose-linux-x86_64 /tmp/docker-compose
 
 RUN echo "d74460e43c0e6eaf40ec1fdda92c53dee94da8a6e6db066711541ada5aab0fa6  /tmp/curl.tar.xz" | sha256sum -c && \
     tar -xJf /tmp/curl.tar.xz -C /out/usr/bin && \
     chmod 755 /out/usr/bin/curl && \
+    echo "af1f85c22214088a0a9986b9c82b4c9b5b74eda8ecaa6c8cca82b1a63f339b4a  /tmp/podman-remote.tar.gz" | sha256sum -c && \
     tar -xzf /tmp/podman-remote.tar.gz -C /tmp && \
     strip --strip-debug /tmp/bin/podman-remote-static-linux_amd64 && \
     install -D -m 755 /tmp/bin/podman-remote-static-linux_amd64 /out/usr/local/bin/podman && \
