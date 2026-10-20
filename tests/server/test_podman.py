@@ -1,0 +1,93 @@
+from datetime import UTC, datetime
+
+from app.server.podman import parse_images, parse_info, parse_ps, parse_stats
+from app.shared import stamp as format_stamp
+
+
+def _unix(seconds: int) -> datetime:
+    return datetime.fromtimestamp(seconds, UTC)
+
+
+def test_parse_stats_and_ps():
+    # Podman 4.9 --format json prints snake_case keys; table headers also parse.
+    samples = parse_stats('[{"name":"heldso","cpu_percent":"1.5%","mem_usage":"20MB / 1GB"}]')
+    assert samples["heldso"].cpu == "1.5%"
+    assert samples["heldso"].mem == "20MB / 1GB"
+    assert samples["heldso"].cpu_percent == 1.5
+    assert samples["heldso"].mem_bytes == 20_000_000
+    old = parse_stats('[{"Name":"heldso","CPUPerc":"1.5%","MemUsage":"20MB / 1GB"}]')
+    assert old["heldso"].cpu == "1.5%"
+    raw = """[
+        {"Names":["heldso"],"State":"running","Status":"Up 2 minutes (healthy)",
+         "StartedAt":1710000000,"ExitCode":0,"Restarts":3},
+        {"Names":["shop"],"State":"exited","Status":"Exited (1) 4 minutes ago","ExitedAt":1710000200,"ExitCode":1}
+    ]"""
+    got = parse_ps(raw)
+    assert got["heldso"].running
+    assert got["heldso"].restarts == 3
+    assert got["shop"].restarts == 0
+    assert got["heldso"].health == "healthy"
+    assert got["heldso"].started == _unix(1710000000)
+    assert not got["shop"].running
+    assert got["shop"].exit_code == 1
+    assert got["shop"].health == ""
+    assert got["shop"].exited == _unix(1710000200)
+
+
+def test_parse_ps_reads_name_and_labels():
+    raw = """[
+        {"Id":"app","Names":["heldso-app-1"],
+         "Labels":{"com.docker.compose.project":"heldso","com.docker.compose.service":"app"}},
+        {"Id":"run","Names":["up-backup-job"]},
+        {"Id":"build","Names":["deploy-backup"]},
+        {"Id":"bare","Names":["caddy"]}
+    ]"""
+    got = parse_ps(raw)
+
+    # An app container: compose's project is the app, its service is the service.
+    assert got["heldso-app-1"].app == "heldso"
+    assert got["heldso-app-1"].service == "app"
+    assert got["heldso-app-1"].role == "app"
+
+    # An apply container is deploy-<app>. A leftover up-<app> or -job name is the same.
+    assert got["up-backup-job"].app == "backup"
+    assert got["up-backup-job"].service == ""
+    assert got["up-backup-job"].role == "deploy"
+    assert got["deploy-backup"].app == "backup"
+    assert got["deploy-backup"].role == "deploy"
+
+    # A container with no compose labels has no app.
+    assert got["caddy"].app == ""
+    assert got["caddy"].service == ""
+    assert got["caddy"].role == "app"
+
+
+def test_parse_info():
+    raw = (
+        '{"host":{"cpus":12,"memTotal":67320864768},'
+        '"store":{"graphRootAllocated":467909804032},"version":{"Version":"5.3.1"}}'
+    )
+    host = parse_info(raw)
+    assert host.cpus == 12
+    assert host.version == "5.3.1"
+    assert host.mem == 67320864768
+    assert host.disk == 467909804032
+    assert parse_info("nope").cpus == 0
+
+
+def test_parse_images():
+    raw = (
+        '[{"Names": ["localhost/app:abc", "localhost/app:latest"], "Created": 1710000000, "Size": 400},'
+        ' {"Names": ["<none>"], "Created": "bad", "Size": "x"}]'
+    )
+    found = parse_images(raw)
+    assert [image.name for image in found] == ["localhost/app:abc", "localhost/app:latest", "<none>"]
+    assert found[0].created == _unix(1710000000)
+    assert found[0].size == 400
+    assert found[2].created is None
+    assert found[2].size == 0
+
+
+def test_format_stamp():
+    assert format_stamp(datetime(2026, 10, 5, 12, 0, 0, tzinfo=UTC)) == "2026-10-05T12:00:00Z"
+    assert format_stamp(datetime(2026, 10, 5, 12, 0, 0, 120000, tzinfo=UTC)) == "2026-10-05T12:00:00.12Z"

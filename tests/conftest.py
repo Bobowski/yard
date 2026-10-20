@@ -3,15 +3,15 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from stario.testing import TestClient
 
-from app.main import bootstrap
+from app.server.main import bootstrap
 
 
 @pytest.fixture
 async def yard(tmp_path, monkeypatch):
+    """The API over TestClient. No podman, no boot steps, no deploys."""
     monkeypatch.setenv("YARD_ROOT", str(tmp_path))
     monkeypatch.setenv("YARD_SKIP_DEPLOY", "1")
     monkeypatch.setenv("YARD_BOOT", "0")
-    monkeypatch.setenv("YARD_HOOK_URL", "http://127.0.0.1:8000")
     monkeypatch.setenv("YARD_PODMAN_BIN", "yard-podman-missing")
     async with TestClient(bootstrap) as client:
         token = (tmp_path / "tokens" / "admin.token").read_text().strip()
@@ -42,94 +42,101 @@ def status_report() -> dict:
             "cpu_used": 2.0,
             "mem_used": 30_000_000,
             "data_used": 10_000_000,
+            "forges": {"origin": True, "github": False},
         },
         "rows": [
             {
-                "project": "heldso",
+                "app": "heldso",
                 "container": "heldso-app",
                 "service": "app",
                 "state": "running",
                 "running": True,
                 "health": "healthy",
                 "exit_code": 0,
+                "id": "aa11bb22cc33",
                 "started": stamp(hours=2),
                 "exited": "",
                 "image": "localhost/heldso:abc1234",
                 "sha": "abc1234",
                 "tip": "f00ba12",
-                "domain": "heldso.example.com",
+                "binds": [{"host": "heldso.example.com", "dial": "heldso:8000"}],
                 "cpu": "1.5%",
                 "mem": "20MB / 1GB",
                 "data": 10_000_000,
                 "deploy": {
-                    "id": 3,
                     "status": "ok",
                     "sha": "abc1234",
                     "started": stamp(minutes=120),
-                    "built": stamp(minutes=119),
                     "ended": stamp(minutes=118),
                 },
             },
             {
-                "project": "shop",
+                "app": "shop",
                 "container": "shop-app",
                 "service": "app",
                 "state": "exited",
                 "running": False,
                 "health": "",
                 "exit_code": 1,
+                "id": "dd44ee55ff66",
+                "oom": False,
+                "error": "",
                 "started": "",
                 "exited": stamp(hours=3),
                 "image": "localhost/shop:def5678",
                 "sha": "def5678",
                 "tip": "",
-                "domain": "",
+                "binds": [],
                 "cpu": "",
                 "mem": "",
                 "data": 0,
                 "deploy": {
-                    "id": 2,
                     "status": "failed",
                     "sha": "def5678",
                     "started": stamp(hours=3),
-                    "built": "",
                     "ended": stamp(hours=3),
                 },
             },
             {
-                "project": "nightly",
+                "app": "nightly",
                 "container": "",
                 "service": "",
                 "state": "absent",
                 "running": False,
-                "health": "idle",
+                "health": "down",
                 "exit_code": 0,
+                "id": "",
+                "oom": False,
+                "error": "",
                 "started": "",
                 "exited": "",
                 "image": "",
                 "sha": "",
                 "tip": "",
-                "domain": "",
-                "trigger": "every 5m",
+                "binds": [],
+                "trigger": "manual",
                 "cpu": "",
                 "mem": "",
                 "data": 0,
                 "deploy": None,
             },
             {
-                "project": "",
+                "app": "",
                 "container": "caddy",
                 "service": "",
                 "state": "running",
                 "running": True,
                 "health": "",
                 "exit_code": 0,
+                "id": "001122334455",
+                "oom": False,
+                "error": "",
                 "started": stamp(days=1),
                 "exited": "",
                 "image": "docker.io/library/caddy:2",
                 "sha": "",
                 "tip": "",
-                "domain": "",
+                "binds": [],
                 "cpu": "0.5%",
                 "mem": "10MB / 1GB",
                 "data": 0,

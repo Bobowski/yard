@@ -94,23 +94,14 @@ ensure_dir() {
 }
 
 ensure_dir "$root"
-# Yard's container writes projects/<slot>/worktree as the yard user. A root-owned
+# Yard's container writes apps/<name>/repo as the yard user. A root-owned
 # directory here would reject every deploy on a fresh host.
-ensure_dir "$root/projects"
-ensure_dir "$root/projects/yard"
-ensure_dir "$root/projects/yard/caddy"
-ensure_dir "$root/projects/yard/caddy/config"
-ensure_dir "$root/projects/yard/caddy/data"
-ensure_dir "$root/repos"
-install -d -o yard -g yard -m 700 "$root/projects/yard"
-if [ -n "$domain" ]; then
-  touch "$root/projects/yard/env"
-  grep -v '^YARD_DOMAIN=' "$root/projects/yard/env" > "$root/projects/yard/env.tmp" || true
-  printf 'YARD_DOMAIN=%s\n' "$domain" >> "$root/projects/yard/env.tmp"
-  mv "$root/projects/yard/env.tmp" "$root/projects/yard/env"
-  chown yard:yard "$root/projects/yard/env"
-  chmod 600 "$root/projects/yard/env"
-fi
+ensure_dir "$root/apps/yard"
+ensure_dir "$root/apps/yard/caddy"
+ensure_dir "$root/apps/yard/caddy/config"
+ensure_dir "$root/apps/yard/caddy/data"
+ensure_dir "$root/apps/yard/caddy/run"
+install -d -o yard -g yard -m 700 "$root/apps/yard"
 
 if systemctl list-unit-files caddy.service >/dev/null 2>&1; then
   systemctl disable --now caddy.service >/dev/null 2>&1 || true
@@ -259,6 +250,36 @@ while [ ! -d "/run/user/${uid}" ]; do
   sleep 1
 done
 
+# Container logs go to journald so they survive a container recreate.
+# Persistent storage is what splits per-user journals for the yard user.
+install -d /etc/systemd/journald.conf.d
+journald_conf='[Journal]
+Storage=persistent
+SystemMaxUse=2G
+RateLimitIntervalSec=30s
+RateLimitBurst=20000'
+if [ "$(cat /etc/systemd/journald.conf.d/yard.conf 2>/dev/null)" != "$journald_conf" ]; then
+  printf '%s\n' "$journald_conf" > /etc/systemd/journald.conf.d/yard.conf
+  mkdir -p /var/log/journal
+  systemd-tmpfiles --create --prefix /var/log/journal
+  systemctl restart systemd-journald
+fi
+
+# Rootless Podman ships container logs and engine events to journald; the Yard API reads them.
+install -d -o yard -g yard /home/yard/.config /home/yard/.config/containers
+containers_conf='[containers]
+log_driver = "journald"
+
+[engine]
+events_logger = "journald"'
+if [ "$(cat /home/yard/.config/containers/containers.conf 2>/dev/null)" != "$containers_conf" ]; then
+  printf '%s\n' "$containers_conf" > /home/yard/.config/containers/containers.conf
+  chown yard:yard /home/yard/.config/containers/containers.conf
+  chmod 644 /home/yard/.config/containers/containers.conf
+  run_yard systemctl --user stop podman.service >/dev/null 2>&1 || true
+  run_yard systemctl --user restart podman.socket
+fi
+
 run_yard systemctl --user enable --now podman.socket
 sock="/run/user/${uid}/podman/podman.sock"
 if ! retry 30 sh -c "test -S '$sock'"; then
@@ -292,39 +313,19 @@ if [ -f /etc/systemd/system/yard-tailscale.service ]; then
   systemctl daemon-reload
 fi
 
-# The bare repo and the image build stay in shell; Python does the first deploy.
-repo="$root/repos/yard.git"
-if [ ! -d "$repo" ]; then
-  run_yard git clone --bare "$origin" "$repo" || die "Could not clone ${origin}." \
-    "The host keeps that bare repo and builds Yard from it." \
+# The Yard clone and the image build stay in shell; Python does the first deploy.
+# An existing clone is left as it is; the running Yard owns it from then on.
+src="$root/apps/yard/repo"
+if [ ! -d "$src/.git" ]; then
+  run_yard git clone --depth 1 "$origin" "$src" || die "Could not clone ${origin}." \
+    "The host clones Yard once. After the first deploy, pushes keep it moving." \
     "Hint: git ls-remote ${origin} HEAD" \
     "Context: clone failed for user yard."
-  run_yard git -C "$repo" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
-  run_yard git -C "$repo" config uploadpack.allowFilter true
-  run_yard git -C "$repo" remote set-head origin -a || true
 fi
-run_yard git -C "$repo" fetch origin || die "Could not fetch origin." \
-  "The install follows main. Fetch fast-forwards main from origin." \
-  "Hint: git -C ${repo} remote -v" \
-  "Context: fetch failed for user yard."
-sha="$(run_yard git -C "$repo" rev-parse refs/remotes/origin/main)"
+sha="$(run_yard git -C "$src" rev-parse HEAD)"
 short="$(printf '%s' "$sha" | cut -c1-12)"
 
-src="$root/projects/yard/worktree"
-if [ ! -e "$src/.git" ]; then
-  run_yard git -C "$repo" worktree add --detach "$src" "$sha" || die "Could not check out ${sha}." \
-    "The worktree is ${src}." \
-    "Hint: git -C ${repo} worktree add --detach ${src} ${sha}" \
-    "Context: worktree add failed for user yard."
-else
-  run_yard git -C "$src" checkout -f --detach "$sha" || die "Could not check out ${sha}." \
-    "The worktree is ${src}." \
-    "Hint: git -C ${src} checkout -f --detach ${sha}" \
-    "Context: checkout failed for user yard."
-  run_yard git -C "$src" clean -fd
-fi
-
-ensure_dir "$root/projects/yard/data"
+ensure_dir "$root/apps/yard/data"
 ensure_dir "$root/tokens"
 
 run_yard podman build -t localhost/yard-apply -f "$src/ops/apply/Containerfile" "$src/ops/apply" || die "Could not build the apply image." \
@@ -332,15 +333,15 @@ run_yard podman build -t localhost/yard-apply -f "$src/ops/apply/Containerfile" 
   "Hint: sudo -u yard podman build -f ${src}/ops/apply/Containerfile ${src}/ops/apply" \
   "Context: the build failed for user yard."
 
-# One apply container builds and starts Yard, the same way Yard deploys slots.
-# The -e set matches what compose.apply passes for the yard slot.
-run_yard podman run --replace --name up-yard --network yard \
+# One apply container builds and starts Yard, the same way Yard deploys apps.
+# The -e set matches what compose.apply passes for the yard app.
+run_yard podman run --replace --name deploy-yard --network yard \
   -v "$sock:/run/podman/podman.sock" -v "$root:$root" \
-  -e COMPOSE_PROJECT_NAME=yard -e COMPOSE_FILE="$src/ops/compose.yml" -e PREVIOUS= \
-  -e APP_ENV="$root/projects/yard/env" -e CHECKOUT="$src" -e DATA_DIR="$root/projects/yard/data" \
+  -e COMPOSE_PROJECT_NAME=yard -e COMPOSE_FILE="$src/ops/compose.yml" \
+  -e APP_ENV="$root/apps/yard/env" -e CHECKOUT="$src" -e DATA_DIR="$root/apps/yard/data" \
   -e IMAGE="localhost/yard:$short" -e SHA="$sha" -e PROJECT_NAME=yard \
   -e YARD_ROOT="$root" -e YARD_PODMAN_SOCK="$sock" \
-  localhost/yard-apply up || die "The first deploy failed." "Hint: podman logs up-yard"
+  localhost/yard-apply up || die "The first deploy failed." "Hint: podman logs deploy-yard"
 
 i=0
 while [ ! -s "$root/tokens/admin.token" ] && [ "$i" -lt 60 ]; do
@@ -358,4 +359,10 @@ else
   echo "url: pass --domain to publish this host"
 fi
 echo "local: http://127.0.0.1:8000"
-run_yard podman exec -e YARD_URL=http://127.0.0.1:8000 -e YARD_TOKEN="$token" yard-app-1 /workspace/.venv/bin/yard status --full || true
+
+# Setup runs on the laptop, through the yard CLI.
+echo ""
+echo "Next steps:"
+echo "  yard login --url https://${domain:-<domain>} --token <token>"
+echo "  yard forge setup origin    # or: yard forge setup github"
+echo "  yard app set --app yard --repo <host>/<owner>/yard --trigger push"

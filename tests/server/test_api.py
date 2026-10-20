@@ -1,0 +1,783 @@
+import hashlib
+import hmac
+import json
+import stat
+
+from app.server import apps, caddy, journal
+from app.server.caddy import Caddy
+from app.server.forges import GitHub, Origin
+from app.server.podman import Podman
+from app.shared import YardError
+from tests.conftest import auth
+
+
+async def test_health(yard):
+    client, _token, _root = yard
+    res = await client.get("/health")
+    assert res.status_code == 200
+
+
+async def test_apps_need_a_token(yard):
+    client, _token, _root = yard
+    res = await client.get("/api/v1/apps")
+    assert res.status_code == 401
+    assert "unauthorized" in res.text
+
+
+async def test_app_create_needs_a_name_and_a_repo(yard):
+    client, token, _root = yard
+    for body in (
+        {"name": "", "repo": "https://origin.cursor.com/org/heldso"},
+        {"name": " ", "repo": "https://origin.cursor.com/org/heldso"},
+        {"repo": "https://origin.cursor.com/org/heldso"},
+        {"name": "heldso"},
+        {"name": "heldso", "repo": " "},
+    ):
+        res = await client.post("/api/v1/apps", json=body, headers=auth(token))
+        assert res.status_code == 400
+        assert res.json()["error"]["code"] == "bad_json"
+
+    res = await client.post(
+        "/api/v1/apps",
+        json={"name": "yard-sampler", "repo": "https://origin.cursor.com/org/heldso"},
+        headers=auth(token),
+    )
+    assert res.status_code == 400
+    assert "bad_name" in res.text
+
+    res = await client.post(
+        "/api/v1/apps",
+        json={"name": "caddy", "repo": "https://origin.cursor.com/org/heldso"},
+        headers=auth(token),
+    )
+    assert res.status_code == 400
+    assert "bad_name" in res.text
+
+    res = await client.post(
+        "/api/v1/apps",
+        json={"name": "heldso", "repo": "not-a-repo"},
+        headers=auth(token),
+    )
+    assert res.status_code == 400
+    assert "bad_repo" in res.text
+
+
+async def test_app_round_trip(yard, monkeypatch):
+    client, token, _root = yard
+
+    async def fake_run(self, *args, timeout=None, env=None, stdin=None):
+        return "[]"
+
+    monkeypatch.setattr(Podman, "run", fake_run)
+    res = await client.post(
+        "/api/v1/apps",
+        json={"name": "heldso", "repo": "https://origin.cursor.com/org/heldso"},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+    app = res.json()["app"]
+    assert app["repo"] == "https://origin.cursor.com/org/heldso"
+    assert app["ref"] == "main"
+    assert app["trigger"] == "push"
+    assert "env" not in app
+
+    res = await client.post(
+        "/api/v1/apps",
+        json={"name": "other", "repo": "https://origin.cursor.com/org/heldso", "ref": "side", "trigger": "manual"},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+    assert res.json()["app"]["trigger"] == "manual"
+
+    res = await client.patch("/api/v1/apps/heldso", json={"ref": "release"}, headers=auth(token))
+    assert res.status_code == 200
+    assert res.json()["app"]["ref"] == "release"
+
+    res = await client.patch("/api/v1/apps/heldso", json={}, headers=auth(token))
+    assert res.status_code == 400
+    assert "nothing to change" in res.text
+
+    page = (await client.get("/api/v1/apps/heldso", headers=auth(token))).json()
+    assert page["app"]["name"] == "heldso"
+    assert page["app"]["ref"] == "release"
+    assert "env" not in page["app"]
+
+    listed = (await client.get("/api/v1/apps", headers=auth(token))).json()
+    assert [row["name"] for row in listed] == ["heldso", "other"]
+    assert "env" not in listed[0]
+
+    res = await client.delete("/api/v1/apps/heldso", headers=auth(token))
+    assert res.status_code == 200
+    res = await client.get("/api/v1/apps/heldso", headers=auth(token))
+    assert res.status_code == 404
+
+
+async def test_app_trigger_is_push_or_manual(yard):
+    client, token, _root = yard
+    res = await client.post(
+        "/api/v1/apps",
+        json={"name": "backup", "repo": "https://origin.cursor.com/org/app", "trigger": "every 5m"},
+        headers=auth(token),
+    )
+    assert res.status_code == 400
+    assert "bad_trigger" in res.text
+
+    res = await client.post(
+        "/api/v1/apps",
+        json={"name": "backup", "repo": "https://origin.cursor.com/org/app", "trigger": "manual"},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+    assert res.json()["app"]["trigger"] == "manual"
+
+    res = await client.patch("/api/v1/apps/backup", json={"trigger": ""}, headers=auth(token))
+    assert res.status_code == 200
+    assert res.json()["app"]["trigger"] == "push"
+
+
+async def test_env_api(yard):
+    client, token, root = yard
+    res = await client.post(
+        "/api/v1/apps",
+        json={"name": "heldso", "repo": "https://origin.cursor.com/org/heldso"},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+
+    env_file = root / "apps" / "heldso" / "env"
+    assert env_file.read_text() == ""
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+
+    res = await client.patch(
+        "/api/v1/apps/heldso/env",
+        json={"API_TOKEN": "secret", "GREETING": "hi there"},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+    assert res.json() == {"keys": ["API_TOKEN", "GREETING"]}
+    assert env_file.read_text() == 'API_TOKEN=secret\nGREETING="hi there"\n'
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+    # The atomic write leaves no tmp file behind.
+    assert sorted(path.name for path in env_file.parent.iterdir()) == ["app", "env"]
+
+    # A null value removes the key.
+    res = await client.patch(
+        "/api/v1/apps/heldso/env",
+        json={"GREETING": None},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+    assert res.json() == {"keys": ["API_TOKEN"]}
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+
+    # PUT replaces the whole file.
+    res = await client.put(
+        "/api/v1/apps/heldso/env",
+        json={"ONLY": "this"},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+    assert res.json() == {"keys": ["ONLY"]}
+
+    res = await client.get("/api/v1/apps/heldso/env", headers=auth(token))
+    assert res.json() == {"ONLY": "this"}
+
+    res = await client.patch(
+        "/api/v1/apps/heldso/env",
+        json={"1BAD": "x"},
+        headers=auth(token),
+    )
+    assert res.status_code == 400
+    assert "bad_key" in res.text
+
+    # Deleting the app removes the directory.
+    assert (await client.delete("/api/v1/apps/heldso", headers=auth(token))).status_code == 200
+    assert not env_file.exists()
+
+
+async def test_app_deploy_reports_the_outcome(yard):
+    client, token, _root = yard
+    res = await client.post(
+        "/api/v1/apps",
+        json={"name": "heldso", "repo": "https://origin.cursor.com/org/heldso"},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+    res = await client.post("/api/v1/apps/heldso/deploy", headers=auth(token))
+    assert res.status_code == 200
+    body = res.json()
+    assert body["app"]["name"] == "heldso"
+    # YARD_SKIP_DEPLOY is set in the fixture.
+    assert body["deploy"]["status"] == "skipped"
+
+    res = await client.post("/api/v1/apps/nope/deploy", headers=auth(token))
+    assert res.status_code == 404
+
+
+async def test_tokens(yard):
+    client, admin, _root = yard
+    res = await client.post("/api/v1/tokens", json={"name": "ada"}, headers=auth(admin))
+    assert res.status_code == 200
+    ada = res.json()["token"]
+    res = await client.get("/api/v1/tokens", headers=auth(admin))
+    names = {row["name"] for row in res.json()}
+    assert names == {"admin", "ada"}
+    assert (await client.get("/api/v1/apps", headers=auth(ada))).status_code == 200
+
+    res = await client.delete("/api/v1/tokens/admin", headers=auth(admin))
+    assert res.status_code == 403
+    assert res.json()["error"]["code"] == "forbidden"
+    res = await client.delete("/api/v1/tokens/nobody", headers=auth(admin))
+    assert res.status_code == 404
+
+    res = await client.delete("/api/v1/tokens/ada", headers=auth(admin))
+    assert res.status_code == 200
+    assert (await client.get("/api/v1/apps", headers=auth(ada))).status_code == 401
+
+
+async def test_podman_allowlist(yard, monkeypatch):
+    client, token, _root = yard
+
+    async def fake_run(self, *args, timeout=None, env=None, stdin=None):
+        return "ok\n"
+
+    monkeypatch.setattr(Podman, "run", fake_run)
+    for verb in ("rm", "run", "exec", "kill", "build"):
+        res = await client.post("/api/v1/podman", json={"args": [verb, "x"]}, headers=auth(token))
+        assert res.status_code == 400, verb
+        assert res.json()["error"]["code"] == "bad_args"
+    for verb in ("ps", "logs", "inspect", "stats", "top", "images", "port"):
+        res = await client.post("/api/v1/podman", json={"args": [verb]}, headers=auth(token))
+        assert res.status_code == 200, verb
+    res = await client.post("/api/v1/podman", json={"args": []}, headers=auth(token))
+    assert res.status_code == 400
+
+
+async def test_prune(yard, monkeypatch):
+    client, token, _root = yard
+
+    async def fake_run(self, *args, **kw):
+        if args and args[0] == "images":
+            return "[]"
+        return ""
+
+    monkeypatch.setattr(Podman, "run", fake_run)
+    res = await client.post("/api/v1/prune", json={"days": 0}, headers=auth(token))
+    assert res.status_code == 400
+    assert res.json()["error"]["code"] == "bad_json"
+
+    res = await client.post("/api/v1/prune", json={"days": 3, "dry": True}, headers=auth(token))
+    assert res.status_code == 200
+    body = res.json()
+    assert body["days"] == 3
+    assert body["dry"]
+    assert body["images"] == []
+
+
+async def test_binds_check_the_values(yard, monkeypatch):
+    client, token, _root = yard
+
+    async def fake_request(self, method, path, body=None):
+        return 200, b"[]"
+
+    monkeypatch.setattr(Caddy, "request", fake_request)
+    res = await client.get("/api/v1/binds", headers=auth(token))
+    assert res.status_code == 200
+    assert res.json() == []
+
+    res = await client.put(
+        "/api/v1/binds/NOT%20A%20HOST",
+        json={"dial": "heldso"},
+        headers=auth(token),
+    )
+    assert res.status_code == 400
+    assert res.json()["error"]["code"] == "bad_domain"
+
+    res = await client.put(
+        "/api/v1/binds/heldso.example.com",
+        json={"dial": "bad dial"},
+        headers=auth(token),
+    )
+    assert res.json()["error"]["code"] == "bad_dial"
+
+    res = await client.put(
+        "/api/v1/binds/heldso.example.com",
+        json={"dial": "heldso", "try": "soon"},
+        headers=auth(token),
+    )
+    assert res.json()["error"]["code"] == "bad_window"
+
+
+async def test_binds_fail_when_caddy_is_down(yard):
+    client, token, _root = yard
+    res = await client.get("/api/v1/binds", headers=auth(token))
+    assert res.status_code == 502
+    assert res.json()["error"]["code"] == "caddy"
+
+
+async def test_origin_hook_status_codes(yard):
+    client, _token, _root = yard
+    payload = {
+        "event": {
+            "type": "repository.pushed",
+            "payload": {"repository": {"owner": {"slug": "org"}, "name": "heldso"}},
+        }
+    }
+    res = await client.post("/hooks/origin", content=json.dumps(payload))
+    assert res.status_code == 204
+    res = await client.post(
+        "/hooks/origin",
+        content=json.dumps({"event": {"type": "installation.created", "payload": {}}}),
+    )
+    assert res.status_code == 204
+    res = await client.post(
+        "/hooks/origin",
+        content=json.dumps({"event": {"type": "something.else", "payload": {}}}),
+    )
+    assert res.status_code == 204
+
+    res = await client.post("/hooks/origin", content="not json")
+    assert res.status_code == 400
+    assert res.json()["error"]["code"] == "bad_json"
+
+    res = await client.post("/hooks/origin", content="x" * (1 << 20 | 1))
+    assert res.status_code == 413
+
+
+async def test_origin_hook_marks_the_delivery(yard, monkeypatch):
+    """last_delivery shows in the doctor origin webhook row."""
+    client, token, _root = yard
+    monkeypatch.setattr(Origin, "connected", lambda self: True)
+
+    async def fake_get_app(self):
+        return {"displayName": "yard"}
+
+    async def fake_find(self):
+        return {"repoSelectionMode": "all"}
+
+    async def fake_token(self):
+        return "tok"
+
+    monkeypatch.setattr(Origin, "get_app", fake_get_app)
+    monkeypatch.setattr(Origin, "find_installation", fake_find)
+    monkeypatch.setattr(Origin, "token", fake_token)
+
+    checks = {check["name"]: check for check in (await client.get("/api/v1/doctor", headers=auth(token))).json()}
+    assert checks["origin webhook"]["detail"] == "none since boot"
+
+    payload = {
+        "event": {
+            "type": "repository.pushed",
+            "payload": {"repository": {"owner": {"slug": "org"}, "name": "heldso"}},
+        }
+    }
+    assert (await client.post("/hooks/origin", content=json.dumps(payload))).status_code == 204
+    await client.drain_tasks()
+    checks = {check["name"]: check for check in (await client.get("/api/v1/doctor", headers=auth(token))).json()}
+    assert checks["origin webhook"]["detail"] != "none since boot"
+
+
+async def test_app_status_and_doctor(yard, monkeypatch):
+    client, token, _root = yard
+
+    async def fake_run(self, *args, timeout=None, env=None, stdin=None):
+        if args and args[0] == "ps":
+            labels = {"com.docker.compose.project": "heldso", "com.docker.compose.service": "app"}
+            return json.dumps([{"Names": ["heldso-app-1"], "State": "running", "Labels": labels}])
+        if args and args[0] == "stats":
+            return "[]"
+        if args and args[0] == "info":
+            return '{"host":{"cpus":4,"memTotal":1000},"version":{"Version":"5.3.1"}}'
+        if args and args[0] == "logs":
+            return "2026-10-05T12:00:00Z one\n"
+        return ""
+
+    monkeypatch.setattr(Podman, "run", fake_run)
+    routes = [
+        {
+            "match": [{"host": ["heldso.example.com"]}],
+            "handle": [{"upstreams": [{"dial": "heldso:8000"}]}],
+        }
+    ]
+
+    async def fake_caddy(self, method, path, body=None):
+        if path == caddy.ROUTES_PATH:
+            return 200, json.dumps(routes).encode()
+        return 200, b"{}"
+
+    monkeypatch.setattr(Caddy, "request", fake_caddy)
+    res = await client.post(
+        "/api/v1/apps",
+        json={"name": "heldso", "repo": "https://origin.cursor.com/org/heldso", "ref": "main"},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+
+    page = (await client.get("/api/v1/apps/heldso", headers=auth(token))).json()
+    assert page["app"]["name"] == "heldso"
+    assert "env" not in page["app"]
+    assert page["binds"] == [{"host": "heldso.example.com", "dial": "heldso:8000"}]
+    assert [row["container"] for row in page["rows"]] == ["heldso-app-1"]
+    assert page["rows"][0]["answers"] is None
+    assert "one" in page["log"]
+    res = await client.get("/api/v1/apps/nope", headers=auth(token))
+    assert res.status_code == 404
+
+    checks = {check["name"]: check for check in (await client.get("/api/v1/doctor", headers=auth(token))).json()}
+    assert checks["podman"] == {"name": "podman", "ok": True, "detail": "podman 5.3.1"}
+    assert checks["caddy"]["detail"] == "skipped: no host"
+    assert checks["origin"]["ok"] is False
+
+
+async def test_status_reports_the_forges(yard, monkeypatch):
+    client, token, _root = yard
+
+    async def fake_run(self, *args, timeout=None, env=None, stdin=None):
+        if args and args[0] == "info":
+            return '{"host":{"cpus":4,"memTotal":1000}}'
+        return "[]"
+
+    monkeypatch.setattr(Podman, "run", fake_run)
+    res = await client.get("/api/v1/status", headers=auth(token))
+    assert res.status_code == 200
+    assert res.json()["host"]["forges"] == {"origin": False, "github": False}
+
+
+async def test_github_hook(yard, monkeypatch):
+    """The signature gates everything; ping and push are the known events."""
+    client, token, root = yard
+    secret = "w" * 64
+    state = root / "apps" / "yard" / "data" / "github" / "state.json"
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(json.dumps({"webhook_secret": secret}))
+
+    seen: list[str] = []
+
+    async def _noop():
+        return None
+
+    monkeypatch.setattr(apps, "check_repo", lambda _yard, repo: seen.append(repo) or _noop())
+    monkeypatch.setattr(apps, "check_installation", lambda _yard, _forge: seen.append("install") or _noop())
+
+    def sig(body: str) -> str:
+        digest = hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+        return f"sha256={digest}"
+
+    body = json.dumps({"zen": "keep it"})
+    # Missing and bad signatures get a 401 and nothing runs.
+    res = await client.post("/hooks/github", content=body, headers={"x-github-event": "ping"})
+    assert res.status_code == 401
+    res = await client.post(
+        "/hooks/github",
+        content=body,
+        headers={"x-github-event": "ping", "x-hub-signature-256": "sha256=" + "0" * 64},
+    )
+    assert res.status_code == 401
+    assert seen == []
+
+    res = await client.post(
+        "/hooks/github",
+        content=body,
+        headers={"x-github-event": "ping", "x-hub-signature-256": sig(body)},
+    )
+    assert res.status_code == 204
+    assert seen == []
+
+    push = json.dumps({"repository": {"full_name": "org/heldso"}})
+    res = await client.post(
+        "/hooks/github",
+        content=push,
+        headers={"x-github-event": "push", "x-hub-signature-256": sig(push)},
+    )
+    assert res.status_code == 204
+    await client.drain_tasks()
+    assert seen == ["https://github.com/org/heldso"]
+
+    install = json.dumps({"action": "created"})
+    res = await client.post(
+        "/hooks/github",
+        content=install,
+        headers={"x-github-event": "installation", "x-hub-signature-256": sig(install)},
+    )
+    assert res.status_code == 204
+    await client.drain_tasks()
+    assert seen[-1] == "install"
+
+
+async def test_github_hook_needs_a_secret(yard, monkeypatch):
+    """A bad signature does not touch last_delivery; a good one does."""
+    client, token, root = yard
+    monkeypatch.setattr(GitHub, "connected", lambda self: True)
+
+    async def fake_get_app(self):
+        return {"name": "yard"}
+
+    async def fake_find(self):
+        return {"repository_selection": "all"}
+
+    async def fake_token(self):
+        return "tok"
+
+    monkeypatch.setattr(GitHub, "get_app", fake_get_app)
+    monkeypatch.setattr(GitHub, "find_installation", fake_find)
+    monkeypatch.setattr(GitHub, "token", fake_token)
+
+    async def row() -> dict:
+        found = (await client.get("/api/v1/doctor", headers=auth(token))).json()
+        return {check["name"]: check for check in found}
+
+    secret = "w" * 64
+    state = root / "apps" / "yard" / "data" / "github" / "state.json"
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(json.dumps({"webhook_secret": secret}))
+
+    res = await client.post(
+        "/hooks/github",
+        content=json.dumps({}),
+        headers={"x-github-event": "ping", "x-hub-signature-256": "sha256=" + "0" * 64},
+    )
+    assert res.status_code == 401
+    assert (await row())["github webhook"]["detail"] == "none since boot"
+
+    body = json.dumps({})
+    digest = hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+    res = await client.post(
+        "/hooks/github",
+        content=body,
+        headers={"x-github-event": "ping", "x-hub-signature-256": f"sha256={digest}"},
+    )
+    assert res.status_code == 204
+    assert (await row())["github webhook"]["detail"] != "none since boot"
+
+
+async def test_forge_routes_redact_secrets(yard, monkeypatch):
+    client, token, _root = yard
+    res = await client.get("/api/v1/forges", headers=auth(token))
+    assert res.status_code == 200
+    rows = {row["name"]: row for row in res.json()}
+    assert list(rows) == ["origin", "github"]
+    assert all(not row["connected"] for row in rows.values())
+    assert all("selection" in row for row in rows.values())
+    # The public key is a summary field; first read creates the keypair.
+    key = rows["origin"]["public_key"]
+    assert key.startswith("-----BEGIN PUBLIC KEY-----")
+    assert "webhook_secret" not in res.text and "PRIVATE" not in res.text
+
+    secret = "w" * 64
+    pem = "-----BEGIN RSA PRIVATE KEY-----\nSECRET-PEM\n-----END RSA PRIVATE KEY-----\n"
+
+    async def fake_connect(self, app_id, private_key, webhook_secret):
+        return {"name": "yard-host", "slug": "yard-host", "events": ["push"]}
+
+    monkeypatch.setattr(GitHub, "connect", fake_connect)
+    res = await client.put(
+        "/api/v1/forges/github",
+        json={"app_id": "42", "private_key": pem, "webhook_secret": secret},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["app"] == {"name": "yard-host", "slug": "yard-host", "events": ["push"]}
+    # The key and the secret went in; they do not come back out.
+    assert "SECRET-PEM" not in res.text
+    assert secret not in res.text
+    assert body["forge"]["name"] == "github"
+
+
+async def test_forge_origin_key_and_put(yard, monkeypatch):
+    client, token, _root = yard
+    # The first read of the summary creates the keypair, idempotently.
+    rows = (await client.get("/api/v1/forges", headers=auth(token))).json()
+    key = next(row["public_key"] for row in rows if row["name"] == "origin")
+    assert key.startswith("-----BEGIN PUBLIC KEY-----")
+    rows = (await client.get("/api/v1/forges", headers=auth(token))).json()
+    assert next(row["public_key"] for row in rows if row["name"] == "origin") == key
+
+    async def fake_connect(self, app_id):
+        self.save(app_id=app_id)
+        return {
+            "displayName": "yard",
+            "webhookUrl": "https://yard.example.com/hooks/origin",
+            "events": ["repository.pushed"],
+        }
+
+    monkeypatch.setattr(Origin, "connect", fake_connect)
+    res = await client.put("/api/v1/forges/origin", json={"app_id": "app_1"}, headers=auth(token))
+    assert res.status_code == 200
+    body = res.json()
+    assert body["forge"]["app_id"] == "app_1"
+    assert body["app"]["name"] == "yard"
+
+
+async def test_forges_find_the_installation_on_read(yard, monkeypatch):
+    client, token, root = yard
+    github = next(forge for forge in _yard_forges(root) if forge.name == "github")
+    github.save(app_id="42")
+
+    async def missing(self):
+        return None
+
+    monkeypatch.setattr(GitHub, "find_installation", missing)
+    rows = (await client.get("/api/v1/forges", headers=auth(token))).json()
+    found = next(row for row in rows if row["name"] == "github")
+    assert found["installation_id"] == ""
+
+    async def found_one(self):
+        self.save(installation_id="101")
+        return {"id": 101, "repository_selection": "all"}
+
+    monkeypatch.setattr(GitHub, "find_installation", found_one)
+    rows = (await client.get("/api/v1/forges", headers=auth(token))).json()
+    found = next(row for row in rows if row["name"] == "github")
+    assert found["installation_id"] == "101"
+    assert found["selection"] == "all"
+    state = json.loads((root / "apps" / "yard" / "data" / "github" / "state.json").read_text())
+    assert state["selection"] == "all"
+
+
+async def test_forges_swallow_installation_errors(yard, monkeypatch):
+    client, token, root = yard
+    github = next(forge for forge in _yard_forges(root) if forge.name == "github")
+    github.save(app_id="42")
+
+    async def broken(self):
+        raise YardError(502, "github", "github GET /app/installations: refused")
+
+    monkeypatch.setattr(GitHub, "find_installation", broken)
+    res = await client.get("/api/v1/forges", headers=auth(token))
+    assert res.status_code == 200
+    found = next(row for row in res.json() if row["name"] == "github")
+    assert found["error"] == "github GET /app/installations: refused"
+
+
+def _yard_forges(root):
+    """Reach the running app's forge objects through its data dir."""
+    from app.server.forges import GitHub, Origin
+
+    return (Origin(root / "apps" / "yard" / "data" / "origin"), GitHub(root / "apps" / "yard" / "data" / "github"))
+
+
+async def test_app_deploy_sha_validation(yard, monkeypatch):
+    client, token, _root = yard
+    await client.post(
+        "/api/v1/apps",
+        json={"name": "heldso", "repo": "https://origin.cursor.com/org/app"},
+        headers=auth(token),
+    )
+    calls: list[tuple[str, str]] = []
+    lookups: list[list[str]] = []
+
+    async def fake_deploy(_yard, name, *, sha="", requested="", cause="", actor=""):
+        calls.append((sha, requested))
+        return apps.Outcome("skipped")
+
+    async def fake_entries(config, matches, **kw):
+        lookups.append(matches)
+        return []
+
+    monkeypatch.setattr(apps, "deploy", fake_deploy)
+    monkeypatch.setattr(journal, "read_entries", fake_entries)
+
+    res = await client.post("/api/v1/apps/heldso/deploy", json={"sha": "nota-sha"}, headers=auth(token))
+    assert res.status_code == 400
+    assert res.json()["error"]["code"] == "bad_sha"
+    assert lookups == []
+
+    res = await client.post("/api/v1/apps/heldso/deploy", json={"sha": "deadbeef"}, headers=auth(token))
+    assert res.status_code == 404
+    assert res.json()["error"]["code"] == "unknown_sha"
+    assert "full 40-character SHA" in res.text
+    assert lookups == [["SYSLOG_IDENTIFIER=yard", "YARD_APP=heldso", "YARD_EVENT=deploy.start"]]
+
+    # A full sha goes straight to the deploy; no journal read.
+    res = await client.post("/api/v1/apps/heldso/deploy", json={"sha": "d" * 40}, headers=auth(token))
+    assert res.status_code == 200
+    assert calls == [("d" * 40, "d" * 40)]
+    assert len(lookups) == 1
+
+
+async def test_app_deploy_a_prefix_resolves_from_the_journal(yard, monkeypatch):
+    client, token, _root = yard
+    await client.post(
+        "/api/v1/apps",
+        json={"name": "heldso", "repo": "https://origin.cursor.com/org/app"},
+        headers=auth(token),
+    )
+    full = "deadbeefcafe" + "1" * 28
+    entries = [{"YARD_SHA": full}, {"YARD_SHA": "cafef00d" + "2" * 32}, {"YARD_SHA": full}]
+
+    async def fake_entries(config, matches, **kw):
+        return entries
+
+    monkeypatch.setattr(journal, "read_entries", fake_entries)
+    got: dict[str, str] = {}
+
+    async def fake_deploy(_yard, name, *, sha="", requested="", cause="", actor=""):
+        got["sha"], got["requested"] = sha, requested
+        return apps.Outcome("skipped")
+
+    monkeypatch.setattr(apps, "deploy", fake_deploy)
+    res = await client.post("/api/v1/apps/heldso/deploy", json={"sha": "deadbee"}, headers=auth(token))
+    assert res.status_code == 200
+    assert got == {"sha": full, "requested": "deadbee"}
+
+
+async def test_app_deploy_an_ambiguous_prefix(yard, monkeypatch):
+    client, token, _root = yard
+    await client.post(
+        "/api/v1/apps",
+        json={"name": "heldso", "repo": "https://origin.cursor.com/org/app"},
+        headers=auth(token),
+    )
+    entries = [{"YARD_SHA": "deadbeef" + "1" * 32}, {"YARD_SHA": "deadbeef" + "2" * 32}]
+
+    async def fake_entries(config, matches, **kw):
+        return entries
+
+    monkeypatch.setattr(journal, "read_entries", fake_entries)
+    res = await client.post("/api/v1/apps/heldso/deploy", json={"sha": "deadbeef"}, headers=auth(token))
+    assert res.status_code == 400
+    error = res.json()["error"]
+    assert error["code"] == "ambiguous_sha"
+    assert "deadbeef" in str(error["context"]["matches"])
+
+
+async def test_app_deploy_when_the_journal_is_down(yard, monkeypatch):
+    client, token, _root = yard
+    await client.post(
+        "/api/v1/apps",
+        json={"name": "heldso", "repo": "https://origin.cursor.com/org/app"},
+        headers=auth(token),
+    )
+
+    async def broken(config, matches, **kw):
+        raise YardError(502, "journal", "journalctl is not on PATH")
+
+    monkeypatch.setattr(journal, "read_entries", broken)
+    res = await client.post("/api/v1/apps/heldso/deploy", json={"sha": "deadbeef"}, headers=auth(token))
+    assert res.status_code == 502
+    assert "full 40-character SHA" in res.text
+
+
+async def test_events_log_actors_and_never_secrets(yard, capsys):
+    """No journal socket under tests: events land on stdout as JSON."""
+    client, token, _root = yard
+    res = await client.post(
+        "/api/v1/apps",
+        json={"name": "heldso", "repo": "https://origin.cursor.com/org/app"},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+    res = await client.patch(
+        "/api/v1/apps/heldso/env",
+        json={"PASSWORD": "hunter2"},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+    out = capsys.readouterr().out
+    assert "hunter2" not in out
+    rows = [json.loads(line) for line in out.splitlines() if '"yard"' in line]
+    create = next(row for row in rows if row["yard"] == "app.create")
+    assert create["actor"] == "admin" and create["app"] == "heldso"
+    env = next(row for row in rows if row["yard"] == "env.set")
+    assert env["keys"] == "PASSWORD" and env["actor"] == "admin"

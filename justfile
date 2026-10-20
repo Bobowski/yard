@@ -5,11 +5,11 @@ set dotenv-load := true
 
 # run the app with hot reload
 dev:
-    uv run watchfiles 'python -m app.main' app/
+    uv run watchfiles 'python -m app.server.main' app/
 
 # run the app once, no reload
 serve:
-    uv run python -m app.main
+    uv run python -m app.server.main
 
 # lint, typecheck, test - run before done
 check:

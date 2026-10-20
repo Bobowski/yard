@@ -1,4 +1,7 @@
 {
+	"admin": {
+		"listen": "unix//run/caddy/admin.sock"
+	},
 	"apps": {
 		"http": {
 			"https_port": 8443,
@@ -9,6 +12,10 @@
 					},
 					"listen": [
 						":8443"
+					],
+					"protocols": [
+						"h1",
+						"h2"
 					],
 					"routes": []
 				}

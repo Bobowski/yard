@@ -1,0 +1,220 @@
+from datetime import UTC, datetime, timedelta
+
+from app.cli.render import (
+    _state_text,
+    format_app_status,
+    format_apps,
+    format_binds,
+    format_status,
+    format_tokens,
+    status_hint,
+)
+from app.shared import ago, format_bytes
+from tests.conftest import NOW, stamp, status_report
+
+
+def test_format_status():
+    text = format_status(status_report(), NOW)
+    lines = text.split("\n")
+    assert lines[0].startswith("name")
+    header = lines[0].split()
+    assert header == ["name", "state", "cpu", "mem", "data", "rev", "bind", "deploy"]
+    assert "heldso-app" in lines[1]
+    assert "up 2h" in lines[1]
+    assert "abc1234 → f00ba12" in lines[1]
+    assert "heldso.example.com → heldso:8000" in lines[1]
+    assert "ok 2m0s" in lines[1]
+    assert "shop-app" in lines[2]
+    assert "exit 1 3h" in lines[2]
+    assert "down" in lines[3]
+    assert "caddy" in lines[4]
+    assert "up 24h" in lines[4]
+    assert "host:" in lines[-2]
+    assert "2% of 4 cores" in lines[-2]
+    assert "30MB of 4GB" in lines[-2]
+    assert "10MB of 200GB" in lines[-2]
+
+
+def test_format_status_drops_empty_columns():
+    report = status_report()
+    for row in report["rows"]:
+        row["data"] = 0
+        row["sha"] = ""
+        row["tip"] = ""
+        row["binds"] = []
+        row["deploy"] = None
+    text = format_status(report, NOW)
+    assert text.split("\n")[0].split() == ["name", "state", "cpu", "mem"]
+
+
+def test_format_status_deploy_failed_hint():
+    report = status_report()
+    assert status_hint(report) == "yard app logs --deploy --app shop"
+    for row in report["rows"]:
+        row["deploy"] = None
+    assert status_hint(report) == "yard logs shop-app"
+
+
+def test_state_text_marks_no_answer_and_restarts():
+    row = {"state": "running", "health": "", "started": stamp(hours=2), "answers": False, "restarts": 3}
+    assert _state_text(row, NOW) == "up 2h · no answer · 3 restarts"
+    row["restarts"] = 1
+    assert _state_text(row, NOW) == "up 2h · no answer · 1 restart"
+    row["answers"] = True
+    assert _state_text(row, NOW) == "up 2h · 1 restart"
+    row["health"] = "starting"
+    row["restarts"] = 0
+    assert _state_text(row, NOW) == "up 2h"
+    row["answers"] = None
+    assert _state_text(row, NOW) == "starting 2h"
+
+
+def test_status_hint_points_a_dead_probe_at_logs():
+    report = status_report()
+    for row in report["rows"]:
+        row["deploy"] = None
+        row["state"] = "running"
+        row["health"] = ""
+        row["answers"] = False
+    assert status_hint(report) == "yard logs heldso-app"
+
+
+def test_format_app_status():
+    report = status_report()
+    row = report["rows"][0]
+    page = {
+        "app": {
+            "name": "heldso",
+            "repo": "heldso",
+            "ref": "main",
+            "dir": "",
+            "domain": "heldso.example.com",
+            "trigger": "",
+            "image": "localhost/heldso:abc1234",
+            "sha": "abc1234",
+            "created": stamp(days=2),
+            "env": {"A": "1", "B": "2", "C": "3"},
+        },
+        "env_file": "/srv/yard/env/heldso.env",
+        "rows": [row],
+        "binds": [
+            {"host": "heldso.example.com", "dial": "heldso:8000"},
+            {"host": "www.heldso.example.com", "dial": "heldso:8000"},
+        ],
+        "deploys": [
+            {
+                "app": "heldso",
+                "sha": "abc1234",
+                "status": "ok",
+                "started": stamp(days=4, minutes=2),
+                "ended": stamp(days=4),
+            },
+            {
+                "app": "heldso",
+                "sha": "def5678",
+                "status": "failed",
+                "started": stamp(days=5, minutes=0, seconds=40),
+                "ended": stamp(days=5),
+            },
+        ],
+        "log": "one\ntwo\n",
+    }
+    assert format_app_status(page, NOW) == (
+        "heldso\n"
+        "rev abc1234 · tip f00ba12 · image localhost/heldso:abc1234\n"
+        "data 10MB · env /srv/yard/env/heldso.env\n"
+        "\n"
+        "binds\n"
+        "  heldso.example.com      →  heldso:8000\n"
+        "  www.heldso.example.com  →  heldso:8000\n"
+        "\n"
+        "containers\n"
+        "  heldso-app  aa11bb22cc33  up 2h  1.5%  20MB\n"
+        "\n"
+        "deploys\n"
+        "  ok      2m0s  4d  abc1234\n"
+        "  failed   40s  5d  def5678\n"
+        "\n"
+        "log\n"
+        "  one\n"
+        "  two\n"
+    )
+
+
+def test_format_app_status_minimal():
+    page = {
+        "app": {"name": "heldso", "sha": "", "image": "", "env": {}},
+        "env_file": "/srv/yard/env/heldso.env",
+        "rows": [{"app": "heldso", "state": "absent", "health": "down"}],
+        "binds": [],
+        "deploys": [],
+        "log": "",
+    }
+    assert format_app_status(page, NOW) == (
+        "heldso\n"
+        "data 0B · env /srv/yard/env/heldso.env\n"
+        "\n"
+        "containers\n"
+        "  heldso  down\n"
+        "\n"
+        "deploys\n"
+        "  no deploys yet\n"
+        "\n"
+        "log\n"
+        "  no log\n"
+    )
+
+
+def test_format_bytes():
+    assert format_bytes(0) == "0B"
+    assert format_bytes(10) == "10B"
+    assert format_bytes(1500) == "1.5kB"
+    assert format_bytes(4_000_000_000) == "4GB"
+
+
+def test_ago():
+    now = datetime.now(UTC)
+    assert ago("", now) == ""
+    assert ago((now - timedelta(seconds=2)).strftime("%Y-%m-%dT%H:%M:%SZ"), now) == "now"
+    assert ago((now - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ"), now) == "3h"
+    assert ago("1999-01-01T00:00:00Z", now) == ""
+
+
+def test_format_status_bind_cell_groups_hosts():
+    report = status_report()
+    report["rows"][0]["binds"] = [
+        {"host": "heldso.example.com", "dial": "heldso:8000"},
+        {"host": "www.heldso.example.com", "dial": "heldso:8000"},
+        {"host": "api.heldso.example.com", "dial": "heldso-api:8000"},
+    ]
+    text = format_status(report, NOW)
+    line = "heldso.example.com, www.heldso.example.com → heldso:8000 · api.heldso.example.com → heldso-api:8000"
+    assert line in text
+
+
+def test_format_resource_tables():
+    apps = format_apps(
+        [
+            {"name": "heldso", "repo": "org/app", "ref": "main", "trigger": "push"},
+            {"name": "docs", "repo": "org/app", "ref": "dev", "trigger": "manual"},
+        ]
+    )
+    assert apps.split("\n")[0].split() == ["app", "repo", "ref", "trigger"]
+    assert "org/app" in apps
+    assert "manual" in apps
+
+    binds = format_binds(
+        [
+            {"host": "b.example.com", "dial": "app:8000", "state": "absent", "try": ""},
+            {"host": "a.example.com", "dial": "app:8000", "state": "up", "try": "30s"},
+        ]
+    )
+    lines = binds.split("\n")
+    assert lines[0].split() == ["host", "dial", "state", "try"]
+    assert lines[1].startswith("a.example.com")
+    assert lines[2].startswith("b.example.com")
+    plain = format_binds([{"host": "a.example.com", "dial": "app:8000", "state": "up"}])
+    assert plain.split("\n")[0].split() == ["host", "dial", "state"]
+
+    tokens = format_tokens([{"name": "ada", "created": stamp(days=1)}])
+    assert tokens.split("\n")[0].split()[0] == "token"

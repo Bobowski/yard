@@ -1,17 +1,10 @@
 FROM debian:trixie-slim AS tools
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends binutils git xz-utils && \
+    apt-get install -y --no-install-recommends binutils xz-utils && \
     rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /out/usr/bin /out/usr/lib/git-core /out/usr/share/git-core /out/lib/x86_64-linux-gnu && \
-    cp -a /usr/lib/git-core/git /out/usr/lib/git-core/git && \
-    ln -s ../lib/git-core/git /out/usr/bin/git && \
-    cp -a /usr/lib/git-core/git-http-backend /out/usr/lib/git-core/git-http-backend && \
-    ln -s git /out/usr/lib/git-core/git-upload-pack && \
-    ln -s git /out/usr/lib/git-core/git-receive-pack && \
-    cp -a /usr/share/git-core/templates /out/usr/share/git-core/templates && \
-    cp -a "$(readlink -f /lib/x86_64-linux-gnu/libpcre2-8.so.0)" /out/lib/x86_64-linux-gnu/libpcre2-8.so.0
+RUN mkdir -p /out/usr/bin
 
 ADD https://github.com/stunnel/static-curl/releases/download/8.22.0/curl-linux-x86_64-glibc-8.22.0.tar.xz /tmp/curl.tar.xz
 ADD https://github.com/containers/podman/releases/download/v4.9.3/podman-remote-static-linux_amd64.tar.gz /tmp/podman-remote.tar.gz
@@ -46,7 +39,6 @@ RUN uv sync --locked --extra server --no-editable
 FROM python:3.14-slim-trixie
 
 COPY --from=tools /out/usr /usr
-COPY --from=tools /out/lib/x86_64-linux-gnu/libpcre2-8.so.0 /lib/x86_64-linux-gnu/libpcre2-8.so.0
 COPY --from=builder /workspace/.venv /workspace/.venv
 COPY --from=builder /workspace/ops/apply /usr/local/share/yard/apply
 
@@ -54,19 +46,19 @@ COPY --from=builder /workspace/ops/apply /usr/local/share/yard/apply
 # deps only. The image ships the source directory and resolves it by path.
 COPY app/ /workspace/app/
 
-# The git copied above has no HTTPS helper. A fetch from GitHub needs one.
+# git fetches the app clones; ca-certificates verifies TLS.
+# systemd ships journalctl, which reads the container journal.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends git ca-certificates && \
+    apt-get install -y --no-install-recommends git ca-certificates systemd && \
     rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/workspace \
     CONTAINER_HOST=unix:///run/podman/podman.sock \
-    GIT_EXEC_PATH=/usr/lib/git-core \
     STARIO_HOST=0.0.0.0 \
     STARIO_PORT=8000
 
 WORKDIR /workspace
 
 EXPOSE 8000
-CMD ["/workspace/.venv/bin/python", "-m", "app.main"]
+CMD ["/workspace/.venv/bin/python", "-m", "app.server.main"]

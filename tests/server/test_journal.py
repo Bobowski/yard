@@ -1,0 +1,344 @@
+"""journalctl and the journald socket as one adapter: argv, send, /logs, /events."""
+
+import json
+import socket
+import struct
+import tempfile
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+from stario.testing import TestClient
+
+from app.server import journal
+from app.server.main import bootstrap
+from app.server.store import Config
+from app.shared import YardError
+from tests.conftest import auth
+
+WHEN = datetime(2025, 10, 5, 21, 0, 0, tzinfo=UTC)
+MICROS = str(int(WHEN.timestamp() * 1_000_000))
+ENTRY = json.dumps({"__REALTIME_TIMESTAMP": MICROS, "CONTAINER_NAME": "heldso-app-1", "MESSAGE": "hello"})
+BYTES = json.dumps({"__REALTIME_TIMESTAMP": MICROS, "CONTAINER_NAME": "heldso-app-1", "MESSAGE": [104, 105, 255]})
+
+FULL_ID = "abc123def456" + "0" * 52
+PODMAN_DIED = json.dumps(
+    {
+        "__REALTIME_TIMESTAMP": MICROS,
+        "SYSLOG_IDENTIFIER": "podman",
+        "PODMAN_TYPE": "container",
+        "PODMAN_EVENT": "died",
+        "PODMAN_NAME": "heldso-app-1",
+        "PODMAN_ID": FULL_ID,
+        "PODMAN_IMAGE": "localhost/heldso:abc123def456",
+        "PODMAN_EXIT_CODE": "1",
+        "PODMAN_LABELS": json.dumps({"com.docker.compose.project": "heldso"}),
+        "MESSAGE": "container died heldso-app-1",
+    }
+)
+PODMAN_SYSTEM = json.dumps(
+    {
+        "__REALTIME_TIMESTAMP": MICROS,
+        "SYSLOG_IDENTIFIER": "podman",
+        "PODMAN_TYPE": "podman",
+        "PODMAN_EVENT": "refresh",
+        "MESSAGE": "system refresh",
+    }
+)
+YARD_DEPLOY = json.dumps(
+    {
+        "__REALTIME_TIMESTAMP": MICROS,
+        "SYSLOG_IDENTIFIER": "yard",
+        "YARD_EVENT": "deploy.end",
+        "YARD_APP": "heldso",
+        "YARD_STATUS": "ok",
+        "YARD_SHA": "abc123def456",
+        "YARD_ACTOR": "admin",
+        "YARD_CAUSE": "manual",
+        "MESSAGE": "deploy heldso ok",
+    }
+)
+
+
+def _config(tmp_path: Path, journalctl: Path, journal_socket: Path | None = None) -> Config:
+    return Config(
+        root=tmp_path,
+        podman_sock="",
+        podman_bin="yard-podman-missing",
+        skip_deploy=True,
+        boot=False,
+        remote=False,
+        journal_dir=tmp_path / "journal",
+        journalctl_bin=str(journalctl),
+        journal_socket=journal_socket or (tmp_path / "no-socket"),
+    )
+
+
+def _journalctl(tmp_path: Path, *, out: str = "", err: str = "", code: int = 0) -> tuple[Path, Path]:
+    """A fake journalctl. It records argv and prints canned output."""
+    argv_log = tmp_path / "argv"
+    script = tmp_path / "journalctl"
+    script.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$@" > "{argv_log}"\n'
+        f'cat "{tmp_path / "out"}" 2>/dev/null\n'
+        f'cat "{tmp_path / "err"}" >&2 2>/dev/null\n'
+        f"exit {code}\n"
+    )
+    script.chmod(0o755)
+    (tmp_path / "out").write_text(out)
+    (tmp_path / "err").write_text(err)
+    (tmp_path / "journal").mkdir()
+    return script, argv_log
+
+
+async def test_read_builds_the_argv(tmp_path: Path):
+    script, argv_log = _journalctl(tmp_path, out=ENTRY + "\n" + BYTES + "\n" + "not json\n")
+    config = _config(tmp_path, script)
+    text = await journal.read(
+        config,
+        ["CONTAINER_NAME=a-app-1", "CONTAINER_NAME=b-app-1"],
+        lines=50,
+        since="-15min",
+        until="2025-10-05 12:00",
+    )
+    assert argv_log.read_text().splitlines() == [
+        "-D",
+        str(config.journal_dir),
+        "--no-pager",
+        "-o",
+        "json",
+        "-n",
+        "50",
+        "--since",
+        "-15min",
+        "--until",
+        "2025-10-05 12:00",
+        "CONTAINER_NAME=a-app-1",
+        "CONTAINER_NAME=b-app-1",
+    ]
+    assert "2025-10-05T21:00:00Z heldso-app-1 hello" in text
+    assert "2025-10-05T21:00:00Z heldso-app-1 hi�" in text
+
+
+async def test_follow_passes_dash_f(tmp_path: Path):
+    script, argv_log = _journalctl(tmp_path, out=ENTRY + "\n")
+    config = _config(tmp_path, script)
+    proc = await journal.follow(config, ["CONTAINER_NAME=heldso-app-1"], lines=20)
+    try:
+        assert proc.stdout is not None
+        assert b"hello" in await proc.stdout.read()
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
+    assert "-f" in argv_log.read_text().splitlines()
+
+
+async def test_a_missing_journal_dir_is_a_502(tmp_path: Path):
+    script, _ = _journalctl(tmp_path)
+    (tmp_path / "journal").rmdir()
+    with pytest.raises(YardError) as caught:
+        await journal.read(_config(tmp_path, script), ["CONTAINER_NAME=heldso-app-1"], lines=20)
+    assert caught.value.status == 502
+    assert caught.value.code == "journal"
+    assert "install.sh" in (caught.value.help_text or "")
+
+
+async def test_a_failed_journalctl_is_a_502(tmp_path: Path):
+    script, _ = _journalctl(tmp_path, err="cannot read", code=1)
+    with pytest.raises(YardError) as caught:
+        await journal.read(_config(tmp_path, script), ["CONTAINER_NAME=heldso-app-1"], lines=20)
+    assert caught.value.status == 502
+    assert "cannot read" in str(caught.value)
+
+
+async def test_a_missing_journalctl_is_a_502(tmp_path: Path):
+    (tmp_path / "journal").mkdir()
+    config = _config(tmp_path, tmp_path / "no-such-journalctl")
+    with pytest.raises(YardError) as caught:
+        await journal.read(config, ["CONTAINER_NAME=heldso-app-1"], lines=20)
+    assert caught.value.status == 502
+
+
+def test_format_line():
+    entry: dict = {"__REALTIME_TIMESTAMP": MICROS, "CONTAINER_NAME": "x", "MESSAGE": "m"}
+    assert journal.format_line(entry) == "2025-10-05T21:00:00Z x m"
+    entry["MESSAGE"] = [104, 105]
+    assert journal.format_line(entry).endswith("x hi")
+    assert journal.format_line({}) == ""
+    assert "x" in journal.format_line({"CONTAINER_NAME": "x", "MESSAGE": "m"})
+
+
+# --- journal.send ------------------------------------------------------------
+
+
+def test_send_writes_a_native_datagram(tmp_path: Path):
+    """A real AF_UNIX dgram socket gets the framed fields."""
+    directory = Path(tempfile.mkdtemp(dir="/tmp"))
+    sock_path = directory / "journal.sock"
+    recv = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    recv.bind(str(sock_path))
+    try:
+        config = _config(tmp_path, Path("/bin/false"), journal_socket=sock_path)
+        journal.send(
+            config,
+            "deploy.end",
+            "deploy heldso ok",
+            priority=3,
+            app="heldso",
+            error="boom\nmore",
+        )
+        recv.settimeout(2)
+        data, _peer = recv.recvfrom(65535)
+    finally:
+        recv.close()
+        sock_path.unlink(missing_ok=True)
+        directory.rmdir()
+    assert b"SYSLOG_IDENTIFIER=yard\n" in data
+    assert b"PRIORITY=3\n" in data
+    assert b"MESSAGE=deploy heldso ok\n" in data
+    assert b"YARD_EVENT=deploy.end\n" in data
+    assert b"YARD_APP=heldso\n" in data
+    marker = b"YARD_ERROR\n" + struct.pack("<Q", len(b"boom\nmore"))
+    assert marker in data
+    assert data.endswith(b"boom\nmore\n")
+
+
+def test_send_falls_back_to_stdout(tmp_path: Path, capsys):
+    """No socket: one JSON line on stdout, which still lands in the journal."""
+    config = _config(tmp_path, Path("/bin/false"), journal_socket=tmp_path / "missing.sock")
+    journal.send(config, "app.create", "app heldso created", app="heldso", actor="admin")
+    row = json.loads(capsys.readouterr().out)
+    assert row == {
+        "yard": "app.create",
+        "message": "app heldso created",
+        "app": "heldso",
+        "actor": "admin",
+    }
+
+
+def test_send_never_raises(tmp_path: Path, capsys):
+    """A path that exists but is not a socket fails the same way."""
+    blocker = tmp_path / "regular"
+    blocker.write_text("x")
+    config = _config(tmp_path, Path("/bin/false"), journal_socket=blocker)
+    journal.send(config, "check.moved", "x")
+    assert "check.moved" in capsys.readouterr().out
+
+
+# --- the /logs and /events routes --------------------------------------------
+
+
+@pytest.fixture
+async def yard_journal(tmp_path, monkeypatch):
+    script, argv_log = _journalctl(tmp_path, out=ENTRY + "\n")
+    monkeypatch.setenv("YARD_ROOT", str(tmp_path))
+    monkeypatch.setenv("YARD_SKIP_DEPLOY", "1")
+    monkeypatch.setenv("YARD_BOOT", "0")
+    monkeypatch.setenv("YARD_PODMAN_BIN", "yard-podman-missing")
+    monkeypatch.setenv("YARD_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.setenv("YARD_JOURNALCTL_BIN", str(script))
+    async with TestClient(bootstrap) as client:
+        token = (tmp_path / "tokens" / "admin.token").read_text().strip()
+        yield client, token, argv_log, tmp_path / "out"
+
+
+async def test_logs_reads_a_container_by_name(yard_journal):
+    client, token, argv_log, _out = yard_journal
+    res = await client.get("/api/v1/logs?container=heldso-app-1", headers=auth(token))
+    assert res.status_code == 200
+    assert "heldso-app-1 hello" in res.text
+    argv = argv_log.read_text().splitlines()
+    assert argv[-1] == "CONTAINER_NAME=heldso-app-1"
+    assert "-n" in argv and "100" in argv
+
+
+async def test_logs_reads_a_container_by_id(yard_journal):
+    client, token, argv_log, _out = yard_journal
+    res = await client.get("/api/v1/logs?container=abc123def456&since=-15m&lines=5", headers=auth(token))
+    assert res.status_code == 200
+    argv = argv_log.read_text().splitlines()
+    assert "CONTAINER_ID=abc123def456" in argv
+    assert argv[argv.index("--since") + 1] == "-15min"
+    res = await client.get(f"/api/v1/logs?container={FULL_ID}", headers=auth(token))
+    assert res.status_code == 200
+    assert f"CONTAINER_ID_FULL={FULL_ID}" in argv_log.read_text().splitlines()
+
+
+async def test_logs_rejects_a_bad_container_and_query(yard_journal):
+    client, token, _, _out = yard_journal
+    for path, code in (
+        ("/api/v1/logs", "bad_container"),
+        ("/api/v1/logs?container=heldso-app-1;rm", "bad_container"),
+        ("/api/v1/logs?container=x&since=tomorrow", "bad_time"),
+        ("/api/v1/logs?container=x&lines=0", "bad_lines"),
+        ("/api/v1/logs?container=x&lines=20000", "bad_lines"),
+        ("/api/v1/logs?container=x&lines=abc", "bad_lines"),
+    ):
+        res = await client.get(path, headers=auth(token))
+        assert res.status_code == 400, path
+        assert res.json()["error"]["code"] == code
+
+
+async def test_logs_follow_streams(yard_journal):
+    client, token, argv_log, _out = yard_journal
+    res = await client.get("/api/v1/logs?container=heldso-app-1&follow=1", headers=auth(token))
+    assert res.status_code == 200
+    assert "heldso-app-1 hello" in res.text
+    assert "-f" in argv_log.read_text().splitlines()
+
+
+async def test_logs_needs_a_token(yard_journal):
+    client, _token, _argv, _out = yard_journal
+    res = await client.get("/api/v1/logs?container=heldso-app-1")
+    assert res.status_code == 401
+
+
+async def test_events_merge_podman_and_yard(yard_journal):
+    client, token, argv_log, out = yard_journal
+    out.write_text(PODMAN_DIED + "\n" + PODMAN_SYSTEM + "\n" + YARD_DEPLOY + "\n")
+    res = await client.get("/api/v1/events", headers=auth(token))
+    assert res.status_code == 200
+    rows = res.json()
+    assert len(rows) == 2
+    died, deploy = rows
+    # A podman event on the engine itself (PODMAN_TYPE=podman) is not a container event.
+    assert died["source"] == "podman" and died["event"] == "died"
+    assert died["app"] == "heldso" and died["container"] == "heldso-app-1"
+    assert died["container_id"] == FULL_ID and died["exit_code"] == "1"
+    assert deploy["source"] == "yard" and deploy["event"] == "deploy.end"
+    assert deploy["status"] == "ok" and deploy["actor"] == "admin"
+    assert deploy["fields"] == {"cause": "manual"}
+    argv = argv_log.read_text().splitlines()
+    assert "SYSLOG_IDENTIFIER=podman" in argv and "SYSLOG_IDENTIFIER=yard" in argv
+    assert argv[argv.index("--since") + 1] == "-1d"
+
+
+async def test_events_filters(yard_journal):
+    client, token, _argv, out = yard_journal
+    out.write_text(PODMAN_DIED + "\n" + YARD_DEPLOY + "\n")
+
+    async def events(query: str) -> list:
+        res = await client.get(f"/api/v1/events?{query}", headers=auth(token))
+        assert res.status_code == 200
+        return res.json()
+
+    assert len(await events("app=heldso")) == 2
+    assert await events("app=other") == []
+    assert [row["source"] for row in await events("source=yard")] == ["yard"]
+    assert [row["event"] for row in await events("event=deploy.")] == ["deploy.end"]
+    assert [row["container"] for row in await events("container=heldso-app-1")] == ["heldso-app-1"]
+    # A 12-char prefix of the full id matches too.
+    assert [row["container"] for row in await events("container=abc123def456")] == ["heldso-app-1"]
+    assert len(await events("lines=1")) == 1
+
+
+async def test_events_follow_streams_ndjson(yard_journal):
+    client, token, argv_log, out = yard_journal
+    out.write_text(YARD_DEPLOY + "\n")
+    res = await client.get("/api/v1/events?follow=1&source=yard", headers=auth(token))
+    assert res.status_code == 200
+    row = json.loads(res.text.splitlines()[0])
+    assert row["event"] == "deploy.end"
+    assert "SYSLOG_IDENTIFIER=yard" in argv_log.read_text().splitlines()
