@@ -151,7 +151,7 @@ The scaffold's `tests/conftest.py` already points `APP_DB_PATH` at `tmp_path`, a
 
 - One `LiteWriter` per file per process. Open it in `bootstrap`. Pass it down. The claim is an `flock`: it releases when the holder dies, so a `ClaimBusy` means the holder is still alive.
 - On dev reload the old process must die before the new one claims. Run the watcher so the app is its direct child: `uv run watchfiles 'python -m app.main' app/ static/`. A nested `uv run` inside the watched command is killed instead of the app, and the orphaned app keeps the claim. A `ClaimBusy` in dev means an orphan: find it with `lsof <db>.sqlite3-claim` and kill it.
-- Reads on the loop thread, short and indexed. A rare large read (an export, a report over every row) goes to a worker thread: `await asyncio.to_thread(db.query, REPORT)`. Each thread reads on its own connection.
+- Reads on the loop thread, short and indexed. A rare large read (an export, a report over every row) awaits `db.aquery(REPORT)` (or `aone`, `avalue`), which runs on a worker thread. Each thread reads on its own connection.
 - Writes through `db.write`. On a plain thread, `db.submit(fn).result()`; never `.result()` on the loop. A synchronous helper called from a handler goes through `await asyncio.to_thread(helper, ...)`. Inside a write function read with `tx`, never `db`: `db.query` on the writer thread raises `StateError`. Never keep `tx` after the function returns.
 - `:name` parameters for every outside value. No f-strings into SQL.
 - `IF NOT EXISTS` in every `SCHEMA`.
