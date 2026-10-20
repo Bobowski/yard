@@ -8,7 +8,9 @@ services:
       dockerfile: ops/Containerfile
     restart: always
     networks:
-      - yard
+      yard:
+        aliases:
+          - yard
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
