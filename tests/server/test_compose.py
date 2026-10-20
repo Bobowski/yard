@@ -24,6 +24,9 @@ def _config(root: Path) -> Config:
         skip_deploy=True,
         boot=False,
         remote=True,
+        journal_dir=root / "no-journal",
+        journalctl_bin="journalctl-missing",
+        journal_socket=root / "no-journal.sock",
     )
 
 

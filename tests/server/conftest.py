@@ -19,6 +19,9 @@ def make_yard(
         skip_deploy=skip,
         boot=boot,
         remote=False,
+        journal_dir=tmp_path / "no-journal",
+        journalctl_bin="journalctl-missing",
+        journal_socket=tmp_path / "no-journal.sock",
     )
     return Yard(config, Store.open(tmp_path))
 

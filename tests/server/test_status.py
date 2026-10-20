@@ -20,6 +20,9 @@ def _yard(tmp_path: Path, ps: list[dict], stats: str = "[]", *, sock: bool = Fal
         skip_deploy=True,
         boot=sock,
         remote=False,
+        journal_dir=tmp_path / "no-journal",
+        journalctl_bin="journalctl-missing",
+        journal_socket=tmp_path / "no-journal.sock",
     )
     store = Store.open(tmp_path)
     yard = Yard(config, store)

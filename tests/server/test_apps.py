@@ -437,6 +437,9 @@ def _yard(tmp_path: Path) -> Yard:
         skip_deploy=True,
         boot=False,
         remote=False,
+        journal_dir=tmp_path / "no-journal",
+        journalctl_bin="journalctl-missing",
+        journal_socket=tmp_path / "no-journal.sock",
     )
     yard = Yard(config, Store.open(tmp_path))
     yard.store.create_app("heldso", "https://origin.cursor.com/org/app", "main")

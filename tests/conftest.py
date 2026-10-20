@@ -13,6 +13,10 @@ async def yard(tmp_path, monkeypatch):
     monkeypatch.setenv("YARD_SKIP_DEPLOY", "1")
     monkeypatch.setenv("YARD_BOOT", "0")
     monkeypatch.setenv("YARD_PODMAN_BIN", "yard-podman-missing")
+    # A Linux runner has a real journal; the tests must never reach it.
+    monkeypatch.setenv("YARD_JOURNAL_DIR", str(tmp_path / "no-journal"))
+    monkeypatch.setenv("YARD_JOURNAL_SOCKET", str(tmp_path / "no-journal.sock"))
+    monkeypatch.setenv("YARD_JOURNALCTL_BIN", "journalctl-missing")
     async with TestClient(bootstrap) as client:
         token = (tmp_path / "tokens" / "admin.token").read_text().strip()
         yield client, token, tmp_path
