@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.2
 
 - Yard mounts the host's Podman socket directory, not the socket file, so a restart of `podman.socket` (an install.sh repair run or a Podman upgrade) no longer leaves Yard unable to reach Podman until its container restarts.
 
