@@ -35,7 +35,7 @@ tests/test_<screen>.py
 ## Stario rules
 
 - Not ASGI: no Uvicorn, FastAPI, or response objects. `python -m app.main` runs `asyncio.run(serve(bootstrap))`.
-- `bootstrap(app: App, span: Span)` is an async generator with one `yield`: build shared objects, `span.attrs(await ASSETS.attach(app))`, register features, `yield`, clean up.
+- `bootstrap(app: App, span: Span)` is an async generator with one `yield`: build shared objects, `span.attrs(await ASSETS.attach(app))`, register features, `yield`, clean up. The scaffold adds `app.use("/", same_origin(), security_headers())` (`stario.http`): cross-site commands get 403, and responses get baseline headers. Routes are fixed after `bootstrap`.
 - A handler is `async def handler(c: Context, w: Writer) -> None`. It answers once: `w.html`, `w.text`, `w.empty`, `w.redirect`, or `SSE(w)`.
 - `Route("GET /rooms/{room_id}")` is one method on one path. `app.add(ROUTE, handler)` registers it; `ROUTE.href(room_id)` builds the link. No `url_for`, no `app.get`.
 - `c.match.params`, `c.req.query`, `c.req.cookies`; `c.state` is filled by middleware. Middleware is `(inner: Handler) -> Handler`, added with `app.use("/prefix", mw)`.
@@ -69,7 +69,7 @@ The stream is the only thing that paints shared state. A command does not return
 ```python
 def board_live(board: Board, relay: Relay[str]):
     async def handler(c: Context, w: Writer) -> None:
-        async with relay.subscribe(CHANGED) as events:
+        async with relay.subscribe(CHANGED, latest=True) as events:
             sse = SSE(w)
             sse.patch_elements(render(board.list_tiles()))
             async for _ in c.alive(events):
@@ -78,7 +78,7 @@ def board_live(board: Board, relay: Relay[str]):
     return handler
 ```
 
-Subscribe before the first render. Subjects are dotted strings at the top of `handlers.py`; `"room.*"` matches every room. With litewriter, `db.watch(query)` replaces `Relay` for row changes.
+Subscribe before the first render. `latest=True` keeps only the newest event per subject: a repaint needs no backlog. Subjects are dotted strings at the top of `handlers.py`; `"room.*"` matches every room. With litewriter, `db.watch(query)` replaces `Relay` for row changes.
 
 A command is a Datastar action: `data.on("click", at.post(ROUTE.href()))`, or `data.on("submit", at.post(ROUTE.href()), prevent=True)` on a `<form>`. A page with inputs uses Datastar, not `<form method="post">`.
 

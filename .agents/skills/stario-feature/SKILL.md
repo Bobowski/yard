@@ -203,7 +203,7 @@ def show_board(board: Board):
 
 def board_live(board: Board, relay: Relay[str]):
     async def handler(c: Context, w: Writer) -> None:
-        async with relay.subscribe(CHANGED) as events:
+        async with relay.subscribe(CHANGED, latest=True) as events:
             sse = SSE(w)
             sse.patch_elements(render(board.list_tiles()))
             async for _ in c.alive(events):
