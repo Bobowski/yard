@@ -235,22 +235,12 @@ async def test_tokens(yard):
     assert (await client.get("/api/v1/apps", headers=auth(ada))).status_code == 401
 
 
-async def test_podman_allowlist(yard, monkeypatch):
+async def test_podman_route_is_gone(yard):
     client, token, _root = yard
-
-    async def fake_run(self, *args, timeout=None, env=None, stdin=None):
-        return "ok\n"
-
-    monkeypatch.setattr(Podman, "run", fake_run)
-    for verb in ("rm", "run", "exec", "kill", "build"):
-        res = await client.post("/api/v1/podman", json={"args": [verb, "x"]}, headers=auth(token))
-        assert res.status_code == 400, verb
-        assert res.json()["error"]["code"] == "bad_args"
-    for verb in ("ps", "logs", "inspect", "stats", "top", "images", "port"):
-        res = await client.post("/api/v1/podman", json={"args": [verb]}, headers=auth(token))
-        assert res.status_code == 200, verb
-    res = await client.post("/api/v1/podman", json={"args": []}, headers=auth(token))
-    assert res.status_code == 400
+    res = await client.post("/api/v1/podman", json={"args": ["ps"]}, headers=auth(token))
+    assert res.status_code == 404
+    res = await client.post("/api/v1/podman", json={"args": ["ps"]})
+    assert res.status_code == 404
 
 
 async def test_prune(yard, monkeypatch):

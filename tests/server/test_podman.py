@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 
-from app.server.podman import parse_images, parse_info, parse_ps, parse_stats
+from app.server.podman import parse_images, parse_info, parse_ps, parse_stats, parse_system_df
 from app.shared import stamp as format_stamp
 
 
@@ -86,6 +86,19 @@ def test_parse_images():
     assert found[0].size == 400
     assert found[2].created is None
     assert found[2].size == 0
+
+
+def test_parse_system_df():
+    raw = '[{"Type":"Images","RawSize":2359570674,"RawReclaimable":1572938,"Size":"2.36GB"}]'
+    assert parse_system_df(raw) == (2359570674, 1572938)
+    # The Containers and Volumes rows are ignored; a missing Images row is None.
+    assert parse_system_df('[{"Type":"Containers","RawSize":9},{"Type":"Volumes","RawSize":8}]') is None
+    assert parse_system_df("") is None
+    assert parse_system_df("[]") is None
+    assert parse_system_df("not json") is None
+    assert parse_system_df('{"Type":"Images","RawSize":1}') is None
+    # Missing or non-numeric fields parse as zero.
+    assert parse_system_df('[{"Type":"Images"}]') == (0, 0)
 
 
 def test_format_stamp():

@@ -11,7 +11,6 @@ from stario.json import JsonValue
 
 from app.server import apps, binds, doctor, journal, status
 from app.server.forges import Forge, GitHub, Origin
-from app.server.podman import Podman
 from app.server.store import App, Config, Store
 from app.server.yard import Yard
 from app.shared import YardError, now
@@ -37,14 +36,10 @@ ENV_PUT = Route("PUT /api/v1/apps/{name}/env")
 BINDS = Route("GET /api/v1/binds")
 BIND_PUT = Route("PUT /api/v1/binds/{host}")
 BIND_DELETE = Route("DELETE /api/v1/binds/{host}")
-PODMAN = Route("POST /api/v1/podman")
 PRUNE = Route("POST /api/v1/prune")
 TOKENS = Route("GET /api/v1/tokens")
 TOKEN_CREATE = Route("POST /api/v1/tokens")
 TOKEN_DELETE = Route("DELETE /api/v1/tokens/{name}")
-
-# Read-only podman. This list is API policy; the adapter runs anything.
-_VERBS = {"ps", "logs", "inspect", "stats", "top", "images", "port"}
 
 
 async def json_object(c: Context) -> dict:
@@ -142,65 +137,6 @@ def run_prune(yard: Yard) -> Handler:
         w.json(cast(JsonValue, asdict(await apps.prune(yard, days, dry, actor=_actor(c)))))
 
     return handler
-
-
-def podman_command(remote: Podman) -> Handler:
-    async def handler(c: Context, w: Writer) -> None:
-        data = await json_object(c)
-        args = data.get("args")
-        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
-            raise YardError(
-                400,
-                "bad_json",
-                "bad json",
-                help_text="args is a list of strings.",
-                example='{"args": ["version"]}',
-            )
-        if (
-            not args
-            or len(args) > 64
-            or any(not arg or "\n" in arg or "\x00" in arg or len(arg) > 4096 for arg in args)
-        ):
-            raise YardError(
-                400,
-                "bad_args",
-                "the command needs words",
-                help_text="Pass the podman command.",
-                example="yard podman ps",
-            )
-        if args[0] not in _VERBS:
-            raise YardError(
-                400,
-                "bad_args",
-                f"podman {args[0]} is not allowed",
-                help_text="Read-only podman: ps logs inspect stats top images port.",
-                example="yard podman logs heldso-app-1",
-            )
-        if "-f" in args or "--follow" in args:
-            await _stream_podman(remote, c, w, args)
-            return
-        text = await remote.run(*args, timeout=None)
-        w.text(text if text.endswith("\n") or not text else text + "\n")
-
-    return handler
-
-
-async def _stream_podman(remote: Podman, c: Context, w: Writer, args: list[str]) -> None:
-    proc = await remote.popen(*args)
-    w.headers.set("content-type", "text/plain; charset=utf-8")
-    w.write_headers(200)
-    assert proc.stdout is not None
-    try:
-        while chunk := await proc.stdout.read(8192):
-            if c.disconnected:
-                break
-            w.write(chunk)
-            await w.drain()
-    finally:
-        if proc.returncode is None:
-            proc.kill()
-        await proc.wait()
-    w.end()
 
 
 async def _hook_body(c: Context, w: Writer) -> bytes | None:
@@ -1009,7 +945,6 @@ def register(app: StarioApp, yard: Yard) -> None:
     app.add(BINDS, binds_list(yard), middleware=auth)
     app.add(BIND_PUT, binds_put(yard), middleware=auth)
     app.add(BIND_DELETE, binds_delete(yard), middleware=auth)
-    app.add(PODMAN, podman_command(yard.podman), middleware=auth)
     app.add(PRUNE, run_prune(yard), middleware=auth)
     app.add(TOKENS, tokens_list(yard.store), middleware=auth)
     app.add(TOKEN_CREATE, tokens_create(yard.store, yard.config), middleware=auth)

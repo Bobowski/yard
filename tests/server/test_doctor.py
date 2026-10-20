@@ -10,11 +10,11 @@ import pytest
 
 from app.server import doctor
 from app.server.caddy import Caddy
-from app.server.forges import Origin
+from app.server.forges import GitHub, Origin
 from app.server.podman import Podman
 from app.server.store import Config, Store
 from app.server.yard import Yard
-from app.shared import YardError
+from app.shared import YardError, now
 from tests.server.conftest import FakeCaddy
 
 CADDY_PS = (
@@ -39,6 +39,7 @@ def _yard(
     info: str = "",
     ps: str = "[]",
     inspect: str = "[]",
+    df: str = "",
     journal_socket: Path | None = None,
 ) -> Yard:
     (tmp_path / "journal").mkdir(exist_ok=True)
@@ -71,6 +72,8 @@ def _yard(
                 return ps
             if args and args[0] == "inspect":
                 return inspect
+            if args[:2] == ("system", "df"):
+                return df
             return ""
 
     yard.podman = _Fake("podman", False)
@@ -105,7 +108,7 @@ def test_doctor_all_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     assert found["journal"]["ok"]
     assert found["container logs"]["detail"] == "1 containers"
     assert found["yard events"]["ok"]
-    assert found["disk"]["detail"] == "100B free of 200B"
+    assert found["disk"]["detail"] == f"{tmp_path} 100B free of 200B · data 0B · journal 0B"
     # A forge nothing uses earns no row.
     assert "origin" not in found
     assert "github" not in found
@@ -146,6 +149,96 @@ def test_doctor_forge_rows_when_connected(tmp_path: Path, monkeypatch: pytest.Mo
     assert found["origin token"]["ok"]
     assert found["origin webhook"]["detail"] == "none since boot"
     assert found["origin check"]["ok"]
+    # Origin does not report commit statuses.
+    assert "origin status" not in found
+
+
+def test_doctor_github_status_row(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard = _yard(tmp_path, ps=CADDY_PS)
+    usage = collections.namedtuple("usage", "total used free")(200, 100, 100)
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: usage)
+    monkeypatch.setattr(GitHub, "connected", lambda self: True)
+
+    async def fake_app(self):
+        return {"name": "yard"}
+
+    async def fake_find(self):
+        return {"repository_selection": "all", "account": {"login": "org"}}
+
+    async def fake_token(self):
+        return "tok"
+
+    monkeypatch.setattr(GitHub, "get_app", fake_app)
+    monkeypatch.setattr(GitHub, "find_installation", fake_find)
+    monkeypatch.setattr(GitHub, "token", fake_token)
+    github = yard.forge_named("github")
+
+    found = _run(yard)
+    assert found["github status"] == {"name": "github status", "ok": True, "detail": "none since boot"}
+
+    github.last_report = now()
+    found = _run(yard)
+    assert found["github status"]["ok"]
+    assert found["github status"]["detail"].endswith("ago")
+
+    github.last_report_error = "github POST /repos/org/app/statuses/abc: 403 write access denied"
+    found = _run(yard)
+    assert found["github status"]["ok"] is False
+    assert "403" in found["github status"]["detail"]
+    assert "Commit statuses: Read and write" in found["github status"]["detail"]
+
+    github.last_report_error = "github POST /repos/org/app/statuses/abc: 502 boom"
+    found = _run(yard)
+    assert "Commit statuses" not in found["github status"]["detail"]
+
+
+def test_doctor_disk_says_where_the_space_went(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard = _yard(
+        tmp_path,
+        ps=CADDY_PS,
+        df='[{"Type":"Images","RawSize":2000,"RawReclaimable":500,"Size":"2kB"}]',
+    )
+    yard.store.create_app("heldso", "https://origin.cursor.com/org/app", "main")
+    data = yard.config.data("heldso")
+    data.mkdir(parents=True)
+    (data / "db.sqlite").write_bytes(b"x" * 100)
+    (tmp_path / "journal" / "system.journal").write_bytes(b"y" * 50)
+    usage = collections.namedtuple("usage", "total used free")(200, 100, 100)
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: usage)
+    found = _run(yard)
+    assert found["disk"]["ok"]
+    assert found["disk"]["detail"] == (
+        f"{tmp_path} 100B free of 200B · images 2kB (500B reclaimable) · data 100B · journal 50B"
+    )
+
+
+def test_doctor_disk_omits_missing_parts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """No podman and no journal dir: the disk row keeps only the filesystem and data parts."""
+    config = Config(
+        root=tmp_path,
+        podman_sock="",
+        podman_bin="podman",
+        skip_deploy=True,
+        boot=False,
+        remote=False,
+        journal_dir=tmp_path / "no-journal",
+        journalctl_bin="journalctl-missing",
+        journal_socket=tmp_path / "no-journal.sock",
+    )
+    yard = Yard(config, Store.open(tmp_path))
+
+    class _Dead(Podman):
+        async def run(
+            self, *args: str, timeout: float | None = 20, env: dict | None = None, stdin: bytes | None = None
+        ) -> str:
+            raise YardError(502, "podman", "podman is down")
+
+    yard.podman = _Dead("podman", False)
+    usage = collections.namedtuple("usage", "total used free")(200, 100, 100)
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: usage)
+    found = _run(yard)
+    assert found["disk"]["ok"]
+    assert found["disk"]["detail"] == f"{tmp_path} 100B free of 200B · data 0B"
 
 
 def test_doctor_skips_the_proxy_checks_without_a_host(tmp_path: Path):
@@ -175,6 +268,7 @@ def test_doctor_flags_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     assert not found["network yard"]["ok"]
     assert not found["caddy"]["ok"]
     assert not found["disk"]["ok"]
+    assert "try yard prune" in found["disk"]["detail"]
     assert not found["origin"]["ok"]
     assert "github" not in found
 

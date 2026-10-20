@@ -11,7 +11,7 @@ from datetime import timedelta
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
-from app.server import binds, journal, podman
+from app.server import binds, journal, podman, status
 from app.server.forges import Forge
 from app.server.store import Config
 from app.shared import YardError, duration, format_bytes, parse
@@ -67,7 +67,7 @@ async def run(yard: Yard) -> list[Check]:
             checks.append(_check(f"https {host}", await _https(host, path)))
 
     checks += await _forge_rows(yard)
-    checks.append(_check("disk", _disk(config)))
+    checks.append(_check("disk", await _disk(yard)))
     return checks
 
 
@@ -90,7 +90,18 @@ async def _forge_rows(yard: Yard) -> list[Check]:
             _check(f"{forge.name} webhook", (True, _ago(forge.last_delivery))),
             _check(f"{forge.name} check", (True, _ago(forge.last_check))),
         ]
+        if forge.reports:
+            rows.append(_check(f"{forge.name} status", _forge_report(forge)))
     return rows
+
+
+def _forge_report(forge: Forge) -> tuple[bool, str]:
+    """The last commit status report, or its error. A 403 wants the grant."""
+    error = forge.last_report_error
+    if error:
+        hint = "; grant Commit statuses: Read and write" if " 403" in error else ""
+        return False, f"{error}{hint}"
+    return True, _ago(forge.last_report)
 
 
 async def _forge_app(forge: Forge) -> tuple[bool, str]:
@@ -275,9 +286,23 @@ def _certificate(config: Config, host: str) -> tuple[bool, str]:
     return True, f"issued {duration(age)} ago"
 
 
-def _disk(config: Config) -> tuple[bool, str]:
+async def _disk(yard: Yard) -> tuple[bool, str]:
+    """Filesystem free, then where the space went: images, app data, the journal."""
+    config = yard.config
     usage = shutil.disk_usage(config.root)
-    detail = f"{format_bytes(usage.free)} free of {format_bytes(usage.total)}"
+    parts = [f"{config.root} {format_bytes(usage.free)} free of {format_bytes(usage.total)}"]
+    try:
+        df = podman.parse_system_df(await yard.podman.run("system", "df", "--format", "json"))
+    except YardError:
+        df = None
+    if df is not None:
+        size, reclaimable = df
+        parts.append(f"images {format_bytes(size)} ({format_bytes(reclaimable)} reclaimable)")
+    data = sum(status.dir_size(config.data(app.name)) for app in yard.store.list_apps())
+    parts.append(f"data {format_bytes(data)}")
+    if config.journal_dir.is_dir():
+        parts.append(f"journal {format_bytes(status.dir_size(config.journal_dir))}")
+    detail = " · ".join(parts)
     if usage.free < usage.total * 0.1:
         return False, f"{detail}; try yard prune"
     return True, detail

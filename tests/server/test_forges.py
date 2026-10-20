@@ -276,6 +276,7 @@ def _write_key(dir: Path, pem: str) -> None:
 class _GhBox:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, object]] = []
+        self.bodies: list[tuple[str, dict]] = []
         self.token_seconds = 3600.0
         self.fail_app = False
 
@@ -303,6 +304,11 @@ def _github_handler(box: _GhBox):
             if method == "POST" and self.path.endswith("/access_tokens"):
                 expires = datetime.now(UTC) + timedelta(seconds=box.token_seconds)
                 _send(self, 200, {"token": f"ghs_{len(box.calls)}", "expires_at": _rfc(expires)})
+                return
+            if method == "POST" and self.path.startswith("/repos/") and "/statuses/" in self.path:
+                length = int(self.headers.get("content-length") or 0)
+                box.bodies.append((self.path, json.loads(self.rfile.read(length) or b"{}")))
+                _send(self, 201, {"state": "created"})
                 return
             _send(self, 404, {"message": "not found"})
 
@@ -481,3 +487,50 @@ def test_github_summary_has_no_secret(tmp_path):
 
 async def test_github_url():
     assert clone_url("https://github.com/org/heldso") == "https://github.com/org/heldso.git"
+
+
+def test_reports_flags(tmp_path):
+    from app.server.forges import Forge
+
+    assert Forge.reports is False
+    assert Origin.reports is False
+    assert GitHub.reports is True
+
+
+async def test_github_report_posts_a_commit_status(gh_api, tmp_path):
+    github, box = gh_api
+    _gh_wire(github, tmp_path)
+    sha = "d" * 40
+    await github.report("https://github.com/org/heldso", sha, "success", "live", "https://heldso.example.com")
+    method, path, headers = box.calls[-1]
+    assert method == "POST"
+    assert path == f"/repos/org/heldso/statuses/{sha}"
+    assert {key.lower(): value for key, value in headers.items()}["authorization"].startswith("Bearer ghs_")
+    assert box.bodies[-1] == (
+        path,
+        {
+            "state": "success",
+            "description": "live",
+            "context": "yard",
+            "target_url": "https://heldso.example.com",
+        },
+    )
+
+
+async def test_github_report_strips_git_truncates_and_skips_the_url(gh_api, tmp_path):
+    github, box = gh_api
+    _gh_wire(github, tmp_path)
+    await github.report("https://github.com/org/heldso.git", "abc123", "pending", "x" * 200)
+    _method, path, _headers = box.calls[-1]
+    assert path == "/repos/org/heldso/statuses/abc123"
+    body = box.bodies[-1][1]
+    assert body["description"] == "x" * 140
+    assert body["context"] == "yard"
+    assert "target_url" not in body
+
+
+async def test_origin_report_is_a_noop(api):
+    origin, box = api
+    _wire(origin)
+    await origin.report("https://origin.cursor.com/org/heldso", "abc123", "success", "live")
+    assert box.calls == []

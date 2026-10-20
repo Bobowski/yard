@@ -118,21 +118,6 @@ class Podman:
             )
         return text
 
-    async def popen(self, *args: str) -> asyncio.subprocess.Process:
-        try:
-            return await asyncio.create_subprocess_exec(
-                *self._args(args),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-        except FileNotFoundError as exc:
-            raise YardError(
-                502,
-                "podman",
-                f"podman {' '.join(args)}: {exc}",
-                help_text="The podman command has to be on PATH.",
-            ) from exc
-
 
 def parse_info(raw: str) -> Host:
     try:
@@ -213,6 +198,18 @@ def parse_images(raw: str) -> list[Image]:
             if isinstance(name, str) and name:
                 found.append(Image(name, created, size))
     return found
+
+
+def parse_system_df(raw: str) -> tuple[int, int] | None:
+    """podman system df: the Images row as (raw size, raw reclaimable), or None."""
+    try:
+        rows = _rows(raw)
+    except YardError, ValueError:
+        return None
+    for row in rows:
+        if str(row.get("Type") or "") == "Images":
+            return _int(row.get("RawSize")), _int(row.get("RawReclaimable"))
+    return None
 
 
 def parse_ps(raw: str) -> dict[str, Container]:

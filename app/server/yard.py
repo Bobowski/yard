@@ -41,12 +41,11 @@ class Yard:
     def attach(self, app: StarioApp) -> None:
         self.stario = app
 
-    def spawn(self, coro) -> None:
+    def spawn(self, coro) -> asyncio.Task:
         """Background work from a request. The app tracks it when it can."""
         if self.stario is not None:
-            self.stario.create_task(coro)
-        else:
-            asyncio.get_running_loop().create_task(coro)
+            return self.stario.create_task(coro)
+        return asyncio.get_running_loop().create_task(coro)
 
     def lock(self, name: str) -> asyncio.Lock:
         """One lock per app: deploys serialize on it."""

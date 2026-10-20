@@ -15,6 +15,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Iterable
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
@@ -34,12 +35,15 @@ class Forge:
     name = "forge"
     host = ""
     api = ""
+    reports = False
 
     def __init__(self, dir: Path, api: str = "") -> None:
         self.dir = dir
         self.api = (api or self.api).rstrip("/")
         self.last_delivery = ""
         self.last_check = ""
+        self.last_report = ""
+        self.last_report_error = ""
         self._token = ""
         self._token_until = 0.0
 
@@ -156,6 +160,9 @@ class Forge:
         self._token_until = moment.timestamp() if moment else 0.0
         return self._token
 
+    async def report(self, repo: str, sha: str, state: str, description: str, target_url: str = "") -> None:
+        """A commit status on the forge. Only a forge with reports = True posts one."""
+
 
 class Origin(Forge):
     """api.cursor.com. Yard makes the Ed25519 key; EdDSA signs the JWT."""
@@ -252,6 +259,7 @@ class GitHub(Forge):
     name = "github"
     host = "github.com"
     api = "https://api.github.com"
+    reports = True
 
     def _headers(self) -> dict[str, str]:
         # GitHub refuses a request with no User-Agent.
@@ -341,6 +349,18 @@ class GitHub(Forge):
             return False
         digest = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
         return hmac.compare_digest(f"sha256={digest}", header)
+
+    async def report(self, repo: str, sha: str, state: str, description: str, target_url: str = "") -> None:
+        """POST /repos/<owner>/<name>/statuses/<sha> with the installation token."""
+        full = urlsplit(repo).path.strip("/").removesuffix(".git")
+        body: dict[str, str] = {
+            "state": state,
+            "description": description[:140],
+            "context": "yard",
+        }
+        if target_url:
+            body["target_url"] = target_url
+        await self._call("POST", f"/repos/{full}/statuses/{sha}", await self.token(), body)
 
 
 def _b64(raw: bytes) -> str:

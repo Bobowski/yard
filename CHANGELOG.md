@@ -4,6 +4,9 @@
 
 - `install.sh` installs a pinned Podman (podman-static 6.1.4) under `/usr/local` and points yard's `podman.service` at it. Podman 4.9's compat API does not return container labels on the list endpoint, so Compose recreated every container on every `up` — including Caddy on each Yard self-deploy. On Podman 6 an unchanged service stays up. The first Podman 6 run migrates the BoltDB state to SQLite.
 - The podman-remote in the Yard and apply images moves to 6.1.4 to match, and the Yard image now verifies its checksum.
+- `yard podman` and `POST /api/v1/podman` are gone. Events and logs come from journald, `status` already carries restarts, health, oom, exit error, cpu, and mem, and `ssh` covers ad-hoc podman.
+- The doctor `disk` row says where the space went: filesystem free, image size and reclaimable from `podman system df`, total app data, and the journal.
+- A deploy on a GitHub repo posts a commit status on the sha (context `yard`): `pending` while it runs, `success` live (linked to the app's public host) or `failure` on a revert or error, and a boot marks the running yard commit `live`. The GitHub App needs `Commit statuses: Read and write` — `yard forge setup github` asks for it — and doctor shows a `<forge> status` row with the last report or its error.
 
 ## 0.5.0
 

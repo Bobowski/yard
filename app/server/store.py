@@ -33,6 +33,7 @@ class Config:
     boot: bool
     remote: bool
     check_seconds: float = 300.0
+    sha: str = ""
     journal_dir: Path = Path("/var/log/journal")
     journalctl_bin: str = "journalctl"
     journal_socket: Path = Path("/run/systemd/journal/socket")
@@ -76,6 +77,7 @@ class Config:
             boot=boot,
             remote=remote,
             check_seconds=float(os.environ.get("YARD_CHECK_SECONDS", "300")),
+            sha=os.environ.get("SHA", ""),
             journal_dir=Path(os.environ.get("YARD_JOURNAL_DIR", "/var/log/journal")),
             journalctl_bin=os.environ.get("YARD_JOURNALCTL_BIN", "journalctl"),
             journal_socket=Path(os.environ.get("YARD_JOURNAL_SOCKET", "/run/systemd/journal/socket")),

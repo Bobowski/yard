@@ -130,10 +130,6 @@ def _api_try(client: Client, method: str, path: str, body: object, timeout: int 
         _die(f"the Yard API did not answer: {exc.reason}")
 
 
-def _stream_post(client: Client, path: str, body: object) -> None:
-    _stream(client, "POST", path, body)
-
-
 def _stream_get(client: Client, path: str) -> None:
     _stream(client, "GET", path, None)
 
@@ -767,7 +763,7 @@ def _setup_github(session: Client, args: argparse.Namespace) -> None:
     secret = str(pending.get("secret")) if pending else secrets.token_hex(32)
     print(f"webhook url: {session.url}/hooks/github")
     print("event: push")
-    print("permission: contents read")
+    print("permission: contents read, commit statuses write")
     print(f"webhook secret: {secret}")
     print("Paste this as the webhook secret.")
     print()
@@ -788,6 +784,7 @@ def _setup_github(session: Client, args: argparse.Namespace) -> None:
                 "webhook_active": "true",
                 "webhook_url": f"{session.url}/hooks/github",
                 "contents": "read",
+                "statuses": "write",
                 "events[]": "push",
             }
         )
@@ -877,16 +874,6 @@ def _poll_installation(session: Client, name: str) -> None:
             return
         time.sleep(SETUP_POLL)
     _die("No installation showed up in ten minutes.")
-
-
-def _cmd_podman(args: argparse.Namespace) -> None:
-    _stream_post(_load(args), "/api/v1/podman", {"args": _remainder(args.args)})
-
-
-def _remainder(args: list[str]) -> list[str]:
-    if args and args[0] == "--":
-        return args[1:]
-    return args
 
 
 def _show_record(raw: str) -> None:
@@ -980,10 +967,6 @@ def _parser() -> argparse.ArgumentParser:
         group = subs.add_parser(name, help=help_text, parents=[common])
         verbs = group.add_subparsers(dest="verb", metavar="command", required=True)
         build(verbs, common)
-
-    podman_cmd = subs.add_parser("podman", help="run podman on the host", parents=[common])
-    podman_cmd.add_argument("args", nargs=argparse.REMAINDER)
-    podman_cmd.set_defaults(func=_cmd_podman)
 
     return parser
 

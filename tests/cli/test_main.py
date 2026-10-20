@@ -368,7 +368,7 @@ def test_env_commands(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFix
     assert "B=2" in out
 
 
-def test_bind_and_podman_commands(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+def test_bind_commands(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
     seen: dict = {}
 
     def fake_api_try(client, method, path, body, timeout=None):
@@ -385,11 +385,7 @@ def test_bind_and_podman_commands(monkeypatch: pytest.MonkeyPatch, capsys: pytes
             return 200, json.dumps([{"name": "heldso", "repo": "https://origin.cursor.com/org/heldso", "ref": "main"}])
         return 200, json.dumps({"output": "ok\n"})
 
-    def fake_stream_post(client, path, body):
-        seen[("POST", path)] = body
-
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
-    monkeypatch.setattr(cli, "_stream_post", fake_stream_post)
     _env(monkeypatch)
 
     main(["bind", "set", "heldso.example.com", "heldso-app:9000", "--try", "30s", "--text"])
@@ -413,11 +409,12 @@ def test_bind_and_podman_commands(monkeypatch: pytest.MonkeyPatch, capsys: pytes
     assert seen[("DELETE", "/api/v1/binds/heldso.example.com")] is None
     assert "removed heldso.example.com" in capsys.readouterr().out
 
-    main(["podman", "--text", "ps"])
-    assert seen[("POST", "/api/v1/podman")] == {"args": ["ps"]}
 
-    main(["podman", "--text", "logs", "-f", "--tail", "20", "heldso-app-1"])
-    assert seen[("POST", "/api/v1/podman")] == {"args": ["logs", "-f", "--tail", "20", "heldso-app-1"]}
+def test_podman_command_is_gone(capsys: pytest.CaptureFixture):
+    with pytest.raises(SystemExit) as caught:
+        main(["podman", "ps"])
+    assert caught.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
 
 
 def test_prune(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):

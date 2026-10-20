@@ -7,7 +7,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
-from app.server import compose, git, journal, podman
+from app.server import binds, compose, git, journal, podman
 from app.server.forges import Forge
 from app.server.store import App
 from app.server.yard import Yard
@@ -128,9 +128,11 @@ async def deploy(
                 error=f"{forge.name} is not connected. Run yard forge setup {forge.name}.",
             )
         head = ""
+        pending: asyncio.Task[None] | None = None
         try:
             token = await forge.token()
             head = await git.sync(yard.config.clone(name), clone_url(app.repo), sha or app.ref, token)
+            pending = yard.spawn(report(forge, app.repo, head, "pending", f"deploying {head[:12]}"))
             journal.send(
                 yard.config,
                 "deploy.start",
@@ -149,7 +151,63 @@ async def deploy(
             # A sync failure never reaches apply; deploy.end alone is the record.
             outcome = Outcome("failed", error=str(exc), log=f"{exc}\n")
         _deploy_end(yard, app, head, outcome)
+        yard.spawn(_report_outcome(yard, app, forge, head, outcome, pending))
         return outcome
+
+
+async def report(forge: Forge, repo: str, sha: str, state: str, description: str, target_url: str = "") -> None:
+    """Post a commit status. A failure logs and records; it never raises."""
+    if not forge.reports:
+        return
+    try:
+        await forge.report(repo, sha, state, description, target_url)
+    except Exception as exc:
+        log.warning("%s report: %s", forge.name, exc)
+        forge.last_report_error = str(exc)
+    else:
+        forge.last_report = now()
+        forge.last_report_error = ""
+
+
+async def _report_outcome(
+    yard: Yard,
+    app: App,
+    forge: Forge,
+    sha: str,
+    outcome: Outcome,
+    pending: asyncio.Task[None] | None,
+) -> None:
+    """The last word on a deploy, after the pending status landed."""
+    if not sha or not forge.reports or outcome.status in {"skipped", "pending"}:
+        return
+    if pending is not None:
+        await asyncio.gather(pending, return_exceptions=True)
+    if outcome.status == "ok":
+        host = await _live_host(yard, app)
+        await report(
+            forge,
+            app.repo,
+            sha,
+            "success",
+            f"live on {host}" if host else "live",
+            f"https://{host}" if host else "",
+        )
+    elif outcome.status in {"reverted", "failed"}:
+        error = (outcome.error.splitlines() or [""])[0]
+        await report(forge, app.repo, sha, "failure", f"{outcome.status}: {error}".rstrip(": "))
+
+
+async def _live_host(yard: Yard, app: App) -> str:
+    """The public host whose bind dials this app; '' when Caddy or the bind is absent."""
+    try:
+        found = await binds.read(yard)
+    except YardError:
+        return ""
+    names = {app.name, compose.app_container(app.name)}
+    for bind in found:
+        if bind.dial.split(":", 1)[0] in names:
+            return bind.host
+    return ""
 
 
 def _deploy_end(yard: Yard, app: App, sha: str, outcome: Outcome) -> None:

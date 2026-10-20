@@ -54,6 +54,8 @@ yard forge setup github [--key PATH] [--org ORG] [--new]
 
 Each forge stores its app ID, installation ID, and secrets in `apps/yard/data/<forge>/state.json`, mode 0600. The private key is `key.pem` in that directory. The files are the truth; the server re-reads them on each call, so no restart is needed. Keys and secrets never appear in an API response.
 
+A deploy on a GitHub repo posts a commit status on the sha, context `yard`: `pending` while it runs, `success` when the image is live (linked to the app's public host), `failure` on a revert or an error. The GitHub App needs `Commit statuses: Read and write`; `yard forge setup github` asks for it. At boot Yard marks its own running commit `live`. A reverted Yard self-deploy leaves that commit `pending`.
+
 `yard forge ls` shows which forges are connected.
 
 ## Checks and deploys
@@ -80,7 +82,7 @@ Everything observable lands in journald on the host: container logs, Podman's co
 - `yard app logs` is the same read for `<name>-app-1`; `--deploy` picks `deploy-<name>`, `--container` another of the app's containers.
 - `yard events` is the merged timeline of Podman and Yard events: `--app`, `--container`, `--source podman|yard`, `--event PREFIX`, `--tail N`, `-f` for NDJSON. `yard events --app <name> --event deploy.` shows an app's deploy history.
 
-A container that predates journald starts logging there on its next deploy. `yard podman logs` still works for the containers that keep file logs.
+A container that predates journald starts logging there on its next deploy.
 
 A Yard event's fields never carry secrets: an env change logs key names only, and tokens, keys, and webhook secrets never appear.
 
@@ -137,16 +139,13 @@ yard bind ls
 yard bind set HOST [CONTAINER[:PORT]] [--try DURATION] [--app NAME]
 yard bind rm HOST
 yard token ls | new NAME | rm NAME
-yard podman ARGS...
 ```
 
 `yard` prints help. `yard status` shows what is running: how long it has been up, the revision, and the app config. A revision behind the remote tip shows both. A failed deploy points at `yard app logs --deploy --app <name>`; a down container at `yard logs <container>`. When no forge is connected, `status` and `login` print a hint on stderr.
 
-`yard status --full` adds the host checks: podman, the yard network, the apply image, caddy, the admin socket and the binds, DNS and certificates, disk, Podman's journald settings, the journal, the container log drivers, the events socket, and each forge in use. It exits 1 when a check fails.
+`yard status --full` adds the host checks: podman, the yard network, the apply image, caddy, the admin socket and the binds, DNS and certificates, disk, Podman's journald settings, the journal, the container log drivers, the events socket, and each forge in use. The disk row says where the space went: filesystem free, image size and reclaimable from `podman system df`, total app data, and the journal. A forge that reports commit statuses earns a `<forge> status` row with the last report or its error. It exits 1 when a check fails.
 
 `yard prune` removes `localhost/` images that no container uses. An app directory stays. The default keeps an image newer than 7 days. `--dry-run` reports without removing.
-
-`yard podman` passes read-only commands to Podman on the host: `ps`, `logs`, `inspect`, `stats`, `top`, `images`, `port`. `yard podman logs -f <container>` streams the log.
 
 A terminal prints text. A pipe, `--json`, `NO_COLOR`, and `--no-color` leave the color off.
 
@@ -184,7 +183,6 @@ PUT /api/v1/forges/github                {app_id, private_key, webhook_secret} �
 GET /api/v1/binds                        — [{host, dial, id, state, try}]
 PUT /api/v1/binds/{host}                 {dial, try?} — {host, dial, id, state, try}
 DELETE /api/v1/binds/{host}              — {host}
-POST /api/v1/podman                      {args: [...]} — text; -f or --follow streams
 GET /api/v1/tokens                       — [token]
 POST /api/v1/tokens                      {name} — {name, token}
 DELETE /api/v1/tokens/{name}             — {name}

@@ -55,6 +55,22 @@ async def boot(yard: Yard, app: App) -> None:
     yard.tasks.append(app.create_task(_apply_image(yard), name="apply-image"))
     yard.tasks.append(app.create_task(apps.loop(yard), name="checks"))
     yard.tasks.append(app.create_task(_caddy_server(yard), name="caddy-server"))
+    yard.tasks.append(app.create_task(_boot_report(yard), name="boot-report"))
+
+
+async def _boot_report(yard: Yard) -> None:
+    """This process is the last yard deploy's commit; mark it live on the forge."""
+    sha = yard.config.sha
+    if not sha:
+        return
+    try:
+        repo = yard.store.app("yard").repo
+        forge = yard.forge(repo)
+    except YardError:
+        return
+    if not repo or not forge.connected():
+        return
+    await apps.report(forge, repo, sha, "success", "live")
 
 
 async def _caddy_server(yard: Yard) -> None:
