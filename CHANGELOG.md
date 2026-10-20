@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
 
 - `install.sh` installs a pinned Podman (podman-static 6.1.4) under `/usr/local` and points yard's `podman.service` at it. Podman 4.9's compat API does not return container labels on the list endpoint, so Compose recreated every container on every `up` — including Caddy on each Yard self-deploy. On Podman 6 an unchanged service stays up. The first Podman 6 run migrates the BoltDB state to SQLite.
 - The podman-remote in the Yard and apply images moves to 6.1.4 to match, and the Yard image now verifies its checksum.
