@@ -2,9 +2,11 @@
 
 from datetime import datetime
 
+import pytest
 from stario import json
 
 
+@pytest.mark.filterwarnings("error::DeprecationWarning")
 async def test_bootstrap_sets_the_orjson_codec(yard):
     assert json.dumps({"a": "é"}) == '{"a":"é"}'
     assert json.loads(json.dumps_bytes({"a": "é"})) == {"a": "é"}

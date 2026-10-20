@@ -15,21 +15,8 @@ from app.shared import YardError
 log = logging.getLogger("yard")
 
 
-class _Orjson:
-    """stario.json codec on orjson. Non-str keys behave like the stdlib codec."""
-
-    def dumps(self, value: object, /, *, default: json.JsonDefault | None = None) -> str:
-        return self.dumps_bytes(value, default=default).decode()
-
-    def dumps_bytes(self, value: object, /, *, default: json.JsonDefault | None = None) -> bytes:
-        return orjson.dumps(value, default=default, option=orjson.OPT_NON_STR_KEYS)
-
-    def loads(self, data: str | bytes | bytearray, /) -> object:
-        return orjson.loads(data)
-
-
 async def bootstrap(app: App, span: Span):
-    json.set_codec(_Orjson())
+    json.set_codec(orjson.dumps, orjson.loads)
     config = Config.from_env()
     span.attrs({"yard.root": str(config.root), "yard.boot": config.boot})
     store = Store.open(config.root)
