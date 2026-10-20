@@ -1,5 +1,6 @@
 #!/bin/sh
-# Install Yard on a VM. A second run repairs a partial install.
+# Install Yard on an Ubuntu 26.04 LTS VM; its packaged Podman 5.x is used.
+# A second run repairs a partial install.
 # A healthy Yard container stays in place. Data under /srv/yard stays in place.
 # The source is the public Yard repo. --domain is the public host for Yard.
 # Caddy listens on 443 inside its container; the host publishes 8443 for TCP and UDP.
@@ -44,40 +45,41 @@ done
   "It creates the yard user, writes /etc files, and loads an nft table." \
   "Hint: sudo ./install.sh --domain <host>"
 
-if ! command -v nft >/dev/null 2>&1 || ! command -v sudo >/dev/null 2>&1 || ! command -v wget >/dev/null 2>&1 || ! command -v newuidmap >/dev/null 2>&1; then
+os_pretty="an unknown OS"
+if [ -r /etc/os-release ]; then
+  . /etc/os-release
+  os_pretty="${PRETTY_NAME:-an unknown OS}"
+fi
+if [ "${ID:-}" != "ubuntu" ] || [ "${VERSION_ID:-}" != "26.04" ]; then
+  echo "warning: Yard targets Ubuntu 26.04 LTS; this host is ${os_pretty}." >&2
+fi
+
+if ! command -v nft >/dev/null 2>&1 || ! command -v sudo >/dev/null 2>&1 || ! command -v newuidmap >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1 || ! command -v podman >/dev/null 2>&1; then
   if ! command -v apt-get >/dev/null 2>&1; then
-    die "nft, wget, sudo, and uidmap are required" \
+    die "nft, sudo, uidmap, git, and podman are required" \
       "The script installs them with apt-get when that command exists." \
-      "Hint: install nftables, wget, sudo, and uidmap, then rerun this script."
+      "Hint: install nftables, sudo, uidmap, git, and podman, then rerun this script."
   fi
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  # uidmap gives rootless Podman newuidmap/newgidmap; podman itself is the
-  # pinned static build below, not the apt package.
-  apt-get install -y nftables git ca-certificates wget sudo iproute2 procps uidmap
+  # uidmap gives rootless Podman newuidmap/newgidmap; acl gives setfacl for the
+  # traverse check; podman is the Ubuntu 26.04 package.
+  apt-get install -y nftables git ca-certificates sudo iproute2 procps uidmap acl podman
 fi
 command -v nft >/dev/null 2>&1 || die "nft is not installed" "Hint: apt-get install -y nftables"
+command -v podman >/dev/null 2>&1 || die "podman is not installed" "Hint: apt-get install -y podman"
 
-# Pinned Podman. Ubuntu ships 4.9, whose compat API drops container labels on
-# the list endpoint, so Compose recreates every container on every up. The
-# static bundle carries the matched netavark/aardvark/pasta set Podman 6 needs.
-# The first run migrates the BoltDB state to SQLite. An apt podman stays in
-# place: the unit drop-in below picks which binary serves the socket.
-podman_version="6.1.4"
-podman_sha256="9dd51073fac5a1742f88cf3caff5554615cb4d67ba554d25e8807be635547af5"
-if ! /usr/local/bin/podman version --format '{{.Client.Version}}' 2>/dev/null | grep -qx "$podman_version"; then
-  tgz="$(mktemp)"
-  wget -q -O "$tgz" \
-    "https://github.com/mgoltzsche/podman-static/releases/download/v${podman_version}/podman-linux-amd64.tar.gz" \
-    || die "Could not download podman-static ${podman_version}." \
-      "Hint: curl -I https://github.com/mgoltzsche/podman-static/releases/tag/v${podman_version}"
-  echo "${podman_sha256}  ${tgz}" | sha256sum -c - \
-    || die "The podman-static checksum did not match." "Hint: the release may have changed; verify by hand."
-  # Only usr/ is extracted. The bundle's etc/containers would set a file event
-  # log and a fuse-overlayfs mount program; this host uses journald and native
-  # overlay.
-  tar -xzf "$tgz" --strip-components=1 -C / "podman-linux-amd64/usr"
-  rm -f "$tgz"
+# Podman 4's compat API drops container labels on the list endpoint, so Compose
+# recreates every container on every up. The gate keeps the install on 5.x.
+podman_version="$(podman --version 2>/dev/null | sed -n 's/^podman version //p')"
+podman_major="${podman_version%%.*}"
+case "$podman_major" in
+  '' | *[!0-9]*) podman_major=0 ;;
+esac
+if [ "$podman_major" -lt 5 ]; then
+  die "Yard needs Podman 5 or newer." \
+    "Context: this host has ${podman_version:-no podman}." \
+    "Hint: use Ubuntu 26.04 LTS, whose podman package is 5.x."
 fi
 
 if ! id yard >/dev/null 2>&1; then
@@ -308,23 +310,21 @@ if [ "$(cat /home/yard/.config/containers/containers.conf 2>/dev/null)" != "$con
   run_yard systemctl --user restart podman.socket
 fi
 
-# The packaged user unit ExecStart is /usr/bin/podman; pin it to the static
-# build. The restart keeps containers up — only the API service reloads.
-install -d -o yard -g yard /home/yard/.config/systemd/user/podman.service.d
-podman_dropin='[Service]
-ExecStart=
-ExecStart=/usr/local/bin/podman $LOGGING system service'
+# The 0.6.0 script pinned podman.service to a static build with this drop-in.
+# Remove it where a host still carries it; the packaged unit runs /usr/bin/podman.
 dropin_file="/home/yard/.config/systemd/user/podman.service.d/podman-static.conf"
-if [ "$(cat "$dropin_file" 2>/dev/null)" != "$podman_dropin" ]; then
-  printf '%s\n' "$podman_dropin" > "$dropin_file"
-  chown yard:yard "$dropin_file"
-  chmod 644 "$dropin_file"
+if [ -f "$dropin_file" ]; then
+  rm -f "$dropin_file"
+  rmdir /home/yard/.config/systemd/user/podman.service.d 2>/dev/null || true
+  run_yard systemctl --user daemon-reload
+  run_yard systemctl --user stop podman.service >/dev/null 2>&1 || true
+  run_yard systemctl --user restart podman.socket
 fi
-run_yard systemctl --user daemon-reload
-run_yard systemctl --user stop podman.service >/dev/null 2>&1 || true
-run_yard systemctl --user restart podman.socket
 
 run_yard systemctl --user enable --now podman.socket
+run_yard systemctl --user enable podman-restart.service || die "Could not enable podman-restart.service." \
+  "Containers marked for restart would not come back after a reboot." \
+  "Hint: systemctl --user --machine yard@ status podman-restart.service"
 sock="/run/user/${uid}/podman/podman.sock"
 if ! retry 30 sh -c "test -S '$sock'"; then
   die "The Podman socket ${sock} is not ready." \
@@ -339,16 +339,6 @@ if ! retry 30 run_yard podman info >/dev/null 2>&1; then
     "Hint: sudo -u yard podman info" \
     "Context: ${info}"
 fi
-# `podman info` runs the local engine, not the socket service. The unit's
-# effective ExecStart is what serves the socket, so assert it directly.
-exec_start="$(run_yard systemctl --user show podman.service --property=ExecStart --value 2>/dev/null || true)"
-case "$exec_start" in
-  *"/usr/local/bin/podman"*) ;;
-  *) die "podman.service does not run the pinned Podman ${podman_version}." \
-    "The drop-in must set ExecStart to /usr/local/bin/podman." \
-    "Hint: systemctl --user --machine yard@ cat podman.service" \
-    "Context: ExecStart is ${exec_start:-empty}." ;;
-esac
 allow_redirect_port
 ensure_traverse "$root"
 

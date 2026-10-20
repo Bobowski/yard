@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.1
+
+- `install.sh` targets Ubuntu 26.04 LTS and uses its podman package (5.x) instead of podman-static 6.1.4. It refuses Podman older than 5 and warns on another OS. It removes the 0.6.0 `podman.service` drop-in if present.
+- The podman-remote in the Yard and apply images moves to 5.7.0 to match the host.
+
 ## 0.6.0
 
 - `install.sh` installs a pinned Podman (podman-static 6.1.4) under `/usr/local` and points yard's `podman.service` at it. Podman 4.9's compat API does not return container labels on the list endpoint, so Compose recreated every container on every `up` — including Caddy on each Yard self-deploy. On Podman 6 an unchanged service stays up. The first Podman 6 run migrates the BoltDB state to SQLite.

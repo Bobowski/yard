@@ -102,13 +102,13 @@ Yard keeps its files in `/srv/yard`:
 
 Caddy listens on 443 inside its container. The host publishes 8443 for TCP and UDP, and nft redirects public 443 — TCP and UDP — to 8443, so HTTP/3 reaches Caddy. The admin API is a unix socket at `apps/yard/caddy/run/admin.sock`. Binds and doctor use it; there is no admin port. A firewall must allow `8443/tcp` and `8443/udp`; install.sh adds both rules to ufw.
 
-Install on the VM, as root:
+Install on an Ubuntu 26.04 LTS VM, as root:
 
 ```sh
 ./install.sh --domain yard.example.com
 ```
 
-`install.sh` prepares the host, installs a pinned Podman (static build, currently 6.1.4) for the yard user — Ubuntu's 4.9 drops container labels on the compat list endpoint, so Compose would recreate every container on every up — configures journald and Podman's journald settings, clones the Yard repo, builds the apply image, and runs the first apply. The `deploy-yard` container is that deploy. A second run repairs. It never asks questions; at the end it prints the next steps.
+`install.sh` prepares the host, installs Ubuntu's podman package (5.x on 26.04 LTS; it refuses Podman older than 5, whose compat API drops container labels so Compose recreated every container on each up), configures journald and Podman's journald settings, clones the Yard repo, builds the apply image, and runs the first apply. The `deploy-yard` container is that deploy. A second run repairs. It never asks questions; at the end it prints the next steps.
 
 The script prints an admin token. Use it with `yard login`, then run `yard forge setup origin` or `yard forge setup github`, and point the yard app at its repo with `yard app set` so pushes to Yard deploy Yard itself.
 

@@ -261,6 +261,32 @@ def test_install_sh_configures_journald():
     assert spec.count('!= "$containers_conf"') == 1
 
 
+def test_install_sh_uses_the_distro_podman():
+    # Ubuntu 26.04 LTS packages Podman 5.x; the static bundle is gone.
+    spec = (Path(__file__).resolve().parents[2] / "install.sh").read_text()
+    assert "apt-get install -y nftables git ca-certificates sudo iproute2 procps uidmap acl podman" in spec
+    assert "VERSION_ID" in spec
+    assert "26.04" in spec
+    assert "Yard needs Podman 5 or newer" in spec
+    # The only podman-static reference left is the drop-in cleanup for 0.6.0 hosts.
+    assert spec.count("podman-static.conf") == 1
+    for gone in ("podman_sha256", "wget -q", "podman-linux-amd64", "/usr/local/bin/podman"):
+        assert gone not in spec
+
+
+def test_the_images_pin_the_host_podman_remote():
+    # Both images carry the podman-remote that matches the host's Podman 5.7.
+    ops = Path(__file__).resolve().parents[2] / "ops"
+    sha = "0d1759e3fc42b0e3a4496176dabc7b65f0f334a0ab2b22eaed7c36afeece8b0c"
+    yard = (ops / "Containerfile").read_text()
+    apply = (ops / "apply" / "Containerfile").read_text()
+    assert "download/v5.7.0/podman-remote-static-linux_amd64.tar.gz" in yard
+    assert f"{sha}  /tmp/podman-remote.tar.gz" in yard
+    assert "PODMAN_VERSION=5.7.0" in apply
+    assert f"PODMAN_SHA256={sha}" in apply
+    assert "v${PODMAN_VERSION}/podman-remote-static-linux_amd64.tar.gz" in apply
+
+
 def test_install_sh_and_apply_pass_the_same_env_names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # install.sh starts the yard apply container by hand; apply() must pass the same -e names.
     spec = (Path(__file__).resolve().parents[2] / "install.sh").read_text()
