@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Yard mounts the host's Podman socket directory, not the socket file, so a restart of `podman.socket` (an install.sh repair run or a Podman upgrade) no longer leaves Yard unable to reach Podman until its container restarts.
+
 ## 0.6.1
 
 - `install.sh` targets Ubuntu 26.04 LTS and uses its podman package (5.x) instead of podman-static 6.1.4. It refuses Podman older than 5 and warns on another OS. It removes the 0.6.0 `podman.service` drop-in if present.

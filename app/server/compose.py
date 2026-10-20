@@ -55,9 +55,11 @@ def run_env(config: Config, app: App, checkout: Path, image: str, sha: str) -> d
             raise YardError(502, "compose", f"no compose file or Containerfile in {checkout}")
         env["DOCKERFILE"] = dockerfile
     if app.name == "yard":
-        # ops/compose.yml binds these two host paths.
+        # ops/compose.yml binds these host paths.
+        sock = config.podman_sock or "/run/podman/podman.sock"
         env["YARD_ROOT"] = str(config.root)
-        env["YARD_PODMAN_SOCK"] = config.podman_sock or "/run/podman/podman.sock"
+        env["YARD_PODMAN_SOCK"] = sock
+        env["YARD_PODMAN_DIR"] = str(Path(sock).parent)
     return env
 
 

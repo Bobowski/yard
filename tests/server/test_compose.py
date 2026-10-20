@@ -3,6 +3,7 @@ import os
 import re
 import stat
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -128,6 +129,11 @@ def test_the_yard_app_gets_its_host_paths_from_config(tmp_path: Path):
 
     assert project.env["YARD_ROOT"] == str(tmp_path)
     assert project.env["YARD_PODMAN_SOCK"] == "/run/podman.sock"
+    # The directory is mounted so a host podman.socket restart stays reachable.
+    assert project.env["YARD_PODMAN_DIR"] == "/run"
+    default = _prepare(replace(config, podman_sock=""), _app("yard"), checkout, "localhost/yard:abc", "abc")
+    assert default.env["YARD_PODMAN_SOCK"] == "/run/podman/podman.sock"
+    assert default.env["YARD_PODMAN_DIR"] == "/run/podman"
     assert project.files == [str(checkout / "ops" / "compose.yml")]
 
     # Another app does not see the host paths.
