@@ -90,8 +90,7 @@ def proxy_route(host: str, dial: str, window: str = "10s") -> dict[str, object]:
         "handle": [
             {
                 "handler": "reverse_proxy",
-                "lb_try_duration": window,
-                "lb_try_interval": "250ms",
+                "load_balancing": {"try_duration": window, "try_interval": "250ms"},
                 "upstreams": [{"dial": dial}],
             }
         ],
@@ -160,7 +159,11 @@ def _window(row: dict[str, object]) -> str:
     for item in handle:
         if not isinstance(item, dict):
             continue
-        window = item.get("lb_try_duration")
+        balancing = item.get("load_balancing")
+        if isinstance(balancing, dict):
+            window = balancing.get("try_duration")
+        else:
+            window = item.get("lb_try_duration")
         if isinstance(window, str) and window:
             return window
     return ""

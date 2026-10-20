@@ -169,7 +169,7 @@ def test_proxy_route_keeps_one_id():
     assert isinstance(handle, list)
     proxy = handle[0]
     assert isinstance(proxy, dict)
-    assert proxy["lb_try_duration"] == "30s"
+    assert proxy["load_balancing"] == {"try_duration": "30s", "try_interval": "250ms"}
     assert proxy["upstreams"] == [{"dial": "heldso:8000"}]
 
 
