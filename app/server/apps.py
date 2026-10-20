@@ -182,11 +182,10 @@ async def _apply(yard: Yard, app: App, sha: str) -> Outcome:
     if await _image_exists(yard, image):
         project.env["SKIP_BUILD"] = "1"
 
-    # The settle gate reverts to the running image when the new one never settles.
+    # A failed `up --wait` reverts to the running image.
     previous = await _running_image(yard, app.name)
     if previous and previous != image:
         project.env["PREVIOUS_IMAGE"] = previous
-    project.env["SETTLE_SECONDS"] = str(int(yard.config.settle_seconds))
 
     # One apply container runs compose up. The deploy container is the record of this run.
     code, text = await compose.apply(

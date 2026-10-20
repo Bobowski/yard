@@ -33,22 +33,7 @@ def _bins(tmp_path: Path) -> Path:
         'exit "${DC_CODE:-0}"\n'
     )
     (bin_dir / "docker-compose").chmod(0o755)
-    (bin_dir / "podman-remote").write_text(
-        "#!/bin/sh\n"
-        # `inspect -f` answers the settle poll; INSPECT_MODE steers it.
-        'if [ "$1" = "inspect" ] && [ "$2" = "-f" ]; then\n'
-        "  n=0\n"
-        '  [ -f "$POLL_COUNT" ] && n=$(cat "$POLL_COUNT")\n'
-        '  n=$((n + 1)); echo "$n" > "$POLL_COUNT"\n'
-        '  case "${INSPECT_MODE:-ok}" in\n'
-        '    ok)      echo "true 0" ;;\n'
-        '    down)    echo "false 0" ;;\n'
-        '    restart) echo "true $n" ;;\n'
-        "  esac\n"
-        "  exit 0\n"
-        "fi\n"
-        "exit 0\n"
-    )
+    (bin_dir / "podman-remote").write_text('#!/bin/sh\necho "podman:$*" >> "$CALL_LOG"\nexit 0\n')
     (bin_dir / "podman-remote").chmod(0o755)
     return bin_dir
 
@@ -68,8 +53,6 @@ def _run(tmp_path: Path, *argv: str, **extra: str) -> tuple[int, str, str, str]:
             "SHA": "abc",
             "IMAGE": "localhost/heldso:abc",
             "DC_CONFIG": "services:\n  app:\n    networks:\n      yard:\n",
-            "POLL_COUNT": str(tmp_path / "polls"),
-            "SETTLE_SECONDS": "2",
         }
     )
     env.update(extra)
@@ -87,10 +70,12 @@ def test_up_builds_starts_and_reports_ready(tmp_path: Path):
     code, out, log, _err = _run(tmp_path, "up")
     assert code == 0
     assert re.search(r"^built \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", out, re.MULTILINE)
-    keys = ["== build", "dc:", "built ", "== start", "== settled"]
+    keys = ["== build", "dc:", "built ", "== start", "== started"]
     positions = [out.index(key) for key in keys]
     assert positions == sorted(positions)
-    assert "dc:up -d --wait --remove-orphans --no-build" in log
+    assert "dc:up -d --wait --wait-timeout 120 --remove-orphans --no-build" in log
+    # `up --wait` is the whole gate; the script never inspects the container.
+    assert "podman:" not in log
 
 
 def test_up_reuses_the_image_when_skip_build_is_set(tmp_path: Path):
@@ -99,13 +84,15 @@ def test_up_reuses_the_image_when_skip_build_is_set(tmp_path: Path):
     assert "== reuse localhost/heldso:abc" in out
     assert "== build" not in out
     assert "built" not in out
-    assert "dc:up -d --wait --remove-orphans --no-build" in log
+    assert "dc:up -d --wait --wait-timeout 120 --remove-orphans --no-build" in log
 
 
 def test_up_reverts_to_the_previous_image(tmp_path: Path):
-    code, out, log, _err = _run(tmp_path, "up", INSPECT_MODE="down", PREVIOUS_IMAGE="localhost/heldso:old")
+    code, out, log, _err = _run(
+        tmp_path, "up", FAIL_IMAGE="localhost/heldso:abc", PREVIOUS_IMAGE="localhost/heldso:old"
+    )
     assert code == 3
-    assert "== unhealthy: heldso-app-1 is not running" in out
+    assert "== unhealthy: up failed" in out
     assert "== revert localhost/heldso:old" in out
     assert "== reverted localhost/heldso:old" in out
     assert "dc:up -d --no-build\nenv IMAGE=localhost/heldso:old" in log
@@ -115,7 +102,7 @@ def test_up_fails_when_the_revert_fails(tmp_path: Path):
     code, out, log, _err = _run(
         tmp_path,
         "up",
-        INSPECT_MODE="down",
+        FAKE_FAIL="up",
         PREVIOUS_IMAGE="localhost/heldso:old",
         FAIL_IMAGE="localhost/heldso:old",
     )
@@ -127,22 +114,17 @@ def test_up_fails_when_the_revert_fails(tmp_path: Path):
 
 
 def test_up_fails_without_a_previous_image(tmp_path: Path):
-    code, out, _, _err = _run(tmp_path, "up", INSPECT_MODE="down")
+    code, out, _, _err = _run(tmp_path, "up", FAIL_IMAGE="localhost/heldso:abc")
     assert code == 1
-    assert "== unhealthy" in out
+    assert "== unhealthy: up failed" in out
     assert "== revert" not in out
+    assert "== started" not in out
 
 
-def test_up_flags_a_restart_loop(tmp_path: Path):
-    code, out, _, _err = _run(tmp_path, "up", INSPECT_MODE="restart", SETTLE_SECONDS="4")
-    assert code == 1
-    assert "restarted" in out
-
-
-def test_up_failure_stops_the_deploy(tmp_path: Path):
-    code, out, _, _err = _run(tmp_path, "up", FAKE_FAIL="up")
-    assert code == 1
-    assert "== settled" not in out
+def test_wait_seconds_overrides_the_wait_timeout(tmp_path: Path):
+    code, _out, log, _err = _run(tmp_path, "up", WAIT_SECONDS="300")
+    assert code == 0
+    assert "dc:up -d --wait --wait-timeout 300 --remove-orphans --no-build" in log
 
 
 def test_build_stops_after_the_stamp(tmp_path: Path):
@@ -169,9 +151,10 @@ def test_down_and_purge(tmp_path: Path):
 
 
 def test_start_restarts_the_current_image(tmp_path: Path):
-    code, out, _, _err = _run(tmp_path, "start")
+    code, out, log, _err = _run(tmp_path, "start")
     assert code == 0
     assert "== start localhost/heldso:abc" in out
+    assert "dc:up -d --wait --wait-timeout 120 --no-build" in log
 
 
 def test_up_rejects_an_app_off_the_yard_network(tmp_path: Path):

@@ -36,7 +36,6 @@ class Config:
     journal_dir: Path = Path("/var/log/journal")
     journalctl_bin: str = "journalctl"
     journal_socket: Path = Path("/run/systemd/journal/socket")
-    settle_seconds: float = 20.0
 
     @property
     def token_file(self) -> Path:
@@ -80,7 +79,6 @@ class Config:
             journal_dir=Path(os.environ.get("YARD_JOURNAL_DIR", "/var/log/journal")),
             journalctl_bin=os.environ.get("YARD_JOURNALCTL_BIN", "journalctl"),
             journal_socket=Path(os.environ.get("YARD_JOURNAL_SOCKET", "/run/systemd/journal/socket")),
-            settle_seconds=float(os.environ.get("YARD_SETTLE_SECONDS", "20")),
         )
 
 

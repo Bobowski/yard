@@ -1,6 +1,8 @@
 #!/bin/sh
 # One apply container runs a deploy: build (unless SKIP_BUILD), then compose up.
-# The env is the only input. Every step prints `==` so `podman logs deploy-<name>` reads as the full story.
+# A healthcheck the app's compose file defines is the gate for `up --wait`; without
+# one the deploy ends once the container runs. The env is the only input. Every
+# step prints `==` so `podman logs deploy-<name>` reads as the full story.
 set -eu
 
 : "${COMPOSE_PROJECT_NAME:?}" "${COMPOSE_FILE:?}"
@@ -56,37 +58,6 @@ build() {
   echo "built $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 }
 
-# The deploy gate: the app container must stay running for SETTLE_SECONDS.
-# A crash loop or a stop inside the window is unhealthy, and the deploy reverts.
-settle() {
-  limit="${SETTLE_SECONDS:-20}"
-  app_container="${COMPOSE_PROJECT_NAME}-app-1"
-  restarts=-1
-  i=0
-  while [ "$i" -lt "$limit" ]; do
-    state="$(podman-remote inspect -f '{{.State.Running}} {{.RestartCount}}' "$app_container" 2>/dev/null)" || {
-      echo "== unhealthy: $app_container did not stay up"
-      return 1
-    }
-    running="$(printf '%s' "$state" | awk '{print $1}')"
-    count="$(printf '%s' "$state" | awk '{print $2}')"
-    if [ "$running" != "true" ]; then
-      echo "== unhealthy: $app_container is not running"
-      return 1
-    fi
-    if [ "$restarts" -ge 0 ] && [ "$count" -gt "$restarts" ]; then
-      echo "== unhealthy: $app_container restarted"
-      return 1
-    fi
-    restarts="$count"
-    i=$((i + 2))
-    if [ "$i" -lt "$limit" ]; then
-      sleep 2
-    fi
-  done
-  echo "== settled"
-}
-
 revert() {
   if [ -n "${PREVIOUS_IMAGE:-}" ]; then
     echo "== revert $PREVIOUS_IMAGE"
@@ -107,11 +78,10 @@ up() {
     build
   fi
   echo "== start $IMAGE"
-  dc up -d --wait --remove-orphans --no-build || {
+  dc up -d --wait --wait-timeout "${WAIT_SECONDS:-120}" --remove-orphans --no-build || {
     echo "== unhealthy: up failed"
     revert
   }
-  settle || revert
   echo "== started $IMAGE"
 }
 
@@ -124,7 +94,7 @@ case "${1:-}" in
   up) up ;;
   start)
     echo "== start $IMAGE"
-    dc up -d --wait --no-build
+    dc up -d --wait --wait-timeout "${WAIT_SECONDS:-120}" --no-build
     ;;
   down) dc down ;;
   purge) dc down -v ;;

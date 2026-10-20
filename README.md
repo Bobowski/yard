@@ -62,7 +62,9 @@ A push event on `/hooks/origin` or `/hooks/github` schedules a check for that re
 
 A deploy syncs the clone at `apps/<name>/repo`, builds `localhost/<name>:<sha12>`, and runs compose up. The fetch token comes from the repo's forge and never lands in `.git/config`. A manual deploy always applies the env file.
 
-Then a settle gate watches the app container for `YARD_SETTLE_SECONDS` (default 20): it must stay running and never restart. A container that does not settle triggers a revert to the image the app was running before, and the deploy ends `reverted`. With no previous image the deploy ends `failed`.
+After the build, Yard runs `compose up --wait`. When the app's compose file defines a healthcheck, the deploy waits until it reports healthy, at most 120 seconds. An unhealthy or exited container reverts to the previous image and the deploy ends `reverted`; with no previous image the deploy ends `failed`. Without a healthcheck the deploy ends once the container runs.
+
+`podman build` drops a `HEALTHCHECK` from a Containerfile when it builds the OCI format, so declare the healthcheck in the app's own `compose.yml`: service `app`, `healthcheck:` with `start_interval` for a fast start and a long `interval`.
 
 ## Deploy an older revision
 
@@ -199,7 +201,7 @@ A deploy row is the `deploy-<name>` container: `{app, sha, image, status, starte
 A deploy outcome — returned by `POST /api/v1/apps/{name}/deploy` — has `status` one of:
 
 - `ok` — the deploy finished; the image is live.
-- `reverted` — the new container never settled; the previous image runs.
+- `reverted` — the new container never got healthy; the previous image runs.
 - `failed` — the deploy failed; the log is the apply log.
 - `pending` — the yard upgrade runs detached. This process does not wait for it.
 - `skipped` — `YARD_SKIP_DEPLOY` is set; nothing ran.

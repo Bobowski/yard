@@ -173,7 +173,7 @@ Imports go one way: api → services → yard/store/adapters → shared. Only `a
 
 Run the server with `python -m app.server.main`.
 
-`Config.from_env` reads `YARD_ROOT` (default `yard-data`), `YARD_PODMAN_SOCK`, `YARD_PODMAN_BIN`, `YARD_SKIP_DEPLOY`, `YARD_BOOT`, `YARD_CHECK_SECONDS`, `YARD_JOURNAL_DIR`, `YARD_JOURNALCTL_BIN`, `YARD_JOURNAL_SOCKET`, `YARD_SETTLE_SECONDS`, and `CONTAINER_HOST`. App state lives under `YARD_ROOT/apps/<name>/`.
+`Config.from_env` reads `YARD_ROOT` (default `yard-data`), `YARD_PODMAN_SOCK`, `YARD_PODMAN_BIN`, `YARD_SKIP_DEPLOY`, `YARD_BOOT`, `YARD_CHECK_SECONDS`, `YARD_JOURNAL_DIR`, `YARD_JOURNALCTL_BIN`, `YARD_JOURNAL_SOCKET`, and `CONTAINER_HOST`. App state lives under `YARD_ROOT/apps/<name>/`.
 
 The `journal` adapter works both ways: `send` writes a Yard event to the journald native socket (stdout JSON when the socket is missing), and `read`/`follow` run journalctl. No event field may carry a secret — an env change logs key names only.
 

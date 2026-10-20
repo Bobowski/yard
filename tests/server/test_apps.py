@@ -168,7 +168,7 @@ async def test_deploy_missing_app(tmp_path: Path):
 
 
 async def test_deploy_reverted_when_the_gate_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Apply exit 3 means the new image never settled and the old one is back."""
+    """Apply exit 3 means the new image never got healthy and the old one is back."""
     yard = make_yard(tmp_path, skip=False)
     yard.store.create_app("heldso", "https://origin.cursor.com/org/app")
     _clone(yard, "heldso")
