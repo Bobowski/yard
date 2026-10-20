@@ -374,6 +374,9 @@ def test_the_default_compose_meets_the_contract():
 
     own = (ops / "compose.yml").read_text()
     assert "labels:" not in own
+    # The socket directory is mounted, not the socket file itself.
+    assert "${YARD_PODMAN_DIR}:/run/podman" in own
+    assert ":/run/podman/podman.sock" not in own
     # The app service keeps the yard alias: a self-deploy probe dials it by name.
     assert "aliases:" in own
     assert "path: ${APP_ENV}" in own

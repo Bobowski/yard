@@ -15,7 +15,8 @@ services:
       - "127.0.0.1:8000:8000"
     volumes:
       - ${YARD_ROOT}:${YARD_ROOT}
-      - ${YARD_PODMAN_SOCK}:/run/podman/podman.sock
+      # The directory, not the socket file, so a host podman.socket restart does not leave Yard on a stale socket.
+      - ${YARD_PODMAN_DIR}:/run/podman
       - ${DATA_DIR}:/data
       # Container logs live in the journal; Yard reads them for the API.
       - /var/log/journal:/var/log/journal:ro
