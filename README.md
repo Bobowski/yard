@@ -45,12 +45,12 @@ Yard connects to each forge as an app — an Origin app on Cursor, a GitHub App 
 
 ```sh
 yard forge setup origin
-yard forge setup github [--key PATH] [--org ORG]
+yard forge setup github [--key PATH] [--org ORG] [--new]
 ```
 
 `yard forge setup origin` prints a public key, the webhook URL `https://<domain>/hooks/origin`, the event `repository.pushed`, and the scope `repository:contents:read`. Create the app at `https://cursor.com/codebase/settings/apps` with those values. Then install the app on the owner and select all repositories.
 
-`yard forge setup github` mints a webhook secret, opens a prefilled GitHub App form, and asks for the app ID and a private key file. Then it opens the install page and waits for the install.
+`yard forge setup github` mints a webhook secret, opens a prefilled GitHub App form, and asks for the app ID and a private key file. Then it opens the install page and waits for the install. A stopped setup continues on the next run with the same webhook secret, so no second GitHub App is needed; `--new` starts over.
 
 Each forge stores its app ID, installation ID, and secrets in `apps/yard/data/<forge>/state.json`, mode 0600. The private key is `key.pem` in that directory. The files are the truth; the server re-reads them on each call, so no restart is needed. Keys and secrets never appear in an API response.
 
@@ -176,7 +176,7 @@ POST /api/v1/apps/{name}/deploy          {sha?: sha} — {app, deploy}
 GET /api/v1/apps/{name}/env              — {KEY: VALUE}
 PATCH /api/v1/apps/{name}/env            {KEY: VALUE|null} — {keys}
 PUT /api/v1/apps/{name}/env              {KEY: VALUE} — {keys}
-GET /api/v1/forges                       — [{name, host, connected, app_id, installation_id, selection, last_delivery, last_check, public_key?, error?}]
+GET /api/v1/forges                       — [{name, host, connected, app_id, installation_id, selection, last_delivery, last_check, public_key?, slug?, error?}]
 PUT /api/v1/forges/origin                {app_id} — {forge, app}
 PUT /api/v1/forges/github                {app_id, private_key, webhook_secret} — {forge, app}
 GET /api/v1/binds                        — [{host, dial, id, state, try}]

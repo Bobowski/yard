@@ -399,6 +399,7 @@ async def test_github_connect_saves_after_the_check(gh_api, tmp_path):
     assert state["slug"] == "yard-host"
     assert state["webhook_secret"] == SECRET
     assert "installation_id" not in state
+    assert github.summary()["slug"] == "yard-host"
 
 
 async def test_github_connect_failure_saves_nothing(gh_api, tmp_path):
@@ -472,8 +473,9 @@ def test_github_summary_has_no_secret(tmp_path):
     summary = github.summary()
     assert summary["name"] == "github" and summary["host"] == "github.com"
     assert summary["app_id"] == "42"
+    assert summary["slug"] == "yard-host"
     assert SECRET not in json.dumps(summary)
-    assert "webhook_secret" not in summary and "slug" not in summary
+    assert "webhook_secret" not in summary
     assert "key" not in summary
 
 

@@ -651,6 +651,55 @@ def _cmd_forge_setup(args: argparse.Namespace) -> None:
         _setup_github(session, args)
 
 
+def _normalize_path(text: str) -> str:
+    """A pasted path: whitespace, one pair of quotes, and `\\ ` escapes come off; ~ expands."""
+    text = text.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
+        text = text[1:-1]
+    return os.path.expanduser(text.replace("\\ ", " "))
+
+
+def _ask(prompt: str) -> str:
+    """One wizard answer. EOF or Ctrl-C exits without a traceback."""
+    try:
+        return input(prompt).strip()
+    except EOFError, KeyboardInterrupt:
+        _die("stopped; run the command again to continue")
+
+
+def _ask_key(key_flag: str) -> str:
+    """The PEM text. An unreadable path or a file without a BEGIN line asks again."""
+    default = _normalize_path(key_flag) if key_flag else ""
+    while True:
+        if default:
+            key_path = _normalize_path(_ask(f"Private key path [{default}]: ")) or default
+        else:
+            key_path = _normalize_path(_ask("Private key path: "))
+        if not key_path:
+            print("pass --key PATH or paste a path", file=sys.stderr)
+            continue
+        try:
+            pem = Path(key_path).read_text()
+        except OSError as exc:
+            print(f"cannot read the key: {exc}", file=sys.stderr)
+            continue
+        if "-----BEGIN" not in pem:
+            print(f"{key_path} is not a PEM file (no -----BEGIN line)", file=sys.stderr)
+            continue
+        return pem
+
+
+def _pending_setup(path: Path, url: str) -> dict:
+    """A saved github setup for this host, or an empty dict."""
+    try:
+        raw = json.loads(path.read_text())
+    except OSError, json.JSONDecodeError:
+        return {}
+    if not isinstance(raw, dict) or raw.get("url") != url:
+        return {}
+    return raw if isinstance(raw.get("secret"), str) else {}
+
+
 def _setup_origin(session: Client, args: argparse.Namespace) -> None:
     """Connect to Cursor Origin: the host makes the key, the user makes the app."""
     key = _forge_row(session, "origin").get("public_key")
@@ -664,9 +713,11 @@ def _setup_origin(session: Client, args: argparse.Namespace) -> None:
     print()
     _open(args, "https://cursor.com/codebase/settings/apps")
 
-    app_id = input("App ID: ").strip()
-    if not re.fullmatch(r"app_[A-Za-z0-9]+", app_id):
-        _die("That is not an app ID. It starts with app_.")
+    while True:
+        app_id = _ask("App ID: ")
+        if re.fullmatch(r"app_[A-Za-z0-9]+", app_id):
+            break
+        print("That is not an app ID. It starts with app_.", file=sys.stderr)
     wrap = _object(_api(session, "PUT", "/api/v1/forges/origin", {"app_id": app_id}))
     app = wrap.get("app") if isinstance(wrap, dict) else None
     if not isinstance(app, dict):
@@ -693,7 +744,27 @@ def _setup_github(session: Client, args: argparse.Namespace) -> None:
     parts = urlsplit(session.url)
     if parts.scheme == "http" and parts.hostname not in {"127.0.0.1", "::1", "localhost"}:
         _die("refusing to send the private key over http; log in with an https url")
-    secret = secrets.token_hex(32)
+    forge = {} if args.new else _forge_row(session, "github")
+    if forge.get("connected"):
+        print(
+            f"GitHub is already connected: app {forge.get('app_id')},"
+            f" installation {forge.get('installation_id')}. Run with --new to replace it."
+        )
+        return
+    if forge.get("app_id") and not forge.get("installation_id"):
+        print(f"App {forge['app_id']} is already set up. Install it and select all repositories.")
+        slug = str(forge.get("slug") or "")
+        if slug:
+            _open(args, f"https://github.com/apps/{slug}/installations/new")
+        else:
+            print("Install it from https://github.com/settings/installations")
+        _poll_installation(session, "github")
+        print("Done.")
+        return
+
+    pending_path = config_path().parent / "github-setup.json"
+    pending = {} if args.new else _pending_setup(pending_path, session.url)
+    secret = str(pending.get("secret")) if pending else secrets.token_hex(32)
     print(f"webhook url: {session.url}/hooks/github")
     print("event: push")
     print("permission: contents read")
@@ -721,29 +792,40 @@ def _setup_github(session: Client, args: argparse.Namespace) -> None:
             }
         )
     )
-    _open(args, link)
-
-    app_id = input("App ID: ").strip()
-    if not app_id.isdigit():
-        _die("That is not an app ID. It is digits.")
-    if args.key:
-        key_path = input(f"Private key path [{args.key}]: ").strip() or str(args.key)
+    if pending:
+        print(
+            f"Continuing the setup from {pending.get('created') or 'an earlier run'}."
+            " If you already created the GitHub App, do not create another: paste its App ID."
+        )
+        print(link)
     else:
-        key_path = input("Private key path: ").strip()
-    if not key_path:
-        _die("pass --key PATH or paste a path")
-    try:
-        pem = Path(key_path).expanduser().read_text()
-    except OSError as exc:
-        _die(f"cannot read the key: {exc}")
-    wrap = _object(
-        _api(
+        created = datetime.now(UTC).isoformat(timespec="seconds")
+        atomic_write(
+            pending_path,
+            json.dumps({"url": session.url, "secret": secret, "created": created}, indent=2) + "\n",
+        )
+        _open(args, link)
+
+    while True:
+        app_id = _ask("App ID: ")
+        if not app_id.isdigit():
+            print("That is not an app ID. It is digits.", file=sys.stderr)
+            continue
+        pem = _ask_key(str(args.key))
+        code, text = _api_try(
             session,
             "PUT",
             "/api/v1/forges/github",
             {"app_id": app_id, "private_key": pem, "webhook_secret": secret},
         )
-    )
+        if 400 <= code < 500:
+            print(text if _json else explain(text), file=sys.stderr)
+            continue
+        if code >= 300:
+            _die(text if _json else explain(text))
+        wrap = _object(text)
+        break
+    pending_path.unlink(missing_ok=True)
     app = wrap.get("app") if isinstance(wrap, dict) else None
     if not isinstance(app, dict):
         app = {}
@@ -967,6 +1049,7 @@ def _forge_parser(subs: argparse._SubParsersAction, common: argparse.ArgumentPar
     setup.add_argument("--key", default="", help="the GitHub app private key PEM")
     setup.add_argument("--org", default="", help="create the GitHub app in this organization")
     setup.add_argument("--no-browser", action="store_true", help="print the links; open nothing")
+    setup.add_argument("--new", action="store_true", help="start the GitHub setup over with a fresh secret")
     setup.set_defaults(func=_cmd_forge_setup)
 
 

@@ -301,6 +301,12 @@ class GitHub(Forge):
     def selection(self, installation: dict) -> str:
         return str(installation.get("repository_selection") or "")
 
+    def summary(self) -> dict:
+        summary = super().summary()
+        # The slug names the public app page; it is not a secret.
+        summary["slug"] = str(self._state().get("slug") or "")
+        return summary
+
     async def connect(self, app_id: str, private_key: str, webhook_secret: str) -> dict:
         """Verify the new key against GET /app before anything is saved."""
         if not app_id.isdigit():

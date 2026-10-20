@@ -1,4 +1,5 @@
 import json
+import stat
 import subprocess
 from pathlib import Path
 
@@ -657,6 +658,33 @@ def _answers(*answers: str):
     return lambda _prompt="": next(it)
 
 
+def _eof_after(*answers: str):
+    it = iter(answers)
+
+    def fake(_prompt=""):
+        try:
+            return next(it)
+        except StopIteration:
+            raise EOFError from None
+
+    return fake
+
+
+PEM = "-----BEGIN PRIVATE KEY-----\nKEY\n-----END PRIVATE KEY-----\n"
+
+
+def _pem(directory: Path, name: str = "key.pem") -> Path:
+    path = directory / name
+    path.write_text(PEM)
+    return path
+
+
+def _config_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    cfg = tmp_path / "cfg"
+    monkeypatch.setattr(cli, "config_path", lambda: cfg / "config.json")
+    return cfg
+
+
 def test_forge_setup_origin(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
     calls: list = []
     monkeypatch.setattr(cli, "_api_try", _fake_setup_api(calls))
@@ -717,20 +745,21 @@ def test_forge_setup_polls_and_warns(monkeypatch: pytest.MonkeyPatch, capsys: py
     assert "the installation covers selected repos only" in captured.err
 
 
-def test_forge_setup_origin_rejects_a_bad_app_id(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+def test_forge_setup_origin_reprompts_a_bad_app_id(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
     calls: list = []
     monkeypatch.setattr(cli, "_api_try", _fake_setup_api(calls))
-    monkeypatch.setattr("builtins.input", _answers("app_a b"))
+    monkeypatch.setattr(cli, "SETUP_POLL", 0.0)
+    monkeypatch.setattr("builtins.input", _answers("app_a b", "app_123"))
     _env(monkeypatch)
-    with pytest.raises(SystemExit):
-        main(["forge", "setup", "origin", "--no-browser", "--text"])
+    main(["forge", "setup", "origin", "--no-browser", "--text"])
     assert "not an app ID" in capsys.readouterr().err
-    assert not [call for call in calls if call[0] == "PUT"]
+    puts = [call for call in calls if call[0] == "PUT"]
+    assert puts == [("PUT", "/api/v1/forges/origin", {"app_id": "app_123"})]
 
 
 def test_forge_setup_github(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, tmp_path: Path):
-    pem = tmp_path / "app.pem"
-    pem.write_text("PRIVATE-KEY-PEM\n")
+    pem = _pem(tmp_path, "app.pem")
+    _config_dir(monkeypatch, tmp_path)
     calls: list = []
     monkeypatch.setattr(cli, "_api_try", _fake_setup_api(calls))
     monkeypatch.setattr(cli, "SETUP_POLL", 0.0)
@@ -753,11 +782,11 @@ def test_forge_setup_github(monkeypatch: pytest.MonkeyPatch, capsys: pytest.Capt
         (
             "PUT",
             "/api/v1/forges/github",
-            {"app_id": "42", "private_key": "PRIVATE-KEY-PEM\n", "webhook_secret": "s" * 64},
+            {"app_id": "42", "private_key": PEM, "webhook_secret": "s" * 64},
         )
     ]
-    assert "PRIVATE-KEY-PEM" not in out
-    assert "PRIVATE-KEY-PEM" not in err
+    assert "PRIVATE KEY" not in out
+    assert "PRIVATE KEY" not in err
 
 
 def test_forge_setup_github_refuses_http_to_a_remote(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
@@ -769,6 +798,241 @@ def test_forge_setup_github_refuses_http_to_a_remote(monkeypatch: pytest.MonkeyP
         main(["forge", "setup", "github", "--no-browser", "--text"])
     assert "refusing to send the private key over http" in capsys.readouterr().err
     assert called == []
+
+
+def test_forge_setup_github_accepts_quoted_and_escaped_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    pem = _pem(tmp_path)
+    spaced = _pem(tmp_path, "my key.pem")
+    _config_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "SETUP_POLL", 0.0)
+    monkeypatch.setattr(cli.secrets, "token_hex", lambda n: "s" * 64)
+    _env(monkeypatch)
+    for answer in (f"'{pem}'", str(spaced).replace(" ", "\\ ")):
+        calls: list = []
+        monkeypatch.setattr(cli, "_api_try", _fake_setup_api(calls))
+        monkeypatch.setattr("builtins.input", _answers("42", answer))
+        main(["forge", "setup", "github", "--no-browser", "--text"])
+        put = [call for call in calls if call[0] == "PUT"]
+        assert put == [
+            (
+                "PUT",
+                "/api/v1/forges/github",
+                {"app_id": "42", "private_key": PEM, "webhook_secret": "s" * 64},
+            )
+        ]
+
+
+def test_forge_setup_github_reprompts_a_missing_key(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, tmp_path: Path
+):
+    pem = _pem(tmp_path)
+    _config_dir(monkeypatch, tmp_path)
+    calls: list = []
+    monkeypatch.setattr(cli, "_api_try", _fake_setup_api(calls))
+    monkeypatch.setattr(cli, "SETUP_POLL", 0.0)
+    monkeypatch.setattr("builtins.input", _answers("42", str(tmp_path / "missing.pem"), str(pem)))
+    monkeypatch.setattr(cli.secrets, "token_hex", lambda n: "s" * 64)
+    _env(monkeypatch)
+    main(["forge", "setup", "github", "--no-browser", "--text"])
+    assert "cannot read the key" in capsys.readouterr().err
+    put = [call for call in calls if call[0] == "PUT"]
+    assert put == [("PUT", "/api/v1/forges/github", {"app_id": "42", "private_key": PEM, "webhook_secret": "s" * 64})]
+
+
+def test_forge_setup_github_reprompts_a_bad_app_id(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, tmp_path: Path
+):
+    pem = _pem(tmp_path)
+    _config_dir(monkeypatch, tmp_path)
+    calls: list = []
+    monkeypatch.setattr(cli, "_api_try", _fake_setup_api(calls))
+    monkeypatch.setattr(cli, "SETUP_POLL", 0.0)
+    monkeypatch.setattr("builtins.input", _answers("forty-two", "42", str(pem)))
+    monkeypatch.setattr(cli.secrets, "token_hex", lambda n: "s" * 64)
+    _env(monkeypatch)
+    main(["forge", "setup", "github", "--no-browser", "--text"])
+    assert "not an app ID" in capsys.readouterr().err
+    put = [call for call in calls if call[0] == "PUT"]
+    assert put == [("PUT", "/api/v1/forges/github", {"app_id": "42", "private_key": PEM, "webhook_secret": "s" * 64})]
+
+
+def test_forge_setup_github_retries_after_a_client_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, tmp_path: Path
+):
+    pem = _pem(tmp_path)
+    _config_dir(monkeypatch, tmp_path)
+    calls: list = []
+    attempts = 0
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        nonlocal attempts
+        calls.append((method, path, body))
+        if path == "/api/v1/forges":
+            return 200, json.dumps([{"name": "github", "installation_id": "101", "selection": "all"}])
+        if path == "/api/v1/forges/github" and method == "PUT":
+            attempts += 1
+            if attempts == 1:
+                return 400, json.dumps({"error": {"message": "the app id does not match the key"}})
+            return 200, json.dumps({"forge": {"name": "github"}, "app": {"slug": "yard-host"}})
+        raise AssertionError(path)
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    monkeypatch.setattr(cli, "SETUP_POLL", 0.0)
+    # First App ID + key are refused by the API; the wizard asks both again.
+    monkeypatch.setattr("builtins.input", _answers("41", str(pem), "42", str(pem)))
+    monkeypatch.setattr(cli.secrets, "token_hex", lambda n: "s" * 64)
+    _env(monkeypatch)
+    main(["forge", "setup", "github", "--no-browser", "--text"])
+    assert "the app id does not match the key" in capsys.readouterr().err
+    put = [call for call in calls if call[0] == "PUT"]
+    assert [call[2]["app_id"] for call in put] == ["41", "42"]
+
+
+def test_forge_setup_github_resumes_a_stopped_run(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, tmp_path: Path
+):
+    pem = _pem(tmp_path)
+    cfg = _config_dir(monkeypatch, tmp_path)
+    calls: list = []
+    monkeypatch.setattr(cli, "_api_try", _fake_setup_api(calls))
+    monkeypatch.setattr(cli, "SETUP_POLL", 0.0)
+    opened: list = []
+    monkeypatch.setattr(cli.webbrowser, "open", lambda url: opened.append(url))
+    _env(monkeypatch)
+
+    # Run 1 stops at the key prompt; the pending setup stays on disk.
+    monkeypatch.setattr("builtins.input", _eof_after("42"))
+    with pytest.raises(SystemExit):
+        main(["forge", "setup", "github", "--text"])
+    pending = cfg / "github-setup.json"
+    saved = json.loads(pending.read_text())
+    assert stat.S_IMODE(pending.stat().st_mode) == 0o600
+    assert saved["url"] == "http://127.0.0.1:8000"
+    assert saved["secret"] and saved["created"]
+    assert "stopped" in capsys.readouterr().err
+
+    # Run 2 reuses the secret; the app form prints but does not open again.
+    monkeypatch.setattr("builtins.input", _answers("42", str(pem)))
+    main(["forge", "setup", "github", "--text"])
+    out = capsys.readouterr().out
+    assert "Continuing the setup from" in out
+    assert "settings/apps/new" in out
+    assert sum("settings/apps/new" in url for url in opened) == 1
+    assert opened[-1] == "https://github.com/apps/yard-host/installations/new"
+    put = [call for call in calls if call[0] == "PUT"]
+    assert put == [
+        (
+            "PUT",
+            "/api/v1/forges/github",
+            {"app_id": "42", "private_key": PEM, "webhook_secret": saved["secret"]},
+        )
+    ]
+    assert not pending.exists()
+
+
+def test_forge_setup_github_new_mints_a_fresh_secret(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, tmp_path: Path
+):
+    pem = _pem(tmp_path)
+    cfg = _config_dir(monkeypatch, tmp_path)
+    pending = cfg / "github-setup.json"
+    cfg.mkdir(parents=True)
+    pending.write_text(
+        json.dumps({"url": "http://127.0.0.1:8000", "secret": "old-secret", "created": "2026-01-01T00:00:00+00:00"})
+    )
+    calls: list = []
+    monkeypatch.setattr(cli, "_api_try", _fake_setup_api(calls))
+    monkeypatch.setattr(cli, "SETUP_POLL", 0.0)
+    monkeypatch.setattr("builtins.input", _answers("42", str(pem)))
+    monkeypatch.setattr(cli.secrets, "token_hex", lambda n: "n" * 64)
+    _env(monkeypatch)
+    main(["forge", "setup", "github", "--new", "--no-browser", "--text"])
+    assert "Continuing" not in capsys.readouterr().out
+    put = [call for call in calls if call[0] == "PUT"]
+    assert put == [("PUT", "/api/v1/forges/github", {"app_id": "42", "private_key": PEM, "webhook_secret": "n" * 64})]
+    assert not pending.exists()
+
+
+def test_forge_setup_github_continues_to_the_install(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, tmp_path: Path
+):
+    _config_dir(monkeypatch, tmp_path)
+    calls: list = []
+    reads = 0
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        nonlocal reads
+        calls.append((method, path, body))
+        if path == "/api/v1/forges":
+            reads += 1
+            row = {
+                "name": "github",
+                "app_id": "42",
+                "slug": "yard-host",
+                "installation_id": "" if reads == 1 else "101",
+                "selection": "all",
+            }
+            return 200, json.dumps([row])
+        raise AssertionError(path)
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    monkeypatch.setattr(cli, "SETUP_POLL", 0.0)
+    _env(monkeypatch)
+    main(["forge", "setup", "github", "--no-browser", "--text"])
+    out = capsys.readouterr().out
+    assert "https://github.com/apps/yard-host/installations/new" in out
+    assert "Done." in out
+    assert not [call for call in calls if call[0] == "PUT"]
+
+
+def test_forge_setup_github_already_connected(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, tmp_path: Path
+):
+    _config_dir(monkeypatch, tmp_path)
+    calls: list = []
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        calls.append((method, path, body))
+        if path == "/api/v1/forges":
+            return 200, json.dumps([{"name": "github", "connected": True, "app_id": "42", "installation_id": "101"}])
+        raise AssertionError(path)
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    _env(monkeypatch)
+    main(["forge", "setup", "github", "--no-browser", "--text"])
+    out = capsys.readouterr().out
+    assert "already connected" in out
+    assert "--new" in out
+    assert calls == [("GET", "/api/v1/forges", None)]
+
+
+def test_forge_setup_github_new_ignores_a_connected_forge(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, tmp_path: Path
+):
+    """--new runs the full form flow even when the forge row says connected."""
+    pem = _pem(tmp_path)
+    _config_dir(monkeypatch, tmp_path)
+    calls: list = []
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        calls.append((method, path, body))
+        if path == "/api/v1/forges":
+            return 200, json.dumps([{"name": "github", "connected": True, "app_id": "42", "installation_id": "101"}])
+        if path == "/api/v1/forges/github" and method == "PUT":
+            return 200, json.dumps({"forge": {"name": "github"}, "app": {"slug": "yard-host"}})
+        raise AssertionError(path)
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    monkeypatch.setattr(cli, "SETUP_POLL", 0.0)
+    monkeypatch.setattr("builtins.input", _answers("42", str(pem)))
+    monkeypatch.setattr(cli.secrets, "token_hex", lambda n: "n" * 64)
+    _env(monkeypatch)
+    main(["forge", "setup", "github", "--new", "--no-browser", "--text"])
+    out = capsys.readouterr().out
+    assert "Continuing" not in out
+    assert "Done." in out
+    put = [call for call in calls if call[0] == "PUT"]
+    assert put == [("PUT", "/api/v1/forges/github", {"app_id": "42", "private_key": PEM, "webhook_secret": "n" * 64})]
 
 
 def test_app_logs_builds_the_query(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
