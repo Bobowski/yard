@@ -2,7 +2,8 @@
 # Install Yard on a VM. A second run repairs a partial install.
 # A healthy Yard container stays in place. Data under /srv/yard stays in place.
 # The source is the public Yard repo. --domain is the public host for Yard.
-# Caddy listens on 8443. This script forwards 443 to that port.
+# Caddy listens on 443 inside its container; the host publishes 8443 for TCP and UDP.
+# This script forwards public 443, TCP and UDP, to that port.
 set -eu
 
 die() {
@@ -113,13 +114,14 @@ table inet yard {
   chain prerouting {
     type nat hook prerouting priority dstnat; policy accept;
     tcp dport 443 redirect to :${proxy_port}
+    udp dport 443 redirect to :${proxy_port}
   }
 }
 EOF
 nft_bin="$(command -v nft)"
 cat > /etc/systemd/system/yard-proxy.service <<EOF
 [Unit]
-Description=Forward public port 443 to Yard Caddy
+Description=Forward public port 443 (TCP and UDP) to Yard Caddy
 After=network-pre.target nftables.service
 Before=network.target
 
@@ -134,9 +136,10 @@ EOF
 systemctl daemon-reload
 systemctl enable yard-proxy.service
 systemctl restart yard-proxy.service
-if ! nft list table inet yard 2>/dev/null | grep -q "tcp dport 443 redirect to :${proxy_port}"; then
+if ! nft list table inet yard 2>/dev/null | grep -q "tcp dport 443 redirect to :${proxy_port}" ||
+  ! nft list table inet yard 2>/dev/null | grep -q "udp dport 443 redirect to :${proxy_port}"; then
   die "The redirect from port 443 to ${proxy_port} is not loaded." \
-    "Caddy listens on ${proxy_port}. Public clients use port 443." \
+    "Caddy is published on ${proxy_port} for TCP and UDP. Public clients use port 443." \
     "Hint: nft -f /etc/yard/proxy.nft && systemctl status yard-proxy.service" \
     "Context: table inet yard is missing or has a different target."
 fi
@@ -165,18 +168,20 @@ allow_redirect_port() {
   fi
   status="$(ufw status 2>/dev/null || true)"
   printf '%s\n' "$status" | grep -q "Status: active" || return 0
-  if printf '%s\n' "$status" | grep -q "^${proxy_port}/tcp"; then
-    return 0
-  fi
-  detail="$(ufw allow "${proxy_port}/tcp" 2>&1)" || die "ufw could not allow port ${proxy_port}." \
-    "This script redirects public port 443 to ${proxy_port}." \
-    "ufw sees the packet after that redirect, so a rule for 443 does not cover ${proxy_port}." \
-    "Hint: ufw allow ${proxy_port}/tcp" \
-    "Context: ${detail}"
-  ufw status | grep -q "^${proxy_port}/tcp" || die "ufw still does not allow port ${proxy_port}." \
-    "The allow command returned, but the rule is not listed." \
-    "Hint: ufw status" \
-    "Context: public port 443 is redirected to ${proxy_port}."
+  for proto in tcp udp; do
+    if printf '%s\n' "$status" | grep -q "^${proxy_port}/${proto}"; then
+      continue
+    fi
+    detail="$(ufw allow "${proxy_port}/${proto}" 2>&1)" || die "ufw could not allow port ${proxy_port}/${proto}." \
+      "This script redirects public port 443 to ${proxy_port}." \
+      "ufw sees the packet after that redirect, so a rule for 443 does not cover ${proxy_port}." \
+      "Hint: ufw allow ${proxy_port}/${proto}" \
+      "Context: ${detail}"
+    ufw status | grep -q "^${proxy_port}/${proto}" || die "ufw still does not allow port ${proxy_port}/${proto}." \
+      "The allow command returned, but the rule is not listed." \
+      "Hint: ufw status" \
+      "Context: public port 443 is redirected to ${proxy_port}."
+  done
 }
 
 ensure_traverse() {

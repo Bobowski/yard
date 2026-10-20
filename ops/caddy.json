@@ -4,18 +4,19 @@
 	},
 	"apps": {
 		"http": {
-			"https_port": 8443,
+			"https_port": 443,
 			"servers": {
 				"yard": {
 					"automatic_https": {
 						"disable_redirects": true
 					},
 					"listen": [
-						":8443"
+						":443"
 					],
 					"protocols": [
 						"h1",
-						"h2"
+						"h2",
+						"h3"
 					],
 					"routes": []
 				}

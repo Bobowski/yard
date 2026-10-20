@@ -339,7 +339,8 @@ def test_the_default_compose_meets_the_contract():
 
     own = (ops / "compose.yml").read_text()
     assert "labels:" not in own
-    assert "aliases:" not in own
+    # The app service keeps the yard alias: a self-deploy probe dials it by name.
+    assert "aliases:" in own
     assert "path: ${APP_ENV}" in own
     assert "required: false" in own
     files = sorted(path.name for path in (ops / "apply").iterdir())

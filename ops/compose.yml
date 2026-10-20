@@ -39,7 +39,10 @@ services:
     networks:
       - yard
     ports:
-      - "8443:8443"
+      # Caddy listens on 443 in the container so Alt-Svc advertises h3 on :443.
+      # The host redirects public 443 — TCP and UDP — to 8443.
+      - "8443:443/tcp"
+      - "8443:443/udp"
     volumes:
       - ${YARD_ROOT}/apps/yard/caddy/config:/config
       - ${YARD_ROOT}/apps/yard/caddy/data:/data

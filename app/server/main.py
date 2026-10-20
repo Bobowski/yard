@@ -7,7 +7,7 @@ import orjson
 import uvloop
 from stario import App, Span, json, serve
 
-from app.server import api, apps, compose
+from app.server import api, apps, caddy, compose
 from app.server.store import Config, Store, ensure_admin
 from app.server.yard import Yard
 from app.shared import YardError
@@ -73,8 +73,9 @@ async def boot(yard: Yard, app: App) -> None:
 async def _caddy_server(yard: Yard) -> None:
     """The server block is ours too: the seed declares it, the autosave must match.
 
-    `protocols` limits Caddy to h1/h2 — h3 needs UDP/443, which the proxy
-    never forwards. Without it, Alt-Svc advertises a port no client can reach.
+    An existing autosave still listens on :8443 with h1/h2. At boot the whole
+    http app is read, converged to listen :443 with h1/h2/h3, and PATCHed back
+    in one call when it differs.
     """
     socket = yard.config.caddy_socket
     for _ in range(40):
@@ -85,12 +86,14 @@ async def _caddy_server(yard: Yard) -> None:
         log.warning("caddy server: admin socket never appeared")
         return
     try:
-        await yard.caddy.request(
-            "POST",
-            "/config/apps/http/servers/yard/protocols",
-            b'["h1", "h2"]',
-        )
-    except YardError as exc:
+        _, raw = await yard.caddy.request("GET", caddy.HTTP_PATH)
+        current = json.loads(raw)
+        if not isinstance(current, dict):
+            raise YardError(502, "caddy", f"caddy GET {caddy.HTTP_PATH}: not an object")
+        converged = caddy.converge_http(current)
+        if converged != current:
+            await yard.caddy.request("PATCH", caddy.HTTP_PATH, json.dumps_bytes(converged))
+    except (YardError, ValueError) as exc:
         log.warning("caddy server: %s", exc)
 
 

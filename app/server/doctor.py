@@ -243,7 +243,7 @@ async def _https(host: str, path: str) -> tuple[bool, str]:
     request = f"GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode()
 
     def round_trip() -> bytes:
-        with socket.create_connection(("caddy", 8443), 10) as raw:
+        with socket.create_connection(("caddy", 443), 10) as raw:
             with ssl.create_default_context().wrap_socket(raw, server_hostname=host) as tls:
                 tls.sendall(request)
                 return tls.recv(4096).split(b"\r\n", 1)[0]

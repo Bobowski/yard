@@ -96,7 +96,7 @@ Yard keeps its files in `/srv/yard`:
 - `apps/yard/caddy/run/` — the admin socket. Yard talks to Caddy there.
 - `tokens/<name>` — a token hash, mode 0600. `tokens/admin.token` is the plaintext admin token.
 
-Caddy listens on 8443. The host forwards 443 to that port. The admin API is a unix socket at `apps/yard/caddy/run/admin.sock`. Binds and doctor use it; there is no admin port.
+Caddy listens on 443 inside its container. The host publishes 8443 for TCP and UDP, and nft redirects public 443 — TCP and UDP — to 8443, so HTTP/3 reaches Caddy. The admin API is a unix socket at `apps/yard/caddy/run/admin.sock`. Binds and doctor use it; there is no admin port. A firewall must allow `8443/tcp` and `8443/udp`; install.sh adds both rules to ufw.
 
 Install on the VM, as root:
 

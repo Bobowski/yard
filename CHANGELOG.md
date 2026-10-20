@@ -27,6 +27,7 @@ Yard no longer hosts git. Cursor Origin is the git host. There is no migration p
 - Push and installation events debounce with a leading plus trailing check, so a burst never waits five minutes.
 - Every disk write is atomic. The git adapter raises `YardError` like the others. The CLI times calls out at 30 seconds (deploy at 30 minutes; streams never).
 - Caddy's admin API is a unix socket at `apps/yard/caddy/run/admin.sock`. The curl-to-admin path and the autosave reads are gone.
+- HTTP/3 is on. Caddy listens on 443 inside its container, the host publishes 8443 for TCP and UDP, and nft redirects public 443 for both protocols, so Alt-Svc's `h3=":443"` is a port clients can reach. An existing host must rerun `install.sh` — or add `udp dport 443 redirect to :8443` to the yard nft table and allow `8443/udp` in ufw — for UDP to reach Caddy.
 
 ## 0.4.0
 
