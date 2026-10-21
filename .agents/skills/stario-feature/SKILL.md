@@ -19,7 +19,7 @@ description: Add, change, or remove a screen (page or resource) in a Stario app.
 1. `app/features/<screen>/__init__.py`, `urls.py`, `views.py`, `handlers.py`, and `data.py` only if the screen owns tables.
 2. `app/main.py`: build the shared object once, then `register_<screen>(app, ...)` before `yield`.
 3. A link from an existing screen: import its `urls.py` and use `ROUTE.href()` in `h.A({"href": ...})`.
-4. `tests/test_<screen>.py`: the page loads; a command repaints the stream; malformed input returns 400.
+4. `tests/test_<screen>.py`: the page loads; a command repaints the stream; malformed input returns 400. That stream test is the proof. Do not open a browser for a command.
 5. `just check`. Fix every failure.
 
 ## A static screen
@@ -241,6 +241,23 @@ register_board(app, Board(), relay)
 ```
 
 One `Relay` per app, built in `bootstrap`, shared by every feature.
+
+```python
+# tests/test_board.py
+from app.features.board.urls import BOARD_LIVE, PAINT
+
+
+async def test_paint_repaints_the_stream(client):
+    headers = {"accept-encoding": "identity"}
+    async with client.stream("GET", BOARD_LIVE.href(), headers=headers) as live:
+        events = live.iter_events()
+        assert 'id="board"' in (await anext(events))["data"]
+        r = await client.post(PAINT.href(1), json={"color": "#ff0000"})
+        assert r.status_code == 204
+        assert "#ff0000" in (await anext(events))["data"]
+```
+
+Open the live stream. Send the command. Assert the next event. That is the proof.
 
 ## A screen with slow work
 

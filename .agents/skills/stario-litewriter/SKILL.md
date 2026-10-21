@@ -145,7 +145,7 @@ Pass it as `LiteWriter(config.db_path, schema=board_data.migrate, claim=30)`. It
 
 ## Tests
 
-The scaffold's `tests/conftest.py` already points `APP_DB_PATH` at `tmp_path`, and `Config.from_env()` runs inside `bootstrap`, so each test gets its own file. The writer creates the file on start.
+The scaffold's `tests/conftest.py` already points `APP_DB_PATH` at `tmp_path`, and `Config.from_env()` runs inside `bootstrap`, so each test gets its own file. The writer creates the file on start. A `watch` screen still uses the stream test in `AGENTS.md`. That is the proof. Do not open a browser for a write.
 
 ## Rules
 

@@ -157,4 +157,4 @@ Rules:
 
 ## Checks
 
-The page loads a stylesheet: `assert 'css/output' in r.text` in the page test. When a class does not apply in the browser, check that the literal appears in a `.py` file under `app/`, then rebuild.
+The page loads a stylesheet: `assert 'css/output' in r.text` in the page test. Prove the link with `TestClient`. When a class does not apply in the browser, check that the literal appears in a `.py` file under `app/`, then rebuild.

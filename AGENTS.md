@@ -129,7 +129,7 @@ Choose with the developer. Do not add a database the app does not need.
 
 ## Tests
 
-Tests run the production `bootstrap` through `TestClient`. Each screen: the page loads; a command repaints the stream; malformed input returns 400.
+Tests run the production `bootstrap` through `TestClient`. Each screen: the page loads; a command repaints the stream; malformed input returns 400. That stream test is the proof. Do not open a browser for a command.
 
 ```python
 async def test_paint_repaints_the_stream(client):
@@ -158,6 +158,10 @@ async def test_paint_repaints_the_stream(client):
 | UI state in signals when HTML can hold it | `<dialog>`, `<details>`, `preserve_attr` |
 | A signal that holds a row or the user | the store, the cookie |
 | Module-level lists or dicts as state | an object built in `bootstrap` |
+
+## Cursor Cloud specific instructions
+
+Install is `.cursor/cloud-install.sh`. Use computer use only when the stream test cannot prove the change. Do not open a pull request. Push `main` to deploy.
 
 ## This app
 

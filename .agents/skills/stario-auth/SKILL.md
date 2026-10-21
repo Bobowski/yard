@@ -323,6 +323,8 @@ h.Button({"type": "button"}, data.on("click", at.post(LOGOUT.href())), "Sign out
 
 ## Tests
 
+Prove login with `TestClient`. Do not open a browser for a sign-in or a redirect.
+
 `tests/conftest.py` sets the secret and the seed user. `bootstrap` creates that user on the empty test database.
 
 ```python

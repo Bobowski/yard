@@ -211,4 +211,6 @@ __marimo__/
 # Yard runtime data
 yard-data/
 *.token
-.cursor/
+.cursor/*
+!.cursor/environment.json
+!.cursor/cloud-install.sh
