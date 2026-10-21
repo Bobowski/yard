@@ -71,5 +71,27 @@ The package uses `uv_build` with `module-name = ["app"]`. `package = false` in `
 
 ### Workflow
 
-- Commit on the agent branch. Do not open a pull request.
-- Do not push `main` unless the user asks to deploy. Yard deploys each push to `main`.
+- Do each piece of work that changes this repo in a pull request. One pull request holds one intent.
+- Open the pull request with your first push.
+- Before each push, run `just check` and fix every failure.
+- Merge only when the task tells you to merge. Then run `gh pr merge --squash --delete-branch`. Yard deploys each merge to `main`.
+- When the task does not tell you to merge, keep the pull request open.
+- When you drop the work, write the reason in the body and close the pull request.
+- Do not push to `main` directly.
+
+The pull request body is the record of the work. The squash merge puts it into the commit message. Write it for a reader who did not see the work. Keep it current while you work. Use these headings:
+
+- **Intent**: the task in one or two sentences, and its source: a schedule, a Medic finding, or the user.
+- **Found**: the state before the change. For a bug, write the cause and how you reproduced it.
+- **Changed**: what you changed, and why you did it this way. Name the other options and why you did not use them.
+- **Not done**: what you did not do, and why. Write "Nothing" when that is true.
+- **Proof**: irrefutable proof that the change works.
+- **Questions**: the decisions that you made without the user. Write "None" when that is true.
+
+Proof is evidence that a reader can check without trust in you. "Tests pass" is not proof. For each claim in **Changed**, give the command that you ran and the part of its output that shows the result:
+
+- For a bug: the new test fails on the old code and passes on the new code. Show both runs.
+- For a route: the `TestClient` response that shows the HTML, the JSON, or the header.
+- For a security fix: the request that worked before the fix, and the status code that it gets now.
+- For a visual change: a screenshot. A test cannot prove a layout.
+- After a merge, when you can reach production: a `curl` to the production URL that shows the fix.
