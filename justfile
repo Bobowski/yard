@@ -26,3 +26,7 @@ fix:
 # run the tests
 test:
     uv run pytest -q
+
+# refresh AGENTS.md, the skills, and the Cloud Agent files from the latest stario-create
+sync:
+    uvx stario-create@latest sync
