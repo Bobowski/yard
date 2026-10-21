@@ -15,9 +15,9 @@ fi
 
 uv python install 3.14
 if [ -f uv.lock ]; then
-  uv sync --all-groups --locked || { echo "uv.lock is stale; resolving again" >&2; uv sync --all-groups; }
+  uv sync --all-groups --all-extras --locked || { echo "uv.lock is stale; resolving again" >&2; uv sync --all-groups --all-extras; }
 else
-  uv sync --all-groups
+  uv sync --all-groups --all-extras
 fi
 
 if ! command -v just >/dev/null 2>&1; then
