@@ -24,18 +24,6 @@ if ! command -v just >/dev/null 2>&1; then
   uv tool install rust-just
 fi
 
-TAILWIND_VERSION="v4.3.3"
-if [ -f frontend/src/input.css ] && [ ! -x ./tailwindcss ]; then
-  case "$(uname -s):$(uname -m)" in
-    Darwin:arm64) asset="tailwindcss-macos-arm64" ;;
-    Darwin:x86_64) asset="tailwindcss-macos-x64" ;;
-    Linux:x86_64 | Linux:amd64) asset="tailwindcss-linux-x64" ;;
-    Linux:aarch64 | Linux:arm64) asset="tailwindcss-linux-arm64" ;;
-    *) echo "no Tailwind build for $(uname -s) $(uname -m)" >&2; exit 1 ;;
-  esac
-  mkdir -p "${HOME}/.local/bin"
-  curl -fL --retry 3 -o "${HOME}/.local/bin/tailwindcss" \
-    "https://github.com/tailwindlabs/tailwindcss/releases/download/${TAILWIND_VERSION}/${asset}"
-  chmod +x "${HOME}/.local/bin/tailwindcss"
-  ln -sfn "${HOME}/.local/bin/tailwindcss" tailwindcss
+if [ -f frontend/src/input.css ] && just --summary 2>/dev/null | tr ' ' '\n' | grep -qx tailwind; then
+  just tailwind
 fi
