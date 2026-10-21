@@ -66,6 +66,9 @@ dev = [
 package = false
 default-groups = ["dev"]
 
+[tool.stario-create]
+profile = "api"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
