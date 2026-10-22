@@ -1352,7 +1352,9 @@ def _forge_parser(subs: argparse._SubParsersAction, common: argparse.ArgumentPar
     setup.add_argument("--key", default="", help="the GitHub app private key PEM")
     setup.add_argument("--manual", action="store_true", help="paste an App ID and key instead of the one-click form")
     setup.add_argument("--org", default="", help="create the GitHub app in this organization")
-    setup.add_argument("--no-browser", action="store_true", help="print the links; open nothing")
+    setup.add_argument(
+        "--no-browser", action="store_true", help="print the links; open nothing (no browser here: use --manual)"
+    )
     setup.add_argument("--new", action="store_true", help="start the GitHub setup over with a fresh secret")
     setup.set_defaults(func=_cmd_forge_setup)
 
