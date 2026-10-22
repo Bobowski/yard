@@ -397,12 +397,17 @@ def ago(when: str, now: datetime) -> str:
     moment = parse(when)
     if moment is None or moment.year < 2000:
         return ""
-    seconds = int((now - moment).total_seconds())
-    if seconds < 5:
+    return age((now - moment).total_seconds())
+
+
+def age(seconds: float) -> str:
+    """A span since a moment: now, 30s, 5m, 2h, 3d."""
+    count = int(seconds)
+    if count < 5:
         return "now"
-    if seconds < 60:
-        return f"{seconds}s"
-    minutes, _seconds = divmod(seconds, 60)
+    if count < 60:
+        return f"{count}s"
+    minutes, _seconds = divmod(count, 60)
     if minutes < 60:
         return f"{minutes}m"
     hours, _minutes = divmod(minutes, 60)
