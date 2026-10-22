@@ -52,7 +52,12 @@ def run_env(config: Config, app: App, checkout: Path, image: str, sha: str) -> d
     if find_compose(checkout) is None:
         dockerfile = next((name for name in DOCKERFILES if (checkout / name).is_file()), "")
         if not dockerfile:
-            raise YardError(502, "compose", f"no compose file or Containerfile in {checkout}")
+            raise YardError(
+                502,
+                "compose",
+                f"no compose file or Containerfile in {checkout}",
+                help_text="Add a Containerfile or a compose file to the repo: stario.dev/yard/compose",
+            )
         env["DOCKERFILE"] = dockerfile
     if app.name == "yard":
         # ops/compose.yml binds these host paths.

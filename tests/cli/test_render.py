@@ -5,6 +5,7 @@ from app.cli.render import (
     format_app_status,
     format_apps,
     format_binds,
+    format_doctor,
     format_status,
     format_tokens,
     status_hint,
@@ -218,3 +219,19 @@ def test_format_resource_tables():
 
     tokens = format_tokens([{"name": "ada", "created": stamp(days=1)}])
     assert tokens.split("\n")[0].split()[0] == "token"
+
+
+def test_format_doctor_marks_warnings():
+    checks = [
+        {"name": "podman", "ok": True, "detail": "podman 5.3.1", "warn": False},
+        {"name": "healthcheck heldso", "ok": True, "detail": "none", "warn": True},
+        {"name": "caddy", "ok": False, "detail": "absent", "warn": False},
+    ]
+    text = format_doctor(checks)
+    assert text.split("\n")[0].startswith("ok")
+    assert text.split("\n")[1].startswith("warn")
+    assert text.split("\n")[2].startswith("FAIL")
+
+    colored = format_doctor(checks, color=True)
+    assert "\033[33mwarn\033[0m" in colored
+    assert "\033[31mFAIL\033[0m" in colored

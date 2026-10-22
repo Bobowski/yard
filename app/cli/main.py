@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NoReturn
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import quote, unquote, urlencode, urlsplit
 
 from app import package_version
 from app.cli.render import (
@@ -44,6 +44,7 @@ from app.shared import (
     check_repo,
     check_window,
     explain,
+    format_bytes,
     format_env,
     parse_env,
 )
@@ -97,7 +98,11 @@ def _load(args: argparse.Namespace) -> Client:
         token = args.token
     url = _http_url(url)
     if not url or not token:
-        _die("run yard login, or set --url and --token")
+        _die(
+            "not logged in.\n"
+            "Run: yard login --url https://<your yard host> --token <token>\n"
+            "The admin token is in /srv/yard/tokens/admin.token on the host."
+        )
     return Client(url, token)
 
 
@@ -123,11 +128,26 @@ def _api_try(client: Client, method: str, path: str, body: object, timeout: int 
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read().decode().strip()
     except TimeoutError:
-        _die(f"the Yard API did not answer in {timeout} s")
+        _die(_unreachable(client, f"no answer in {timeout} s", method, path))
     except urllib.error.URLError as exc:
-        if isinstance(exc.reason, TimeoutError):
-            _die(f"the Yard API did not answer in {timeout} s")
-        _die(f"the Yard API did not answer: {exc.reason}")
+        reason = f"no answer in {timeout} s" if isinstance(exc.reason, TimeoutError) else str(exc.reason)
+        _die(_unreachable(client, reason, method, path))
+
+
+def _unreachable(client: Client, reason: str, method: str, path: str) -> str:
+    """A connection failure says where it dialed and what to check. A deploy may
+    still be running on the host, so a timed-out POST points at its log."""
+    message = (
+        f"the Yard API at {client.url} did not answer: {reason}\n"
+        "Check the address with yard login, or on the host: sudo -u yard podman ps"
+    )
+    deploy = re.fullmatch(r"/api/v1/apps/([^/]+)/deploy", path)
+    if method == "POST" and deploy:
+        message += (
+            "\nThe deploy may still be running."
+            f" Follow it with: yard app logs --deploy --app {unquote(deploy.group(1))}"
+        )
+    return message
 
 
 def _stream_get(client: Client, path: str) -> None:
@@ -143,9 +163,9 @@ def _stream(client: Client, method: str, path: str, body: object) -> None:
         raw = exc.read().decode().strip()
         _die(raw if _json else explain(raw))
     except TimeoutError:
-        _die("the Yard API did not answer")
+        _die(_unreachable(client, "no answer", method, path))
     except urllib.error.URLError as exc:
-        _die(f"the Yard API did not answer: {exc.reason}")
+        _die(_unreachable(client, str(exc.reason), method, path))
     with response:
         if response.status >= 300:
             raw = response.read().decode().strip()
@@ -230,13 +250,16 @@ def _app_name(client_: Client, args: argparse.Namespace) -> str:
     if str(getattr(args, "app", "") or "").strip():
         return str(args.app).strip()
     if not _git_out("rev-parse", "--show-toplevel"):
-        _die("not a git checkout here; pass --app NAME")
+        _die("not a git checkout here; pass --app NAME, or cd into the app's checkout. yard app ls lists the apps.")
     repo = _remote_repo(_git_out("remote", "get-url", "origin"))
     if not repo:
-        _die("the origin remote is not on Origin or GitHub; pass --app NAME")
+        _die(
+            "the origin remote is not on Origin or GitHub; pass --app NAME, or cd into the app's checkout."
+            " yard app ls lists the apps."
+        )
     branch = _git_out("branch", "--show-current")
     if not branch:
-        _die("detached HEAD; pass --app NAME")
+        _die("detached HEAD; pass --app NAME. yard app ls lists the apps.")
     rows = _object(_api(client_, "GET", "/api/v1/apps", None))
     found = [
         row
@@ -246,9 +269,12 @@ def _app_name(client_: Client, args: argparse.Namespace) -> str:
         and str(row.get("ref") or "") == branch
     ]
     if not found:
-        _die(f"no app follows {repo} {branch}; pass --app NAME")
+        _die(
+            f"no app follows {repo} {branch}.\n"
+            "Create one here: yard app new   (or pass --app NAME; yard app ls lists the apps)"
+        )
     if len(found) > 1:
-        _die(f"more than one app follows {repo} {branch}; pass --app NAME")
+        _die(f"more than one app follows {repo} {branch}; pass --app NAME. yard app ls lists the apps.")
     return str(found[0]["name"])
 
 
@@ -486,7 +512,7 @@ def _cmd_app_deploy(args: argparse.Namespace) -> None:
     if not isinstance(note, dict):
         print(raw)
         return
-    _print_deploy_note(note)
+    _print_deploy_note(note, name)
     record = wrap.get("app") if isinstance(wrap, dict) else None
     if sha and isinstance(record, dict) and record.get("trigger") == "push":
         print(
@@ -498,10 +524,64 @@ def _cmd_app_deploy(args: argparse.Namespace) -> None:
 def _cmd_app_rm(args: argparse.Namespace) -> None:
     session = _load(args)
     name = _app_name(session, args)
-    _show_record(_api(session, "DELETE", "/api/v1/apps/" + quote(name), None))
+    if not args.yes:
+        if not sys.stdin.isatty():
+            _die("yard app rm deletes the app's data and needs a confirmation.\nRun it in a terminal, or pass --yes.")
+        _rm_preview(session, name, args.with_binds)
+        answer = _ask("Type the app name to confirm: ")
+        if answer != name:
+            _die(f"Not removed: you typed '{answer}', the app is '{name}'.")
+    path = f"/api/v1/apps/{quote(name)}" + ("?binds=1" if args.with_binds else "")
+    raw = _api(session, "DELETE", path, None)
+    if _json:
+        print(raw)
+        return
+    data = _object(raw)
+    if not isinstance(data, dict):
+        print(raw)
+        return
+    print(f"removed {name}")
+    for bind in data.get("binds_removed") or []:
+        if isinstance(bind, dict):
+            print(f"removed bind {bind.get('host')} → {bind.get('dial')}")
+    left = [bind for bind in data.get("binds_left") or [] if isinstance(bind, dict)]
+    if left:
+        print(f"These binds still point at {name}'s containers. Caddy answers them with an error now.")
+        print("Remove them with:")
+        for bind in left:
+            print(f"  yard bind rm {bind.get('host')}")
+        print("Next time, yard app rm --with-binds removes them in the same step.")
+    error = str(data.get("binds_error") or "")
+    if error:
+        print(f"Could not read the binds: {error}\nCheck with: yard bind ls")
 
 
-def _print_deploy_note(note: dict) -> None:
+def _rm_preview(session: Client, name: str, with_binds: bool) -> None:
+    """What `app rm` takes away: the containers, the files, the binds. One page read."""
+    page = _object(_api(session, "GET", f"/api/v1/apps/{quote(name)}", None))
+    page = page if isinstance(page, dict) else {}
+    env_file = str(page.get("env_file") or "")
+    app_dir = str(Path(env_file).parent) if env_file else ""
+    rows = [row for row in page.get("rows") or [] if isinstance(row, dict)]
+    containers = ", ".join(str(row["container"]) for row in rows if row.get("container"))
+    data = sum(int(row.get("data") or 0) for row in rows if isinstance(row.get("data"), int))
+    page_binds = [bind for bind in page.get("binds") or [] if isinstance(bind, dict) and bind.get("host")]
+    print(f"This deletes the app {name}:")
+    print(f"  {'containers'.ljust(10)}  {containers or '(none)'}")
+    print(f"  {'clone'.ljust(10)}  {app_dir}/repo")
+    print(f"  {'env file'.ljust(10)}  {env_file}")
+    print(f"  {'data'.ljust(10)}  {app_dir}/data ({format_bytes(data)})")
+    if page_binds:
+        if with_binds:
+            print("These binds also go (--with-binds):")
+        else:
+            print("These binds stay and will point at nothing:")
+        for bind in page_binds:
+            print(f"  {bind.get('host')} → {bind.get('dial')}")
+    print("This cannot be undone. Copy the data directory first if you need it.")
+
+
+def _print_deploy_note(note: dict, name: str) -> None:
     status = str(note.get("status") or "")
     image = str(note.get("image") or "")
     line = "  ".join(part for part in (status, image) if part)
@@ -512,6 +592,11 @@ def _print_deploy_note(note: dict) -> None:
     text = str(note.get("log") or "")
     if text:
         print(text, end="" if text.endswith("\n") else "\n")
+    if status == "failed":
+        print(f"Read the full log: yard app logs --deploy --app {name}")
+    elif status == "reverted":
+        print("The new container never got healthy, so the previous image still runs.")
+        print(f"Read why: yard app logs --deploy --app {name}, then yard app logs --app {name}")
 
 
 def _cmd_env_show(args: argparse.Namespace) -> None:
@@ -539,7 +624,7 @@ def _cmd_env_set(args: argparse.Namespace) -> None:
     for pair in args.pairs:
         key, sep, value = pair.partition("=")
         if not sep:
-            _die(f"need KEY=VALUE, got {pair}")
+            _die(f"need KEY=VALUE, got {pair}\nExample: yard env set DATABASE_PATH=/data/app.sqlite3")
         patch[key] = value
     raw = _api(session, "PATCH", f"/api/v1/apps/{quote(name)}/env", patch)
     if _json:
@@ -906,7 +991,7 @@ def _edit_text(initial: str) -> str:
         editor = os.environ.get("EDITOR") or "vi"
         proc = subprocess.run([*editor.split(), str(path)])
         if proc.returncode:
-            _die(f"editor: exit {proc.returncode}")
+            _die(f"the editor exited with {proc.returncode}; nothing was saved")
         return path.read_text()
     finally:
         path.unlink(missing_ok=True)
@@ -1020,6 +1105,8 @@ def _app_parser(subs: argparse._SubParsersAction, common: argparse.ArgumentParse
 
     rm = subs.add_parser("rm", help="remove an app", parents=[common])
     _add_app_flag(rm)
+    rm.add_argument("--yes", action="store_true", help="remove without confirming")
+    rm.add_argument("--with-binds", action="store_true", help="remove the app's binds too")
     rm.set_defaults(func=_cmd_app_rm)
 
 

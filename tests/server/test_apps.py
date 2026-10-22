@@ -204,6 +204,134 @@ async def test_deploy_emits_start_and_end(tmp_path: Path, monkeypatch: pytest.Mo
     assert sent[-1][1]["status"] == "ok" and sent[-1][1]["container"] == "deploy-heldso"
 
 
+PS_HELDSO = (
+    '[{"Names":["heldso-app-1"],"State":"running","Image":"localhost/heldso:abc",'
+    '"Labels":{"com.docker.compose.project":"heldso","com.docker.compose.service":"app"}}]'
+)
+
+
+def _delete_yard(tmp_path: Path, *, routes: list[dict] | None = None, ps: str = "[]") -> tuple[Yard, FakeCaddy]:
+    yard = make_yard(tmp_path)
+    yard.store.create_app("heldso", "https://origin.cursor.com/org/app")
+    yard.podman = _Podman(ps=ps)
+    caddy = FakeCaddy(routes if routes is not None else [])
+    yard.caddy = caddy
+    return yard, caddy
+
+
+async def test_delete_refuses_the_yard_app(tmp_path: Path):
+    yard = make_yard(tmp_path)
+    yard.store.create_app("yard", "")
+    with pytest.raises(YardError) as caught:
+        await apps.delete(yard, "yard")
+    assert caught.value.status == 400
+    assert caught.value.code == "forbidden"
+    assert "yard-app-1" in (caught.value.help_text or "")
+
+
+async def test_delete_reports_the_binds_it_leaves(tmp_path: Path):
+    yard, caddy = _delete_yard(tmp_path, routes=[_route("heldso.example.com", "heldso-app-1:8000")], ps=PS_HELDSO)
+    removed = await apps.delete(yard, "heldso")
+    assert removed.name == "heldso"
+    assert removed.binds_left == [("heldso.example.com", "heldso-app-1:8000")]
+    assert removed.binds_removed == []
+    assert removed.binds_error == ""
+    assert len(caddy.routes) == 1  # nothing was removed
+
+
+async def test_delete_with_binds_removes_them(tmp_path: Path):
+    yard, caddy = _delete_yard(
+        tmp_path,
+        routes=[
+            _route("heldso.example.com", "heldso-app-1:8000"),
+            _route("other.example.com", "other-app-1:8000"),
+        ],
+        ps=PS_HELDSO,
+    )
+    removed = await apps.delete(yard, "heldso", with_binds=True)
+    assert removed.binds_removed == [("heldso.example.com", "heldso-app-1:8000")]
+    assert removed.binds_left == []
+    # Only the app's own bind went.
+    assert [row["match"][0]["host"][0] for row in caddy.routes] == ["other.example.com"]
+
+
+async def test_delete_counts_an_unlabeled_container_by_name(tmp_path: Path):
+    """The `<name>-app-1` guess covers a bind written before the container existed."""
+    yard, _caddy = _delete_yard(tmp_path, routes=[_route("heldso.example.com", "heldso-app-1:8000")], ps="[]")
+    removed = await apps.delete(yard, "heldso")
+    assert removed.binds_left == [("heldso.example.com", "heldso-app-1:8000")]
+
+
+async def test_delete_keeps_going_when_the_binds_are_unreadable(tmp_path: Path):
+    yard, _caddy = _delete_yard(tmp_path, ps=PS_HELDSO)
+
+    class _Down(FakeCaddy):
+        async def request(self, method: str, path: str, body=None):
+            raise YardError(502, "caddy", "caddy GET /config: no socket")
+
+    yard.caddy = _Down()
+    removed = await apps.delete(yard, "heldso")
+    assert "no socket" in removed.binds_error
+    assert removed.binds_removed == [] and removed.binds_left == []
+    with pytest.raises(YardError):
+        yard.store.app("heldso")  # the app is gone anyway
+
+
+async def test_prune_loop_uses_the_configured_days(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The loop waits ten minutes, then prunes with YARD_PRUNE_DAYS once a day."""
+    yard = make_yard(tmp_path)
+    yard.config = replace(yard.config, prune_days=3)
+    calls: list[tuple[int, bool, str]] = []
+
+    async def fake_prune(host, days, dry, *, actor=""):
+        calls.append((days, dry, actor))
+        return apps.Report(freed=100)
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) > 1:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(apps, "prune", fake_prune)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    await apps.prune_loop(yard)
+    assert calls == [(3, False, "auto")]
+    assert sleeps == [600, 24 * 3600]
+    assert yard.last_prune
+    assert yard.last_prune_freed == 100
+    assert yard.last_prune_error == ""
+
+
+async def test_prune_loop_records_an_error_and_keeps_going(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard = make_yard(tmp_path)
+    runs = 0
+
+    async def fake_prune(host, days, dry, *, actor=""):
+        nonlocal runs
+        runs += 1
+        if runs == 1:
+            raise YardError(502, "podman", "podman is down")
+        return apps.Report()
+
+    seen_errors: list[str] = []
+
+    async def fake_sleep(seconds):
+        seen_errors.append(yard.last_prune_error)
+        if runs > 1:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(apps, "prune", fake_prune)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    await apps.prune_loop(yard)
+    # The boot wait runs first, then each prune's 24 h wait sees the last result.
+    assert runs == 2
+    assert seen_errors == ["", "podman is down", ""]
+    assert yard.last_prune_error == ""
+    assert yard.last_prune
+
+
 async def test_ensure_host_app_is_unconditional(tmp_path: Path):
     yard = make_yard(tmp_path)
     apps.ensure_host(yard)
@@ -533,6 +661,29 @@ async def test_a_report_failure_never_fails_the_deploy(tmp_path: Path, monkeypat
     assert "403" in forge.last_report_error
 
 
+async def test_report_skips_a_repo_the_installation_does_not_own(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A push-trigger yard app on Bobowski/yard must not POST a status there."""
+    yard = make_yard(tmp_path)
+    forge = yard.forge("https://github.com/Bobowski/yard")
+    forge.save(account="org")
+    calls = _reports(monkeypatch)
+    await apps.report(forge, "https://github.com/Bobowski/yard", "abc123", "success", "live")
+    assert calls == []
+    # Skipping is not an error: nothing lands on the doctor row.
+    assert forge.last_report == ""
+    assert forge.last_report_error == ""
+
+
+async def test_report_still_posts_for_an_owned_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard = make_yard(tmp_path)
+    forge = yard.forge("https://github.com/org/app")
+    forge.save(account="org")
+    calls = _reports(monkeypatch)
+    await apps.report(forge, "https://github.com/org/app", "abc123", "success", "live")
+    assert calls == [("https://github.com/org/app", "abc123", "success", "live", "")]
+    assert forge.last_report
+
+
 async def test_a_yard_self_deploy_stays_pending(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """The detached apply means no success: the commit reads pending until the boot report."""
     yard, _recorder = _deploy_github(tmp_path, monkeypatch, name="yard")
@@ -583,6 +734,45 @@ async def test_boot_report_says_nothing_without_a_sha_or_repo(tmp_path: Path, mo
     yard.store.update_app("yard", repo="https://github.com/org/yard")
     await main._boot_report(yard)  # github is not connected
     assert calls == []
+
+
+async def test_boot_report_learns_the_installation_account(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A host installed before accounts existed picks it up once at boot."""
+    yard = make_yard(tmp_path)
+    yard.store.create_app("yard", "https://github.com/org/yard")
+    _connect(monkeypatch)
+    calls = _reports(monkeypatch)
+    found: list[str] = []
+
+    async def fake_find(self):
+        found.append(self.name)
+        self.save(installation_id="101", account="org")
+        return {"id": "101"}
+
+    monkeypatch.setattr(GitHub, "find_installation", fake_find)
+    yard.config = replace(yard.config, sha="c" * 40)
+    await main._boot_report(yard)
+    assert found == ["github"]
+    assert calls == [("https://github.com/org/yard", "c" * 40, "success", "live", "")]
+
+    # The account is saved; the next boot does not ask again.
+    await main._boot_report(yard)
+    assert found == ["github"]
+
+
+async def test_boot_report_ignores_a_find_installation_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard = make_yard(tmp_path)
+    yard.store.create_app("yard", "https://github.com/org/yard")
+    _connect(monkeypatch)
+    calls = _reports(monkeypatch)
+
+    async def down(self):
+        raise YardError(502, "github", "github GET /app/installations: refused")
+
+    monkeypatch.setattr(GitHub, "find_installation", down)
+    yard.config = replace(yard.config, sha="c" * 40)
+    await main._boot_report(yard)  # best effort; the report still lands
+    assert calls == [("https://github.com/org/yard", "c" * 40, "success", "live", "")]
 
 
 async def test_deploy_reuses_a_local_image(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

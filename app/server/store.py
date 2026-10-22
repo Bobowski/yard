@@ -33,6 +33,7 @@ class Config:
     boot: bool
     remote: bool
     check_seconds: float = 300.0
+    prune_days: int = 7
     sha: str = ""
     journal_dir: Path = Path("/var/log/journal")
     journalctl_bin: str = "journalctl"
@@ -77,6 +78,7 @@ class Config:
             boot=boot,
             remote=remote,
             check_seconds=float(os.environ.get("YARD_CHECK_SECONDS", "300")),
+            prune_days=int(os.environ.get("YARD_PRUNE_DAYS", "7")),
             sha=os.environ.get("SHA", ""),
             journal_dir=Path(os.environ.get("YARD_JOURNAL_DIR", "/var/log/journal")),
             journalctl_bin=os.environ.get("YARD_JOURNALCTL_BIN", "journalctl"),

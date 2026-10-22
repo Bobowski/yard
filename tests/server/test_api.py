@@ -3,7 +3,7 @@ import hmac
 import json
 import stat
 
-from app.server import apps, caddy, journal
+from app.server import apps, binds, caddy, journal
 from app.server.caddy import Caddy
 from app.server.forges import GitHub, Origin
 from app.server.podman import Podman
@@ -110,6 +110,73 @@ async def test_app_round_trip(yard, monkeypatch):
     assert res.status_code == 200
     res = await client.get("/api/v1/apps/heldso", headers=auth(token))
     assert res.status_code == 404
+
+
+async def test_app_delete_answers_the_binds_it_left(yard, monkeypatch):
+    client, token, _root = yard
+
+    async def fake_run(self, *args, **kw):
+        return "[]"
+
+    async def fake_read(host):
+        return [binds.Bind("heldso.example.com", "heldso-app-1:8000", "yard-heldso.example.com", "10s")]
+
+    monkeypatch.setattr(Podman, "run", fake_run)
+    monkeypatch.setattr(binds, "read", fake_read)
+    res = await client.post(
+        "/api/v1/apps",
+        json={"name": "heldso", "repo": "https://origin.cursor.com/org/heldso"},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+
+    res = await client.delete("/api/v1/apps/heldso", headers=auth(token))
+    assert res.status_code == 200
+    body = res.json()
+    assert body["name"] == "heldso"
+    assert body["binds_removed"] == []
+    assert body["binds_left"] == [{"host": "heldso.example.com", "dial": "heldso-app-1:8000"}]
+    assert "binds_error" not in body
+
+
+async def test_app_delete_binds_query_removes_them(yard, monkeypatch):
+    client, token, _root = yard
+    removed: list[str] = []
+
+    async def fake_run(self, *args, **kw):
+        return "[]"
+
+    async def fake_read(host):
+        return [binds.Bind("heldso.example.com", "heldso-app-1:8000", "yard-heldso.example.com", "10s")]
+
+    async def fake_delete(yard_, host, *, actor=""):
+        removed.append(host)
+        return host
+
+    monkeypatch.setattr(Podman, "run", fake_run)
+    monkeypatch.setattr(binds, "read", fake_read)
+    monkeypatch.setattr(binds, "delete_bind", fake_delete)
+    res = await client.post(
+        "/api/v1/apps",
+        json={"name": "heldso", "repo": "https://origin.cursor.com/org/heldso"},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+
+    res = await client.delete("/api/v1/apps/heldso?binds=1", headers=auth(token))
+    assert res.status_code == 200
+    assert removed == ["heldso.example.com"]
+    assert res.json()["binds_removed"] == [{"host": "heldso.example.com", "dial": "heldso-app-1:8000"}]
+    assert res.json()["binds_left"] == []
+
+
+async def test_app_delete_refuses_the_yard_app(yard):
+    client, token, _root = yard
+    res = await client.delete("/api/v1/apps/yard", headers=auth(token))
+    assert res.status_code == 400
+    error = res.json()["error"]
+    assert error["code"] == "forbidden"
+    assert "yard-app-1" in error["help"]
 
 
 async def test_app_trigger_is_push_or_manual(yard):
@@ -414,7 +481,7 @@ async def test_app_status_and_doctor(yard, monkeypatch):
     assert res.status_code == 404
 
     checks = {check["name"]: check for check in (await client.get("/api/v1/doctor", headers=auth(token))).json()}
-    assert checks["podman"] == {"name": "podman", "ok": True, "detail": "podman 5.3.1"}
+    assert checks["podman"] == {"name": "podman", "ok": True, "detail": "podman 5.3.1", "warn": False}
     assert checks["caddy"]["detail"] == "skipped: no host"
     assert checks["origin"]["ok"] is False
 

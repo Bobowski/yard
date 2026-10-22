@@ -3,7 +3,7 @@
 import asyncio
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -55,6 +55,15 @@ class Image:
     name: str
     created: datetime | None = None
     size: int = 0
+
+
+@dataclass(slots=True)
+class Healthcheck:
+    """Config.Healthcheck plus the live State.Health status. Interval is nanoseconds."""
+
+    test: list[str] = field(default_factory=list)
+    interval: int = 0
+    status: str = ""
 
 
 class Podman:
@@ -158,6 +167,26 @@ def parse_log_types(raw: str) -> dict[str, str]:
         kind = log.get("Type") if isinstance(log, dict) else ""
         if name:
             found[name] = str(kind or "")
+    return found
+
+
+def parse_health(raw: str) -> dict[str, Healthcheck]:
+    """podman inspect: container name -> its healthcheck."""
+    found: dict[str, Healthcheck] = {}
+    for row in _rows(raw):
+        name = str(row.get("Name") or row.get("name") or "").lstrip("/")
+        if not name:
+            continue
+        config = row.get("Config")
+        check = config.get("Healthcheck") if isinstance(config, dict) else None
+        state = row.get("State")
+        health = state.get("Health") if isinstance(state, dict) else None
+        test = check.get("Test") if isinstance(check, dict) else []
+        found[name] = Healthcheck(
+            [str(item) for item in test] if isinstance(test, list) else [],
+            _int(check.get("Interval")) if isinstance(check, dict) else 0,
+            str(health.get("Status") or "") if isinstance(health, dict) else "",
+        )
     return found
 
 

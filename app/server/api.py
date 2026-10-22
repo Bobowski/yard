@@ -247,7 +247,7 @@ def _named(forges: dict[str, Forge], name: str) -> Forge:
     for forge in forges.values():
         if forge.name == name:
             return forge
-    raise YardError(404, "not_found", f"unknown forge {name}")
+    raise YardError(404, "not_found", f"unknown forge {name}", help_text="The forges are origin and github.")
 
 
 def forges_list(forges: dict[str, Forge], config: Config) -> Handler:
@@ -351,7 +351,9 @@ def forge_put(forges: dict[str, Forge], config: Config) -> Handler:
                 "events": info.get("events") or [],
             }
         else:
-            raise YardError(404, "not_found", f"unknown forge {forge.name}")
+            raise YardError(
+                404, "not_found", f"unknown forge {forge.name}", help_text="The forges are origin and github."
+            )
         w.json(cast(JsonValue, {"forge": forge.summary(), "app": app}))
 
     return handler
@@ -429,8 +431,15 @@ def app_patch(yard: Yard) -> Handler:
 def app_delete(yard: Yard) -> Handler:
     async def handler(c: Context, w: Writer) -> None:
         name = c.match.params["name"]
-        await apps.delete(yard, name, actor=_actor(c))
-        w.json({"name": name})
+        removed = await apps.delete(yard, name, with_binds=c.req.query.get("binds") == "1", actor=_actor(c))
+        body: dict[str, Any] = {
+            "name": removed.name,
+            "binds_removed": [{"host": host, "dial": dial} for host, dial in removed.binds_removed],
+            "binds_left": [{"host": host, "dial": dial} for host, dial in removed.binds_left],
+        }
+        if removed.binds_error:
+            body["binds_error"] = removed.binds_error
+        w.json(cast(JsonValue, body))
 
     return handler
 
@@ -467,6 +476,7 @@ def app_deploy(yard: Yard) -> Handler:
                 "deploy_failed",
                 outcome.log.strip() or outcome.error or "deploy failed",
                 context={"app": name},
+                help_text=f"Read the full log: yard app logs --deploy --app {name}",
             )
         w.json(
             cast(

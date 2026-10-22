@@ -49,7 +49,8 @@ build() {
     # The default contract is one image from CHECKOUT; podman-remote builds it
     # in ~2s where dc build needs ~18s on the same socket.
     */default.compose.yml)
-      podman-remote build -t "$IMAGE" -f "$CHECKOUT/${DOCKERFILE:-Containerfile}" "$CHECKOUT" || exit 1
+      # Docker format keeps HEALTHCHECK; podman-remote defaults to OCI, which drops it.
+      podman-remote build --format docker -t "$IMAGE" -f "$CHECKOUT/${DOCKERFILE:-Containerfile}" "$CHECKOUT" || exit 1
       ;;
     *)
       dc build || exit 1

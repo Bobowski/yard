@@ -171,3 +171,15 @@ def test_warnings_come_from_the_compose_file(tmp_path: Path):
     assert code == 0
     assert "${APP_ENV}" in out
     assert "${DATA_DIR}" in out
+
+
+def test_default_compose_builds_a_docker_image(tmp_path: Path):
+    # podman-remote defaults to OCI, which drops HEALTHCHECK; docker keeps it.
+    code, _out, log, _err = _run(
+        tmp_path,
+        "up",
+        COMPOSE_FILE="/srv/yard/apps/heldso/repo/default.compose.yml",
+        CHECKOUT="/srv/yard/apps/heldso/repo",
+    )
+    assert code == 0
+    assert "podman:build --format docker -t localhost/heldso:abc" in log

@@ -37,6 +37,9 @@ class Yard:
         self.queued: dict[str, Callable[[], Awaitable[None]]] = {}
         self.tasks: list[asyncio.Task[None]] = []
         self.stario: StarioApp | None = None
+        self.last_prune = ""
+        self.last_prune_freed = 0
+        self.last_prune_error = ""
 
     def attach(self, app: StarioApp) -> None:
         self.stario = app
@@ -55,7 +58,13 @@ class Yard:
         """The forge that hosts a repo URL."""
         forge = self.forges.get(urlsplit(repo).hostname or "")
         if forge is None:
-            raise YardError(400, "bad_repo", f"repo must be a forge URL: {repo}")
+            raise YardError(
+                400,
+                "bad_repo",
+                f"repo must be a forge URL: {repo}",
+                help_text="Use https://<forge>/<owner>/<name>.",
+                example="https://github.com/org/heldso",
+            )
         return forge
 
     def forge_named(self, name: str) -> Forge:
@@ -63,4 +72,4 @@ class Yard:
         for forge in self.forges.values():
             if forge.name == name:
                 return forge
-        raise YardError(404, "not_found", f"unknown forge {name}")
+        raise YardError(404, "not_found", f"unknown forge {name}", help_text="The forges are origin and github.")

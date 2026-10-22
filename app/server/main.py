@@ -56,10 +56,20 @@ async def boot(yard: Yard, app: App) -> None:
     yard.tasks.append(app.create_task(apps.loop(yard), name="checks"))
     yard.tasks.append(app.create_task(_caddy_server(yard), name="caddy-server"))
     yard.tasks.append(app.create_task(_boot_report(yard), name="boot-report"))
+    if config.prune_days > 0:
+        yard.tasks.append(app.create_task(apps.prune_loop(yard), name="prune"))
 
 
 async def _boot_report(yard: Yard) -> None:
     """This process is the last yard deploy's commit; mark it live on the forge."""
+    for forge in yard.forges.values():
+        # Older hosts never saved the installation account; learn it once so
+        # forge.owns() can keep statuses off repos the installation does not own.
+        if forge.reports and forge.connected() and not forge.account:
+            try:
+                await forge.find_installation()
+            except YardError as exc:
+                log.warning("%s installation: %s", forge.name, exc)
     sha = yard.config.sha
     if not sha:
         return
