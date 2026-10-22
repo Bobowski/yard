@@ -39,8 +39,10 @@ Yard is built for [Stario](https://stario.dev) apps, but it never looks inside t
 
 ## Docs
 
-- [Guide](https://stario.dev/yard/guide) — install, connect a forge, deploy an app, read the host.
-- [How it works](https://stario.dev/yard/how-it-works) — one push, step by step, and every file Yard keeps.
+- [The whole idea](https://stario.dev/yard/the-idea) — Yard in one page: what each tool does and what Yard leaves out.
+- [Set up a host](https://stario.dev/yard/install) — a fresh VM to a working Yard in one script and a few commands.
+- [Your first app](https://stario.dev/yard/first-app) — the four rules an app follows, then one push.
+- [How it works](https://stario.dev/yard/how-it-works) — the internals: files, the check loop, the deploy container, Caddy, journald.
 - [CLI](https://stario.dev/yard/cli-reference) — every `yard` command.
 - [API](https://stario.dev/yard/api-reference) — the HTTP API the CLI talks to.
 
