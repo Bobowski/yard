@@ -1,8 +1,13 @@
+import argparse
+import html
+import http.client
 import json
+import re
 import stat
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -1075,7 +1080,7 @@ def test_forge_setup_github(monkeypatch: pytest.MonkeyPatch, capsys: pytest.Capt
     monkeypatch.setattr("builtins.input", _answers("42", ""))
     monkeypatch.setattr(cli.secrets, "token_hex", lambda n: "s" * 64)
     _env(monkeypatch)
-    main(["forge", "setup", "github", "--key", str(pem), "--no-browser", "--text"])
+    main(["forge", "setup", "github", "--manual", "--key", str(pem), "--no-browser", "--text"])
     out = capsys.readouterr().out
     err = capsys.readouterr().err
     assert "s" * 64 in out
@@ -1119,7 +1124,7 @@ def test_forge_setup_github_accepts_quoted_and_escaped_paths(monkeypatch: pytest
         calls: list = []
         monkeypatch.setattr(cli, "_api_try", _fake_setup_api(calls))
         monkeypatch.setattr("builtins.input", _answers("42", answer))
-        main(["forge", "setup", "github", "--no-browser", "--text"])
+        main(["forge", "setup", "github", "--manual", "--no-browser", "--text"])
         put = [call for call in calls if call[0] == "PUT"]
         assert put == [
             (
@@ -1141,7 +1146,7 @@ def test_forge_setup_github_reprompts_a_missing_key(
     monkeypatch.setattr("builtins.input", _answers("42", str(tmp_path / "missing.pem"), str(pem)))
     monkeypatch.setattr(cli.secrets, "token_hex", lambda n: "s" * 64)
     _env(monkeypatch)
-    main(["forge", "setup", "github", "--no-browser", "--text"])
+    main(["forge", "setup", "github", "--manual", "--no-browser", "--text"])
     assert "cannot read the key" in capsys.readouterr().err
     put = [call for call in calls if call[0] == "PUT"]
     assert put == [("PUT", "/api/v1/forges/github", {"app_id": "42", "private_key": PEM, "webhook_secret": "s" * 64})]
@@ -1158,7 +1163,7 @@ def test_forge_setup_github_reprompts_a_bad_app_id(
     monkeypatch.setattr("builtins.input", _answers("forty-two", "42", str(pem)))
     monkeypatch.setattr(cli.secrets, "token_hex", lambda n: "s" * 64)
     _env(monkeypatch)
-    main(["forge", "setup", "github", "--no-browser", "--text"])
+    main(["forge", "setup", "github", "--manual", "--no-browser", "--text"])
     assert "not an app ID" in capsys.readouterr().err
     put = [call for call in calls if call[0] == "PUT"]
     assert put == [("PUT", "/api/v1/forges/github", {"app_id": "42", "private_key": PEM, "webhook_secret": "s" * 64})]
@@ -1190,7 +1195,7 @@ def test_forge_setup_github_retries_after_a_client_error(
     monkeypatch.setattr("builtins.input", _answers("41", str(pem), "42", str(pem)))
     monkeypatch.setattr(cli.secrets, "token_hex", lambda n: "s" * 64)
     _env(monkeypatch)
-    main(["forge", "setup", "github", "--no-browser", "--text"])
+    main(["forge", "setup", "github", "--manual", "--no-browser", "--text"])
     assert "the app id does not match the key" in capsys.readouterr().err
     put = [call for call in calls if call[0] == "PUT"]
     assert [call[2]["app_id"] for call in put] == ["41", "42"]
@@ -1211,7 +1216,7 @@ def test_forge_setup_github_resumes_a_stopped_run(
     # Run 1 stops at the key prompt; the pending setup stays on disk.
     monkeypatch.setattr("builtins.input", _eof_after("42"))
     with pytest.raises(SystemExit):
-        main(["forge", "setup", "github", "--text"])
+        main(["forge", "setup", "github", "--manual", "--text"])
     pending = cfg / "github-setup.json"
     saved = json.loads(pending.read_text())
     assert stat.S_IMODE(pending.stat().st_mode) == 0o600
@@ -1221,7 +1226,7 @@ def test_forge_setup_github_resumes_a_stopped_run(
 
     # Run 2 reuses the secret; the app form prints but does not open again.
     monkeypatch.setattr("builtins.input", _answers("42", str(pem)))
-    main(["forge", "setup", "github", "--text"])
+    main(["forge", "setup", "github", "--manual", "--text"])
     out = capsys.readouterr().out
     assert "Continuing the setup from" in out
     assert "settings/apps/new" in out
@@ -1254,7 +1259,7 @@ def test_forge_setup_github_new_mints_a_fresh_secret(
     monkeypatch.setattr("builtins.input", _answers("42", str(pem)))
     monkeypatch.setattr(cli.secrets, "token_hex", lambda n: "n" * 64)
     _env(monkeypatch)
-    main(["forge", "setup", "github", "--new", "--no-browser", "--text"])
+    main(["forge", "setup", "github", "--manual", "--new", "--no-browser", "--text"])
     assert "Continuing" not in capsys.readouterr().out
     put = [call for call in calls if call[0] == "PUT"]
     assert put == [("PUT", "/api/v1/forges/github", {"app_id": "42", "private_key": PEM, "webhook_secret": "n" * 64})]
@@ -1335,12 +1340,220 @@ def test_forge_setup_github_new_ignores_a_connected_forge(
     monkeypatch.setattr("builtins.input", _answers("42", str(pem)))
     monkeypatch.setattr(cli.secrets, "token_hex", lambda n: "n" * 64)
     _env(monkeypatch)
-    main(["forge", "setup", "github", "--new", "--no-browser", "--text"])
+    main(["forge", "setup", "github", "--manual", "--new", "--no-browser", "--text"])
     out = capsys.readouterr().out
     assert "Continuing" not in out
     assert "Done." in out
     put = [call for call in calls if call[0] == "PUT"]
     assert put == [("PUT", "/api/v1/forges/github", {"app_id": "42", "private_key": PEM, "webhook_secret": "n" * 64})]
+
+
+MANIFEST_APP = {
+    "id": 4242,
+    "slug": "yard-127-0-0-1",
+    "pem": PEM,
+    "webhook_secret": "w" * 40,
+    "html_url": "https://github.com/apps/yard-127-0-0-1",
+}
+
+
+def _local_get(url: str) -> tuple[int, str]:
+    parts = urlsplit(url)
+    conn = http.client.HTTPConnection(parts.hostname or "127.0.0.1", parts.port, timeout=10)
+    conn.request("GET", parts.path + ("?" + parts.query if parts.query else ""))
+    response = conn.getresponse()
+    body = response.read().decode()
+    conn.close()
+    return response.status, body
+
+
+def _drive_manifest(opened: list, bad_state_first: bool = False):
+    """The browser: open the local page, send GitHub's callback."""
+
+    def fake_open(url: str) -> None:
+        opened.append(url)
+        if not url.startswith("http://127.0.0.1"):
+            return
+        status, page = _local_get(url)
+        assert status == 200
+        state = re.search(r'state=([^"&]+)', page)
+        assert state
+        if bad_state_first:
+            status, body = _local_get(f"{url}callback?code=manifest-code&state=bogus")
+            assert status == 400
+            assert "does not belong" in body
+        status, body = _local_get(f"{url}callback?code=manifest-code&state={state.group(1)}")
+        assert status == 200
+        assert "Go back to the terminal" in body
+
+    return fake_open
+
+
+class _ConversionReply:
+    def __init__(self, raw: bytes):
+        self.raw = raw
+
+    def read(self) -> bytes:
+        return self.raw
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+
+def _fake_conversion(request, timeout=None):
+    assert request.full_url == "https://api.github.com/app-manifests/manifest-code/conversions"
+    assert request.get_method() == "POST"
+    return _ConversionReply(json.dumps(MANIFEST_APP).encode())
+
+
+def test_forge_setup_github_manifest_page():
+    session = cli.Client("https://yard.a-rather-long-host-name.example.com", "t")
+    page = cli._manifest_page(session, argparse.Namespace(org=""), "http://127.0.0.1:9", "STATE")
+    action = re.search(r'action="([^"]*)"', page)
+    assert action and html.unescape(action.group(1)) == "https://github.com/settings/apps/new?state=STATE"
+    hidden = re.search(r'name="manifest" value="([^"]*)"', page)
+    assert hidden
+    manifest = json.loads(html.unescape(hidden.group(1)))
+    assert manifest["name"] == "yard-yard.a-rather-long-host-name.example.com"[:34]
+    assert len(manifest["name"]) == 34
+    assert manifest["url"] == "https://yard.a-rather-long-host-name.example.com"
+    assert manifest["hook_attributes"] == {
+        "url": "https://yard.a-rather-long-host-name.example.com/hooks/github",
+        "active": True,
+    }
+    assert manifest["redirect_url"] == "http://127.0.0.1:9/callback"
+    assert manifest["public"] is False
+    assert manifest["default_permissions"] == {"contents": "read", "statuses": "write", "metadata": "read"}
+    assert manifest["default_events"] == ["push"]
+    assert "document.forms[0].submit()" in page
+
+    org_page = cli._manifest_page(session, argparse.Namespace(org="my-org"), "http://127.0.0.1:9", "S")
+    org_action = re.search(r'action="([^"]*)"', org_page)
+    assert org_action and html.unescape(org_action.group(1)).startswith(
+        "https://github.com/organizations/my-org/settings/apps/new"
+    )
+
+
+def test_forge_setup_github_manifest(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, tmp_path: Path):
+    cfg = _config_dir(monkeypatch, tmp_path)
+    calls: list = []
+    monkeypatch.setattr(cli, "_api_try", _fake_setup_api(calls))
+    monkeypatch.setattr(cli, "SETUP_POLL", 0.0)
+    opened: list = []
+    monkeypatch.setattr(cli.webbrowser, "open", _drive_manifest(opened, bad_state_first=True))
+    monkeypatch.setattr(cli.urllib.request, "urlopen", _fake_conversion)
+    _env(monkeypatch)
+    main(["forge", "setup", "github", "--text"])
+    captured = capsys.readouterr()
+    out = captured.out
+    assert "Opening the GitHub App form. Keep the name or change it" in out
+    assert "Install the app on your account and pick the repos Yard may deploy." in out
+    assert "https://github.com/apps/yard-127-0-0-1/installations/new" in out
+    assert "Done." in out
+    put = [call for call in calls if call[0] == "PUT"]
+    assert put == [
+        (
+            "PUT",
+            "/api/v1/forges/github",
+            {"app_id": "4242", "private_key": PEM, "webhook_secret": "w" * 40},
+        )
+    ]
+    assert not (cfg / "github-manifest.json").exists()
+    # The key and the secret never reach the terminal.
+    assert "PRIVATE KEY" not in out + captured.err
+    assert "w" * 40 not in out + captured.err
+
+
+def test_forge_setup_github_manifest_no_browser(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, tmp_path: Path
+):
+    _config_dir(monkeypatch, tmp_path)
+    calls: list = []
+    monkeypatch.setattr(cli, "_api_try", _fake_setup_api(calls))
+    monkeypatch.setattr(cli, "SETUP_POLL", 0.0)
+    opened: list = []
+
+    def fake_open(args, url):
+        opened.append(url)
+        print(url)
+        if url.startswith("http://127.0.0.1"):
+            _drive_manifest([], False)(url)
+
+    monkeypatch.setattr(cli, "_open", fake_open)
+    monkeypatch.setattr(cli.urllib.request, "urlopen", _fake_conversion)
+    _env(monkeypatch)
+    main(["forge", "setup", "github", "--no-browser", "--text"])
+    out = capsys.readouterr().out
+    assert "http://127.0.0.1:" in out
+    assert "Open it in a browser on this computer; GitHub sends you back to it." in out
+    assert "Done." in out
+
+
+def test_forge_setup_github_manifest_times_out(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, tmp_path: Path
+):
+    _config_dir(monkeypatch, tmp_path)
+    calls: list = []
+    monkeypatch.setattr(cli, "_api_try", _fake_setup_api(calls))
+    monkeypatch.setattr(cli, "SETUP_LIMIT", 0.05)
+    monkeypatch.setattr(cli, "_open", lambda args, url: None)
+    _env(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(["forge", "setup", "github", "--no-browser", "--text"])
+    assert "No answer from GitHub in ten minutes" in capsys.readouterr().err
+
+
+def test_forge_setup_github_manifest_keeps_a_failed_put(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, tmp_path: Path
+):
+    cfg = _config_dir(monkeypatch, tmp_path)
+    calls: list = []
+    puts = 0
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        nonlocal puts
+        calls.append((method, path, body))
+        if path == "/api/v1/forges":
+            return 200, json.dumps([{"name": "github", "installation_id": "101", "selection": "all"}])
+        if path == "/api/v1/forges/github" and method == "PUT":
+            puts += 1
+            if puts == 1:
+                return 400, json.dumps({"error": {"message": "the secret is too short"}})
+            return 200, json.dumps({"forge": {"name": "github"}, "app": {"slug": "yard-127-0-0-1"}})
+        raise AssertionError(path)
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    monkeypatch.setattr(cli, "SETUP_POLL", 0.0)
+    opened: list = []
+    monkeypatch.setattr(cli.webbrowser, "open", _drive_manifest(opened))
+    monkeypatch.setattr(cli.urllib.request, "urlopen", _fake_conversion)
+    _env(monkeypatch)
+
+    with pytest.raises(SystemExit):
+        main(["forge", "setup", "github", "--text"])
+    err = capsys.readouterr().err
+    assert "the secret is too short" in err
+    assert "The key is kept in" in err
+    pending = cfg / "github-manifest.json"
+    saved = json.loads(pending.read_text())
+    assert stat.S_IMODE(pending.stat().st_mode) == 0o600
+    assert saved["pem"] == PEM and saved["app_id"] == "4242"
+
+    # The rerun goes straight to the PUT; the browser opens the install page only.
+    opened.clear()
+    monkeypatch.setattr(cli.webbrowser, "open", lambda url: opened.append(url))
+    main(["forge", "setup", "github", "--text"])
+    out = capsys.readouterr().out
+    assert "Finishing the app created at" in out
+    assert "saving its key in Yard" in out
+    assert "Done." in out
+    assert opened == ["https://github.com/apps/yard-127-0-0-1/installations/new"]
+    assert not pending.exists()
+    put = [call for call in calls if call[0] == "PUT"]
+    assert len(put) == 2
 
 
 def test_app_logs_builds_the_query(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
