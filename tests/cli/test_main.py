@@ -1,6 +1,7 @@
 import json
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -188,6 +189,229 @@ def test_app_deploy_a_sha_warns_on_a_push_trigger(monkeypatch: pytest.MonkeyPatc
     out = capsys.readouterr().out
     assert "The trigger is push: the next check deploys the tip again." in out
     assert "yard app set --trigger manual" in out
+
+
+class _TTY:
+    """sys.stdin for the confirmation tests."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+def _rm_api(page: dict, deleted: dict):
+    def fake_api_try(client, method, path, body, timeout=None):
+        base = path.split("?")[0]
+        if method == "GET" and base == "/api/v1/apps/heldso":
+            return 200, json.dumps(page)
+        if method == "DELETE" and base == "/api/v1/apps/heldso":
+            return 200, json.dumps(deleted)
+        raise AssertionError((method, path))
+
+    return fake_api_try
+
+
+_RM_PAGE = {
+    "app": {"name": "heldso"},
+    "env_file": "/srv/yard/apps/heldso/env",
+    "rows": [{"container": "heldso-app-1", "data": 1_200_000_000}],
+    "binds": [{"host": "heldso.example.com", "dial": "heldso-app-1:8000"}],
+    "deploys": [],
+    "log": "",
+}
+
+
+def test_app_rm_refuses_a_non_tty(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    _env(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(["app", "rm", "--app", "heldso", "--text"])
+    err = capsys.readouterr().err
+    assert "needs a confirmation" in err
+    assert "--yes" in err
+
+
+def test_app_rm_confirms_and_lists_the_binds_left(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    deleted = {
+        "name": "heldso",
+        "binds_removed": [],
+        "binds_left": [{"host": "heldso.example.com", "dial": "heldso-app-1:8000"}],
+    }
+    monkeypatch.setattr(cli, "_api_try", _rm_api(_RM_PAGE, deleted))
+    monkeypatch.setattr(sys, "stdin", _TTY())
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "heldso")
+    _env(monkeypatch)
+    main(["app", "rm", "--app", "heldso", "--text"])
+    out = capsys.readouterr().out
+    assert "This deletes the app heldso:" in out
+    assert "heldso-app-1" in out
+    assert "/srv/yard/apps/heldso/data (1.2GB)" in out
+    assert "These binds stay and will point at nothing:" in out
+    assert "heldso.example.com → heldso-app-1:8000" in out
+    assert "removed heldso" in out
+    assert "yard bind rm heldso.example.com" in out
+    assert "yard app rm --with-binds" in out
+
+
+def test_app_rm_a_wrong_answer_removes_nothing(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    calls = []
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        calls.append((method, path))
+        return 200, json.dumps(_RM_PAGE)
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    monkeypatch.setattr(sys, "stdin", _TTY())
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "other")
+    _env(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(["app", "rm", "--app", "heldso", "--text"])
+    assert "Not removed: you typed 'other', the app is 'heldso'" in capsys.readouterr().err
+    assert [call for call in calls if call[0] == "DELETE"] == []
+
+
+def test_app_rm_yes_with_binds(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    deleted = {
+        "name": "heldso",
+        "binds_removed": [{"host": "heldso.example.com", "dial": "heldso-app-1:8000"}],
+        "binds_left": [],
+    }
+    calls = []
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        calls.append((method, path))
+        return 200, json.dumps(deleted)
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    _env(monkeypatch)
+    main(["app", "rm", "--app", "heldso", "--yes", "--with-binds", "--text"])
+    assert calls == [("DELETE", "/api/v1/apps/heldso?binds=1")]
+    out = capsys.readouterr().out
+    assert "removed heldso" in out
+    assert "removed bind heldso.example.com → heldso-app-1:8000" in out
+
+
+def test_app_rm_warns_when_the_binds_are_unreadable(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    deleted = {"name": "heldso", "binds_removed": [], "binds_left": [], "binds_error": "caddy GET: no socket"}
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        return 200, json.dumps(deleted)
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    _env(monkeypatch)
+    main(["app", "rm", "--app", "heldso", "--yes", "--text"])
+    out = capsys.readouterr().out
+    assert "Could not read the binds: caddy GET: no socket" in out
+    assert "yard bind ls" in out
+
+
+def test_not_logged_in_points_at_login(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    monkeypatch.delenv("YARD_URL", raising=False)
+    monkeypatch.delenv("YARD_TOKEN", raising=False)
+    monkeypatch.setattr(cli, "config_path", lambda: Path("/nonexistent/yard/config.json"))
+    with pytest.raises(SystemExit):
+        main(["app", "ls", "--text"])
+    err = capsys.readouterr().err
+    assert "not logged in" in err
+    assert "yard login --url https://<your yard host> --token <token>" in err
+    assert "/srv/yard/tokens/admin.token" in err
+
+
+def test_api_unreachable_names_the_url(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    import urllib.error
+
+    def boom(request, timeout=None):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(cli.urllib.request, "urlopen", boom)
+    _env(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(["app", "ls", "--text"])
+    err = capsys.readouterr().err
+    assert "the Yard API at http://127.0.0.1:8000 did not answer: " in err
+    assert "yard login" in err
+    assert "sudo -u yard podman ps" in err
+
+
+def test_a_deploy_timeout_points_at_the_deploy_log(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    def boom(request, timeout=None):
+        raise TimeoutError
+
+    monkeypatch.setattr(cli.urllib.request, "urlopen", boom)
+    _env(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(["app", "deploy", "--app", "heldso", "--text"])
+    err = capsys.readouterr().err
+    assert "did not answer" in err
+    assert "The deploy may still be running" in err
+    assert "yard app logs --deploy --app heldso" in err
+
+
+def test_env_set_needs_key_value(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    _env(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(["env", "set", "notakey", "--app", "heldso", "--text"])
+    err = capsys.readouterr().err
+    assert "need KEY=VALUE, got notakey" in err
+    assert "Example: yard env set DATABASE_PATH=/data/app.sqlite3" in err
+
+
+def test_env_edit_an_editor_failure_saves_nothing(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    class _Proc:
+        returncode = 3
+
+    monkeypatch.setattr(cli, "_api_try", lambda *a, **k: (200, "{}"))
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: _Proc())
+    monkeypatch.setattr(sys, "stdin", _TTY())
+    _env(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(["env", "edit", "--app", "heldso", "--text"])
+    err = capsys.readouterr().err
+    assert "the editor exited with 3; nothing was saved" in err
+
+
+def test_app_deploy_failed_reads_the_log_hint(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    wrap = {
+        "app": {"name": "heldso", "trigger": "manual"},
+        "deploy": {"status": "failed", "image": "localhost/heldso:abc", "log": "== boom\n", "error": "apply exited 1"},
+    }
+    monkeypatch.setattr(cli, "_api_try", lambda *a, **k: (200, json.dumps(wrap)))
+    _env(monkeypatch)
+    main(["app", "deploy", "--app", "heldso", "--text"])
+    out = capsys.readouterr().out
+    assert "failed" in out
+    assert "Read the full log: yard app logs --deploy --app heldso" in out
+
+
+def test_app_deploy_reverted_explains_the_old_image(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    wrap = {
+        "app": {"name": "heldso", "trigger": "manual"},
+        "deploy": {
+            "status": "reverted",
+            "image": "localhost/heldso:abc",
+            "log": "",
+            "previous": "localhost/heldso:old",
+        },
+    }
+    monkeypatch.setattr(cli, "_api_try", lambda *a, **k: (200, json.dumps(wrap)))
+    _env(monkeypatch)
+    main(["app", "deploy", "--app", "heldso", "--text"])
+    out = capsys.readouterr().out
+    assert "The new container never got healthy, so the previous image still runs." in out
+    assert "yard app logs --deploy --app heldso, then yard app logs --app heldso" in out
+
+
+def test_app_deploy_a_server_500_keeps_the_log_hint(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    body = {
+        "error": {
+            "code": "deploy_failed",
+            "message": "apply exited 1",
+            "help": "Read the full log: yard app logs --deploy --app heldso",
+        }
+    }
+    monkeypatch.setattr(cli, "_api_try", lambda *a, **k: (500, json.dumps(body)))
+    _env(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(["app", "deploy", "--app", "heldso", "--text"])
+    assert "yard app logs --deploy --app heldso" in capsys.readouterr().err
 
 
 def test_app_new(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
@@ -582,7 +806,10 @@ def test_app_deduction_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, c
     monkeypatch.chdir(repo)
     with pytest.raises(SystemExit):
         cli._app_name(cli.Client("http://x", "t"), argparse_ns())
-    assert "--app" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "--app" in err
+    assert "no app follows https://origin.cursor.com/org/heldso dev" in err
+    assert "Create one here: yard app new" in err
 
 
 def test_forge_ls(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):

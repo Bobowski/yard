@@ -11,7 +11,7 @@ from datetime import timedelta
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
-from app.server import binds, journal, podman, status
+from app.server import binds, compose, journal, podman, status
 from app.server.forges import Forge
 from app.server.store import Config
 from app.shared import YardError, duration, format_bytes, parse
@@ -25,14 +25,15 @@ class Check:
     name: str
     ok: bool
     detail: str
+    warn: bool = False
 
 
 async def run(yard: Yard) -> list[Check]:
     config = yard.config
     checks = [
         _check("podman", await _podman(yard)),
-        _check("network yard", await _exists(yard, "network", "yard")),
-        _check("apply image", await _exists(yard, "image", "localhost/yard-apply")),
+        _check("network yard", await _exists(yard, "network", "yard", "rerun install.sh")),
+        _check("apply image", await _exists(yard, "image", "localhost/yard-apply", "rerun install.sh")),
     ]
 
     if not config.boot:
@@ -57,6 +58,7 @@ async def run(yard: Yard) -> list[Check]:
         checks.append(_check("journal", await _journal(yard)))
         checks.append(_check("container logs", await _container_logs(yard)))
         checks.append(_check("yard events", _yard_events(config)))
+        checks += await _healthchecks(yard)
         hosts = [row.host for row in found]
         yard_hosts = {row.host for row in found if _yard_dial(row.dial)}
     if config.boot:
@@ -67,6 +69,7 @@ async def run(yard: Yard) -> list[Check]:
             checks.append(_check(f"https {host}", await _https(host, path)))
 
     checks += await _forge_rows(yard)
+    checks.append(_check("prune", _prune(yard)))
     checks.append(_check("disk", await _disk(yard)))
     return checks
 
@@ -108,20 +111,21 @@ async def _forge_app(forge: Forge) -> tuple[bool, str]:
     try:
         body = await forge.get_app()
     except YardError as exc:
-        return False, str(exc)
+        return False, f"{exc}; check the app on {forge.host}"
     name = body.get("displayName") or body.get("display_name") or body.get("name") or ""
     return True, str(name) if name else "ok"
 
 
-async def _forge_installation(forge: Forge) -> tuple[bool, str]:
+async def _forge_installation(forge: Forge) -> tuple[bool, str] | tuple[bool, str, bool]:
     try:
         installation = await forge.find_installation()
     except YardError as exc:
-        return False, str(exc)
+        return False, f"{exc}; check the installation on {forge.host}"
     if installation is None:
-        return False, "no installation"
+        return False, "no installation; reinstall it from the forge app page"
     if forge.selection(installation) != "all":
-        return False, "selected repos only; new repos need a grant"
+        # A selected-repos install is legitimate; the user grants each new repo.
+        return True, "selected repos only; grant each new repo on the installation page", True
     target = installation.get("target")
     account = installation.get("account")
     slug = ""
@@ -136,7 +140,7 @@ async def _forge_token(forge: Forge) -> tuple[bool, str]:
     try:
         await forge.token()
     except YardError as exc:
-        return False, str(exc)
+        return False, f"{exc}; rerun yard forge setup {forge.name}"
     return True, "ok"
 
 
@@ -148,24 +152,24 @@ def _ago(stamp: str) -> str:
     return f"{duration(age)} ago"
 
 
-def _check(name: str, pair: tuple[bool, str]) -> Check:
-    ok, detail = pair
-    return Check(name, ok, detail)
+def _check(name: str, pair: tuple[bool, str] | tuple[bool, str, bool]) -> Check:
+    ok, detail, *warn = pair
+    return Check(name, ok, detail, bool(warn and warn[0]))
 
 
 async def _podman(yard: Yard) -> tuple[bool, str]:
     try:
         info = podman.parse_info(await yard.podman.run("info", "--format", "json"))
     except YardError as exc:
-        return False, str(exc)
+        return False, f"{exc}; run sudo -u yard podman info on the host"
     return True, f"podman {info.version}" if info.version else "podman"
 
 
-async def _exists(yard: Yard, kind: str, name: str) -> tuple[bool, str]:
+async def _exists(yard: Yard, kind: str, name: str, hint: str = "") -> tuple[bool, str]:
     try:
         await yard.podman.run(kind, "exists", name)
     except YardError:
-        return False, f"{name} missing"
+        return False, f"{name} missing" + (f"; {hint}" if hint else "")
     return True, f"{name} exists"
 
 
@@ -176,15 +180,17 @@ async def _caddy_up(yard: Yard) -> tuple[bool, str]:
     except YardError as exc:
         return False, str(exc)
     if found is None:
-        return False, "absent"
-    return (True, "running") if found.running else (False, f"{found.state} not running")
+        return False, "absent; rerun install.sh"
+    if not found.running:
+        return False, f"{found.state} not running; sudo -u yard podman start yard-caddy-1"
+    return True, "running"
 
 
 async def _caddy_admin(yard: Yard) -> tuple[bool, str]:
     try:
         await yard.caddy.request("GET", "/config/")
     except YardError as exc:
-        return False, str(exc)
+        return False, f"{exc}; sudo -u yard podman restart yard-caddy-1"
     return True, "ok"
 
 
@@ -192,7 +198,7 @@ async def _binds(yard: Yard) -> tuple[bool, str, list[binds.Bind]]:
     try:
         found = await binds.read(yard)
     except YardError as exc:
-        return False, str(exc), []
+        return False, f"{exc}; check the caddy admin row", []
     return True, f"{len(found)} routes", found
 
 
@@ -201,7 +207,7 @@ async def _podman_journald(yard: Yard) -> tuple[bool, str]:
     try:
         info = podman.parse_info(await yard.podman.run("info", "--format", "json"))
     except YardError as exc:
-        return False, str(exc)
+        return False, f"{exc}; check podman on the host"
     detail = f"logs {info.log_driver or 'unset'} · events {info.event_logger or 'unset'}"
     if info.log_driver != "journald" or info.event_logger != "journald":
         return False, f"{detail}; rerun install.sh"
@@ -214,9 +220,9 @@ def _yard_events(config: Config) -> tuple[bool, str]:
     try:
         mode = path.stat().st_mode
     except OSError:
-        return False, f"no socket at {path}; events fall back to stdout"
+        return False, f"no socket at {path}; events fall back to stdout; rerun install.sh"
     if not stat.S_ISSOCK(mode):
-        return False, f"{path} is not a socket"
+        return False, f"{path} is not a socket; rerun install.sh"
     return True, str(path)
 
 
@@ -224,7 +230,7 @@ async def _journal(yard: Yard) -> tuple[bool, str]:
     try:
         await journal.read(yard.config, [], lines=0)
     except YardError as exc:
-        return False, str(exc)
+        return False, f"{exc}; check journald on the host"
     return True, str(yard.config.journal_dir)
 
 
@@ -237,11 +243,76 @@ async def _container_logs(yard: Yard) -> tuple[bool, str]:
             return True, "0 containers"
         types = podman.parse_log_types(await yard.podman.run("inspect", *running))
     except YardError as exc:
-        return False, str(exc)
+        return False, f"{exc}; check podman on the host"
     stale = [name for name in running if types.get(name, "") != "journald"]
     if stale:
         return False, f"redeploy to switch: {', '.join(sorted(stale))}"
     return True, f"{len(running)} containers"
+
+
+async def _healthchecks(yard: Yard) -> list[Check]:
+    """One row per app container's HEALTHCHECK. The yard app has none on purpose."""
+    checks = []
+    for app in yard.store.list_apps():
+        if app.name == "yard":
+            continue
+        container = compose.app_container(app.name)
+        try:
+            found = podman.parse_health(await yard.podman.run("inspect", container, "--format", "json"))
+        except YardError:
+            continue  # no app container yet, or podman is down (its own row covers that)
+        health = found.get(container)
+        if health is not None:
+            checks.append(_healthcheck(app.name, container, health))
+    return checks
+
+
+def _healthcheck(app: str, container: str, health: podman.Healthcheck) -> Check:
+    """Absent or slow checks warn; a failing one fails."""
+    if health.status == "unhealthy":
+        return Check(f"healthcheck {app}", False, f"unhealthy; read yard logs {container}")
+    if not health.test or health.test == ["NONE"]:
+        return Check(
+            f"healthcheck {app}",
+            True,
+            "none; a broken build goes live. Add HEALTHCHECK to the Containerfile:"
+            " stario.dev/yard/compose#healthchecks",
+            warn=True,
+        )
+    if health.interval > 60_000_000_000:
+        return Check(
+            f"healthcheck {app}",
+            True,
+            f"every {_ns_text(health.interval)}; Podman runs the first check one interval"
+            " after start and a deploy waits 120 s, so use --interval=10s",
+            warn=True,
+        )
+    detail = f"every {_ns_text(health.interval)}"
+    if health.status:
+        detail += f" · {health.status}"
+    return Check(f"healthcheck {app}", True, detail)
+
+
+def _ns_text(nanos: int) -> str:
+    """A healthcheck interval: 10s, 5m. Whole minutes drop the 0s."""
+    seconds = nanos / 1e9
+    minutes, rest = divmod(seconds, 60)
+    if minutes and not rest:
+        return f"{int(minutes)}m"
+    return duration(timedelta(seconds=seconds))
+
+
+def _prune(yard: Yard) -> tuple[bool, str, bool]:
+    """The daily auto-prune. A failed run is a warning: `yard prune` still works by hand."""
+    days = yard.config.prune_days
+    if days <= 0:
+        return True, "off (YARD_PRUNE_DAYS=0); run yard prune by hand", False
+    base = f"daily, keeps {days} days"
+    if yard.last_prune_error:
+        return True, f"{base}; {yard.last_prune_error}", True
+    if not yard.last_prune:
+        return True, f"{base}; not run yet", False
+    return True, f"{base}; last {_ago(yard.last_prune)}, freed {format_bytes(yard.last_prune_freed)}", False
 
 
 def _yard_dial(dial: str) -> bool:
@@ -262,17 +333,17 @@ async def _https(host: str, path: str) -> tuple[bool, str]:
     try:
         line = await asyncio.to_thread(round_trip)
     except (OSError, ssl.SSLError) as exc:
-        return False, str(exc)
+        return False, f"{exc}; yard logs yard-caddy-1"
     if line.startswith(b"HTTP/"):
         return True, line.decode(errors="replace").strip()
-    return False, line.decode(errors="replace").strip() or "no answer"
+    return False, (line.decode(errors="replace").strip() or "no answer") + "; yard logs yard-caddy-1"
 
 
 async def _dns(host: str) -> tuple[bool, str]:
     try:
         found = await asyncio.to_thread(socket.getaddrinfo, host, 443)
     except OSError as exc:
-        return False, str(exc)
+        return False, f"{exc}; point the A record at this host"
     return True, str(found[0][4][0])
 
 
@@ -281,7 +352,7 @@ def _certificate(config: Config, host: str) -> tuple[bool, str]:
     root = config.caddy_data() / "caddy" / "certificates"
     found = list(root.glob(f"*/{host}/{host}.crt")) if root.is_dir() else []
     if not found:
-        return False, "not issued yet"
+        return False, "not issued yet; check dns, then yard logs yard-caddy-1"
     age = timedelta(seconds=max(0, time.time() - found[0].stat().st_mtime))
     return True, f"issued {duration(age)} ago"
 

@@ -62,6 +62,11 @@ class Forge:
     def installation_id(self) -> str:
         return str(self._state().get("installation_id") or "")
 
+    @property
+    def account(self) -> str:
+        """The owner the installation lives on: GitHub's account, Origin's target."""
+        return str(self._state().get("account") or "")
+
     def save(self, drop: Iterable[str] = (), **fields: str) -> None:
         """Merge fields into state.json. The write is atomic."""
         state = {**self._state(), **{key: value for key, value in fields.items() if value}}
@@ -71,6 +76,18 @@ class Forge:
 
     def connected(self) -> bool:
         return (self.dir / _KEY).is_file() and bool(self.app_id) and bool(self.installation_id)
+
+    def owns(self, repo: str) -> bool:
+        """True when the installation's account owns the repo's owner.
+
+        An empty account means the host installed before accounts were saved;
+        keep reporting as before so nothing regresses.
+        """
+        account = self.account
+        if not account:
+            return True
+        owner = urlsplit(repo).path.strip("/").split("/", 1)[0]
+        return owner.lower() == account.lower()
 
     def selection(self, installation: dict) -> str:
         """all or selected. Subclasses read their own field."""
@@ -135,7 +152,13 @@ class Forge:
         if not isinstance(found, list) or not found or not isinstance(found[0], dict):
             return None
         installation = found[0]
-        self.save(installation_id=str(installation.get("id") or ""))
+        account = _account(installation)
+        # A new installation can mean a new owner; a missing field clears the old one.
+        self.save(
+            installation_id=str(installation.get("id") or ""),
+            account=account,
+            drop=() if account else ("account",),
+        )
         return installation
 
     async def token(self) -> str:
@@ -185,7 +208,12 @@ class Origin(Forge):
             )
         key = serialization.load_pem_private_key(path.read_bytes(), password=None)
         if not isinstance(key, Ed25519PrivateKey):
-            raise YardError(502, "origin", "key.pem is not an Ed25519 key")
+            raise YardError(
+                502,
+                "origin",
+                "key.pem is not an Ed25519 key",
+                help_text="Delete the bad key.pem and run yard forge setup origin.",
+            )
         return key
 
     def summary(self) -> dict:
@@ -224,7 +252,7 @@ class Origin(Forge):
     async def connect(self, app_id: str) -> dict:
         """Save the app id only when GET /app answers for it and the existing key."""
         info = await self.get_app_for(app_id)
-        self.save(app_id=app_id, drop=("installation_id",))
+        self.save(app_id=app_id, drop=("installation_id", "account"))
         self._token = ""
         self._token_until = 0.0
         return info
@@ -280,7 +308,12 @@ class GitHub(Forge):
                 help_text="Run yard forge setup github.",
             ) from exc
         if not isinstance(key, rsa.RSAPrivateKey):
-            raise YardError(502, "github", "key.pem is not an RSA key")
+            raise YardError(
+                502,
+                "github",
+                "key.pem is not an RSA key",
+                help_text="Run yard forge setup github.",
+            )
         return key
 
     def _jwt(self, app_id: str, key: rsa.RSAPrivateKey) -> str:
@@ -320,15 +353,26 @@ class GitHub(Forge):
         if not app_id.isdigit():
             raise YardError(400, "bad_app", "the app id is digits", help_text="The App ID on the app page.")
         if len(private_key.encode()) > 16 * 1024:
-            raise YardError(400, "bad_key", "the private key is too large")
+            raise YardError(
+                400, "bad_key", "the private key is too large", help_text="Paste the key the app page gives."
+            )
         try:
             key = serialization.load_pem_private_key(private_key.encode(), password=None)
         except ValueError as exc:
-            raise YardError(400, "bad_key", "the private key does not parse") from exc
+            raise YardError(
+                400, "bad_key", "the private key does not parse", help_text="Paste the whole PEM, BEGIN to END."
+            ) from exc
         if not isinstance(key, rsa.RSAPrivateKey):
-            raise YardError(400, "bad_key", "the private key is not an RSA key")
+            raise YardError(
+                400, "bad_key", "the private key is not an RSA key", help_text="The app page gives an RSA key."
+            )
         if len(webhook_secret) < 32:
-            raise YardError(400, "bad_secret", "the webhook secret is too short")
+            raise YardError(
+                400,
+                "bad_secret",
+                "the webhook secret is too short",
+                help_text="At least 32 characters, from the app page.",
+            )
         body = await self._call("GET", "/app", self._jwt(app_id, key))
         info = body if isinstance(body, dict) else {}
         atomic_write(self.dir / _KEY, private_key if private_key.endswith("\n") else private_key + "\n")
@@ -336,7 +380,7 @@ class GitHub(Forge):
             app_id=app_id,
             slug=str(info.get("slug") or ""),
             webhook_secret=webhook_secret,
-            drop=("installation_id",),
+            drop=("installation_id", "account"),
         )
         self._token = ""
         self._token_until = 0.0
@@ -361,6 +405,17 @@ class GitHub(Forge):
         if target_url:
             body["target_url"] = target_url
         await self._call("POST", f"/repos/{full}/statuses/{sha}", await self.token(), body)
+
+
+def _account(installation: dict) -> str:
+    """GitHub answers account.login; Origin answers target.slug."""
+    account = installation.get("account")
+    if isinstance(account, dict) and account.get("login"):
+        return str(account["login"])
+    target = installation.get("target")
+    if isinstance(target, dict):
+        return str(target.get("slug") or "")
+    return ""
 
 
 def _b64(raw: bytes) -> str:

@@ -40,6 +40,7 @@ def _yard(
     ps: str = "[]",
     inspect: str = "[]",
     df: str = "",
+    prune_days: int = 7,
     journal_socket: Path | None = None,
 ) -> Yard:
     (tmp_path / "journal").mkdir(exist_ok=True)
@@ -53,6 +54,7 @@ def _yard(
         skip_deploy=True,
         boot=sock,
         remote=False,
+        prune_days=prune_days,
         journal_dir=tmp_path / "journal",
         journalctl_bin=str(journalctl),
         journal_socket=journal_socket or _journal_sock(),
@@ -174,7 +176,7 @@ def test_doctor_github_status_row(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     github = yard.forge_named("github")
 
     found = _run(yard)
-    assert found["github status"] == {"name": "github status", "ok": True, "detail": "none since boot"}
+    assert found["github status"] == {"name": "github status", "ok": True, "detail": "none since boot", "warn": False}
 
     github.last_report = now()
     found = _run(yard)
@@ -244,7 +246,7 @@ def test_doctor_disk_omits_missing_parts(tmp_path: Path, monkeypatch: pytest.Mon
 def test_doctor_skips_the_proxy_checks_without_a_host(tmp_path: Path):
     yard = _yard(tmp_path, sock=False)
     found = _run(yard)
-    assert found["caddy"] == {"name": "caddy", "ok": True, "detail": "skipped: no host"}
+    assert found["caddy"] == {"name": "caddy", "ok": True, "detail": "skipped: no host", "warn": False}
     assert found["caddy admin"]["ok"]
     assert found["caddy routes"]["ok"]
     assert not any(name.startswith("dns ") for name in found)
@@ -306,7 +308,7 @@ def test_doctor_routes_and_certificates(tmp_path: Path, monkeypatch: pytest.Monk
     found = _run(yard)
     assert found["caddy routes"]["detail"] == "1 routes"
     assert found["dns heldso.example.com"]["detail"] == "10.0.0.1"
-    assert found["certificate heldso.example.com"]["detail"] == "not issued yet"
+    assert found["certificate heldso.example.com"]["detail"] == "not issued yet; check dns, then yard logs yard-caddy-1"
     assert not found["certificate heldso.example.com"]["ok"]
 
     # The certificate file ages out of the not-issued state.
@@ -424,6 +426,121 @@ def test_doctor_flags_a_missing_journal_socket(tmp_path: Path):
     yard = _yard(tmp_path, ps=CADDY_PS, journal_socket=plain)
     found = _run(yard)
     assert "not a socket" in found["yard events"]["detail"]
+
+
+HEALTH_NONE = '[{"Name":"/heldso-app-1","Config":{"Healthcheck":{"Test":["NONE"]}},"State":{"Health":{}}}]'
+HEALTH_SLOW = (
+    '[{"Name":"/heldso-app-1","Config":{"Healthcheck":{"Test":["CMD-SHELL","curl -fs localhost:8000"],'
+    '"Interval":300000000000}},"State":{"Health":{"Status":"starting"}}}]'
+)
+HEALTH_BAD = (
+    '[{"Name":"/heldso-app-1","Config":{"Healthcheck":{"Test":["CMD-SHELL","curl -fs localhost:8000"],'
+    '"Interval":10000000000}},"State":{"Health":{"Status":"unhealthy"}}}]'
+)
+HEALTH_OK = (
+    '[{"Name":"/heldso-app-1","Config":{"Healthcheck":{"Test":["CMD-SHELL","curl -fs localhost:8000"],'
+    '"Interval":10000000000}},"State":{"Health":{"Status":"healthy"}}}]'
+)
+
+
+def _healthcheck_yard(tmp_path: Path, inspect: str) -> Yard:
+    yard = _yard(tmp_path, ps=CADDY_PS, inspect=inspect)
+    yard.store.create_app("heldso", "https://origin.cursor.com/org/app", "main")
+    return yard
+
+
+def test_doctor_warns_on_a_missing_healthcheck(tmp_path: Path):
+    found = _run(_healthcheck_yard(tmp_path, HEALTH_NONE))
+    row = found["healthcheck heldso"]
+    assert row["ok"] and row["warn"]
+    assert row["detail"].startswith("none; a broken build goes live")
+    assert "stario.dev/yard/compose#healthchecks" in row["detail"]
+
+
+def test_doctor_warns_on_a_slow_healthcheck(tmp_path: Path):
+    found = _run(_healthcheck_yard(tmp_path, HEALTH_SLOW))
+    row = found["healthcheck heldso"]
+    assert row["ok"] and row["warn"]
+    assert row["detail"].startswith("every 5m; Podman runs the first check one interval after start")
+    assert "use --interval=10s" in row["detail"]
+
+
+def test_doctor_fails_an_unhealthy_container(tmp_path: Path):
+    found = _run(_healthcheck_yard(tmp_path, HEALTH_BAD))
+    row = found["healthcheck heldso"]
+    assert row["ok"] is False
+    assert row["detail"] == "unhealthy; read yard logs heldso-app-1"
+
+
+def test_doctor_healthcheck_ok(tmp_path: Path):
+    found = _run(_healthcheck_yard(tmp_path, HEALTH_OK))
+    row = found["healthcheck heldso"]
+    assert row == {"name": "healthcheck heldso", "ok": True, "detail": "every 10s · healthy", "warn": False}
+
+
+def test_doctor_skips_the_yard_healthcheck(tmp_path: Path):
+    """The yard compose has no healthcheck on purpose, so it earns no row."""
+    yard = _yard(tmp_path, ps=CADDY_PS, inspect=HEALTH_OK)
+    yard.store.create_app("yard", "https://origin.cursor.com/org/yard", "main")
+    yard.store.create_app("heldso", "https://origin.cursor.com/org/app", "main")
+    found = _run(yard)
+    assert "healthcheck yard" not in found
+    assert found["healthcheck heldso"]["ok"]
+
+
+def test_doctor_skips_a_healthcheck_for_an_app_without_a_container(tmp_path: Path):
+    yard = _yard(tmp_path, ps=CADDY_PS, inspect="[]")
+    yard.store.create_app("heldso", "https://origin.cursor.com/org/app", "main")
+    found = _run(yard)
+    assert "healthcheck heldso" not in found
+
+
+def test_doctor_prune_row(tmp_path: Path):
+    yard = _yard(tmp_path)
+    found = _run(yard)
+    assert found["prune"]["detail"] == "daily, keeps 7 days; not run yet"
+
+    yard.last_prune = now()
+    yard.last_prune_freed = 1_200_000_000
+    found = _run(yard)
+    assert found["prune"]["detail"].startswith("daily, keeps 7 days; last ")
+    assert found["prune"]["detail"].endswith("ago, freed 1.2GB")
+    assert found["prune"]["warn"] is False
+
+    yard.last_prune_error = "podman is down"
+    found = _run(yard)
+    assert found["prune"]["ok"] and found["prune"]["warn"]
+    assert "podman is down" in found["prune"]["detail"]
+
+
+def test_doctor_prune_row_when_off(tmp_path: Path):
+    yard = _yard(tmp_path, prune_days=0)
+    found = _run(yard)
+    assert found["prune"]["detail"] == "off (YARD_PRUNE_DAYS=0); run yard prune by hand"
+    assert found["prune"]["warn"] is False
+
+
+def test_doctor_a_selected_installation_warns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A selected-repos install is legitimate; new repos just need a grant."""
+    yard = _yard(tmp_path, ps=CADDY_PS)
+    monkeypatch.setattr(GitHub, "connected", lambda self: True)
+
+    async def fake_app(self):
+        return {"name": "yard"}
+
+    async def fake_find(self):
+        return {"repository_selection": "selected", "account": {"login": "org"}}
+
+    async def fake_token(self):
+        return "tok"
+
+    monkeypatch.setattr(GitHub, "get_app", fake_app)
+    monkeypatch.setattr(GitHub, "find_installation", fake_find)
+    monkeypatch.setattr(GitHub, "token", fake_token)
+    found = _run(yard)
+    row = found["github installation"]
+    assert row["ok"] and row["warn"]
+    assert row["detail"] == "selected repos only; grant each new repo on the installation page"
 
 
 def test_doctor_flags_a_missing_journal(tmp_path: Path):

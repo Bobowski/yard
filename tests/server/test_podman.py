@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 
-from app.server.podman import parse_images, parse_info, parse_ps, parse_stats, parse_system_df
+from app.server.podman import parse_health, parse_images, parse_info, parse_ps, parse_stats, parse_system_df
 from app.shared import stamp as format_stamp
 
 
@@ -99,6 +99,26 @@ def test_parse_system_df():
     assert parse_system_df('{"Type":"Images","RawSize":1}') is None
     # Missing or non-numeric fields parse as zero.
     assert parse_system_df('[{"Type":"Images"}]') == (0, 0)
+
+
+def test_parse_health():
+    raw = (
+        '[{"Name":"/heldso-app-1","Config":{"Healthcheck":{"Test":["CMD-SHELL","curl -fs localhost:8000"],'
+        '"Interval":10000000000}},"State":{"Health":{"Status":"healthy"}}}]'
+    )
+    got = parse_health(raw)
+    assert got["heldso-app-1"].test == ["CMD-SHELL", "curl -fs localhost:8000"]
+    assert got["heldso-app-1"].interval == 10_000_000_000
+    assert got["heldso-app-1"].status == "healthy"
+
+    # No Healthcheck, or an OCI image that dropped it: empty test, no status.
+    bare = parse_health('[{"Name":"heldso-app-1","Config":{},"State":{}}]')
+    assert bare["heldso-app-1"].test == []
+    assert bare["heldso-app-1"].interval == 0
+    assert bare["heldso-app-1"].status == ""
+
+    assert parse_health("[]") == {}
+    assert parse_health("") == {}
 
 
 def test_format_stamp():

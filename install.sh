@@ -421,6 +421,27 @@ if [ -n "$domain" ]; then
 else
   echo "url: pass --domain to publish this host"
 fi
+
+# The yard app deploys Yard itself, but a fresh record has an empty repo and
+# `yard app deploy --app yard` fails until one is set. Point it at the install
+# origin, trigger manual. Best effort: the warning carries the fix command.
+app_url="http://127.0.0.1:${public_port}/api/v1/apps/yard"
+app_page="$(curl -fsS -H "Authorization: Bearer $token" "$app_url" 2>/dev/null || true)"
+# The first "repo" key is the app record's. Only an explicit empty value is
+# patched, so a re-install never overwrites a repo the user chose.
+repo_field="$(printf '%s' "$app_page" | grep -o '"repo": *"[^"]*"' | head -n 1 | tr -d ' ')"
+if [ -z "$app_page" ] || [ -z "$repo_field" ]; then
+  echo "warning: could not read the yard app record; its repo may be unset." >&2
+  echo "  Set it: yard app set --app yard --repo ${origin%.git}" >&2
+elif [ "$repo_field" = '"repo":""' ]; then
+  if curl -fsS -X PATCH -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+    -d "{\"repo\":\"${origin%.git}\"}" "$app_url" >/dev/null 2>&1; then
+    echo "repo: yard follows ${origin%.git} (manual; yard app deploy --app yard upgrades)"
+  else
+    echo "warning: could not set the yard repo." >&2
+    echo "  Set it: yard app set --app yard --repo ${origin%.git}" >&2
+  fi
+fi
 echo "local: http://127.0.0.1:8000"
 
 # Setup runs on the laptop, through the yard CLI.
@@ -428,4 +449,4 @@ echo ""
 echo "Next steps:"
 echo "  yard login --url https://${domain:-<domain>} --token <token>"
 echo "  yard forge setup origin    # or: yard forge setup github"
-echo "  yard app set --app yard --repo <host>/<owner>/yard --trigger push"
+echo "  yard app set --app yard --trigger push   # optional: upgrade Yard on every push to ${origin%.git}"

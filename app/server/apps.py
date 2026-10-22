@@ -66,8 +66,41 @@ def update(
     return app
 
 
-async def delete(yard: Yard, name: str, *, actor: str = "") -> None:
+@dataclass(slots=True)
+class Removed:
+    """What a delete did to the binds that dialed the app's containers."""
+
+    name: str
+    binds_removed: list[tuple[str, str]] = field(default_factory=list)
+    binds_left: list[tuple[str, str]] = field(default_factory=list)
+    binds_error: str = ""
+
+
+async def delete(yard: Yard, name: str, *, with_binds: bool = False, actor: str = "") -> Removed:
+    if name == "yard":
+        raise YardError(
+            400,
+            "forbidden",
+            "the yard app runs Yard itself",
+            help_text="To stop Yard, run: sudo -u yard podman stop yard-app-1 on the host.",
+        )
     app = yard.store.app(name)
+
+    # A bind that dials one of the app's containers points at nothing after
+    # this. Collect the names before the purge removes the containers.
+    names = {compose.app_container(name)}
+    try:
+        listed = podman.parse_ps(await yard.podman.run("ps", "-a", "--format", "json"))
+        names |= {item.name for item in listed.values() if item.app == name}
+    except YardError:
+        pass
+    app_binds: list[binds.Bind] = []
+    binds_error = ""
+    try:
+        app_binds = [bind for bind in await binds.read(yard) if bind.dial.split(":", 1)[0] in names]
+    except YardError as exc:
+        binds_error = exc.message
+
     project = compose.saved_project(yard.config, app)
     if project is not None:
         try:
@@ -80,6 +113,17 @@ async def delete(yard: Yard, name: str, *, actor: str = "") -> None:
     if directory.exists():
         shutil.rmtree(directory)
     journal.send(yard.config, "app.delete", f"app {name} deleted", app=name, actor=actor)
+
+    removed = Removed(name, binds_error=binds_error)
+    if binds_error:
+        return removed
+    if not with_binds:
+        removed.binds_left = [(bind.host, bind.dial) for bind in app_binds]
+        return removed
+    for bind in app_binds:
+        await binds.delete_bind(yard, bind.host, actor=actor)
+        removed.binds_removed.append((bind.host, bind.dial))
+    return removed
 
 
 @dataclass(slots=True)
@@ -157,7 +201,7 @@ async def deploy(
 
 async def report(forge: Forge, repo: str, sha: str, state: str, description: str, target_url: str = "") -> None:
     """Post a commit status. A failure logs and records; it never raises."""
-    if not forge.reports:
+    if not forge.reports or not forge.owns(repo):
         return
     try:
         await forge.report(repo, sha, state, description, target_url)
@@ -406,6 +450,25 @@ async def loop(yard: Yard) -> None:
                 await check_all(yard)
             except Exception as exc:
                 log.warning("check: %s", exc)
+    except asyncio.CancelledError:
+        return
+
+
+async def prune_loop(yard: Yard) -> None:
+    """The daily prune. The first run waits ten minutes so the boot deploys settle."""
+    try:
+        await asyncio.sleep(600)
+        while True:
+            try:
+                found = await prune(yard, yard.config.prune_days, False, actor="auto")
+            except Exception as exc:
+                log.warning("prune: %s", exc)
+                yard.last_prune_error = str(exc)
+            else:
+                yard.last_prune = now()
+                yard.last_prune_freed = found.freed
+                yard.last_prune_error = ""
+            await asyncio.sleep(24 * 3600)
     except asyncio.CancelledError:
         return
 

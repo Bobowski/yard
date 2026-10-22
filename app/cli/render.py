@@ -461,8 +461,12 @@ def format_doctor(checks: list[dict[str, Any]], color: bool = False) -> str:
         if not isinstance(check, dict):
             continue
         word = "ok" if check.get("ok") else "FAIL"
-        if not check.get("ok") and color:
+        if check.get("ok") and check.get("warn"):
+            word = "warn"
+        if word == "FAIL" and color:
             word = ansi(word, "31")
+        elif word == "warn" and color:
+            word = ansi(word, "33")
         lines.append(f"{word:<5}{str(check.get('name') or ''):<{width}}  {check.get('detail') or ''}")
     return "\n".join(lines) + ("\n" if lines else "")
 

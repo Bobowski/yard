@@ -165,8 +165,10 @@ async def test_find_installation_saves_the_id(api, tmp_path):
     found = await origin.find_installation()
     assert found is not None and found["id"] == "ins_1"
     assert origin.installation_id == "ins_1"
+    # Origin's target.slug is the account.
+    assert origin.account == "org"
     state = json.loads((tmp_path / "origin" / "state.json").read_text())
-    assert state == {"app_id": "app_1", "installation_id": "ins_1"}
+    assert state == {"app_id": "app_1", "account": "org", "installation_id": "ins_1"}
 
 
 async def test_repos_follows_the_page_token(api):
@@ -390,12 +392,19 @@ async def test_github_installation_saves_the_id(gh_api):
     found = await github.find_installation()
     assert found is not None and found["id"] == 101
     assert github.installation_id == "101"
+    # GitHub's account.login is the account.
+    assert github.account == "org"
     assert github.selection(found) == "all"
 
 
 async def test_github_connect_saves_after_the_check(gh_api, tmp_path):
     github, _box = gh_api
-    github.save(app_id="7", installation_id="99", webhook_secret="old-secret-old-secret-old-secret")
+    github.save(
+        app_id="7",
+        installation_id="99",
+        webhook_secret="old-secret-old-secret-old-secret",
+        account="org",
+    )
     pem = _rsa_pem()
     info = await github.connect("42", pem, SECRET)
     assert info["slug"] == "yard-host"
@@ -405,6 +414,8 @@ async def test_github_connect_saves_after_the_check(gh_api, tmp_path):
     assert state["slug"] == "yard-host"
     assert state["webhook_secret"] == SECRET
     assert "installation_id" not in state
+    # A new app drops the old installation's account too.
+    assert "account" not in state
     assert github.summary()["slug"] == "yard-host"
 
 
@@ -495,6 +506,21 @@ def test_reports_flags(tmp_path):
     assert Forge.reports is False
     assert Origin.reports is False
     assert GitHub.reports is True
+
+
+def test_owns_without_a_saved_account_allows_everything(tmp_path):
+    """Hosts installed before accounts existed keep today's behavior."""
+    github = GitHub(tmp_path / "github")
+    assert github.owns("https://github.com/Bobowski/yard")
+
+
+def test_owns_matches_the_url_owner_case_insensitively(tmp_path):
+    github = GitHub(tmp_path / "github")
+    github.save(account="org")
+    assert github.owns("https://github.com/org/yard")
+    assert github.owns("https://github.com/ORG/yard.git")
+    assert not github.owns("https://github.com/Bobowski/yard")
+    assert not github.owns("https://github.com/other/yard")
 
 
 async def test_github_report_posts_a_commit_status(gh_api, tmp_path):

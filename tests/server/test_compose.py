@@ -267,6 +267,22 @@ def test_install_sh_configures_journald():
     assert spec.count('!= "$containers_conf"') == 1
 
 
+def test_install_sh_points_the_yard_app_at_the_origin():
+    # ensure_host creates the yard app with repo ""; a fresh install PATCHes the
+    # install origin in, best effort, and keeps the trigger manual.
+    spec = (Path(__file__).resolve().parents[2] / "install.sh").read_text()
+    for part in (
+        "api/v1/apps/yard",
+        "-X PATCH",
+        '\\"repo\\":\\"${origin%.git}\\"',
+        "repo: yard follows ${origin%.git} (manual; yard app deploy --app yard upgrades)",
+        "yard app set --app yard --repo ${origin%.git}",
+        "yard app set --app yard --trigger push   # optional: upgrade Yard on every push to ${origin%.git}",
+    ):
+        assert part in spec
+    assert "jq" not in spec
+
+
 def test_install_sh_uses_the_distro_podman():
     # Ubuntu 26.04 LTS packages Podman 5.x; the static bundle is gone.
     spec = (Path(__file__).resolve().parents[2] / "install.sh").read_text()
