@@ -54,20 +54,22 @@ if [ "${ID:-}" != "ubuntu" ] || [ "${VERSION_ID:-}" != "26.04" ]; then
   echo "warning: Yard targets Ubuntu 26.04 LTS; this host is ${os_pretty}." >&2
 fi
 
-if ! command -v nft >/dev/null 2>&1 || ! command -v sudo >/dev/null 2>&1 || ! command -v newuidmap >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1 || ! command -v podman >/dev/null 2>&1; then
+if ! command -v nft >/dev/null 2>&1 || ! command -v sudo >/dev/null 2>&1 || ! command -v newuidmap >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1 || ! command -v podman >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
   if ! command -v apt-get >/dev/null 2>&1; then
-    die "nft, sudo, uidmap, git, and podman are required" \
+    die "nft, sudo, uidmap, git, podman, and curl are required" \
       "The script installs them with apt-get when that command exists." \
-      "Hint: install nftables, sudo, uidmap, git, and podman, then rerun this script."
+      "Hint: install nftables, sudo, uidmap, git, podman, and curl, then rerun this script."
   fi
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
   # uidmap gives rootless Podman newuidmap/newgidmap; acl gives setfacl for the
-  # traverse check; podman is the Ubuntu 26.04 package.
-  apt-get install -y nftables git ca-certificates sudo iproute2 procps uidmap acl podman
+  # traverse check; podman is the Ubuntu 26.04 package; curl writes the bind
+  # for --domain through the local API.
+  apt-get install -y nftables git ca-certificates sudo iproute2 procps uidmap acl podman curl
 fi
 command -v nft >/dev/null 2>&1 || die "nft is not installed" "Hint: apt-get install -y nftables"
 command -v podman >/dev/null 2>&1 || die "podman is not installed" "Hint: apt-get install -y podman"
+command -v curl >/dev/null 2>&1 || die "curl is not installed" "Hint: apt-get install -y curl"
 
 # Podman 4's compat API drops container labels on the list endpoint, so Compose
 # recreates every container on every up. The gate keeps the install on 5.x.
@@ -398,6 +400,23 @@ done
 token="$(cat "$root/tokens/admin.token")"
 echo "token: $token"
 if [ -n "$domain" ]; then
+  # --domain publishes Yard's own host: one bind through the local API.
+  # Caddy's admin socket can lag the token file, so the PUT retries.
+  bind_url="http://127.0.0.1:${public_port}/api/v1/binds/${domain}"
+  if ! retry 30 sh -c "curl -fsS -X PUT -H 'Authorization: Bearer $token' -H 'Content-Type: application/json' -d '{\"dial\":\"yard-app-1\"}' '$bind_url' >/dev/null 2>&1"; then
+    out="$(curl -sS -X PUT -H "Authorization: Bearer $token" -H 'Content-Type: application/json' -d '{"dial":"yard-app-1"}' "$bind_url" 2>&1 || true)"
+    die "Could not create the bind for ${domain}." \
+      "Yard answers locally, but writing the Caddy route failed." \
+      "Hint: yard bind set ${domain} yard-app-1" \
+      "Context: PUT ${bind_url} answered: ${out:-no output}"
+  fi
+  echo "bind: https://$domain -> yard-app-1"
+  # The bind is written; the certificate and DNS can still lag. Warn, not fail.
+  if ! retry 10 sh -c "curl -fsS -o /dev/null --max-time 5 'https://${domain}/health'"; then
+    echo "warning: https://${domain}/health did not answer yet." >&2
+    echo "  The bind is written. Caddy still needs DNS and a certificate." >&2
+    echo "  Check: curl -I https://${domain}/health" >&2
+  fi
   echo "url: https://$domain"
 else
   echo "url: pass --domain to publish this host"
