@@ -1,3 +1,4 @@
+import re
 from datetime import UTC, datetime, timedelta
 
 from app.cli.render import (
@@ -235,3 +236,49 @@ def test_format_doctor_marks_warnings():
     colored = format_doctor(checks, color=True)
     assert "\033[33mwarn\033[0m" in colored
     assert "\033[31mFAIL\033[0m" in colored
+
+
+def _plain(text: str) -> str:
+    return re.sub(r"\033\[[0-9;]*m", "", text)
+
+
+def test_colored_doctor_words_keep_the_padding():
+    checks = [
+        {"name": "podman", "ok": True, "detail": "podman 5.7.0", "warn": False},
+        {"name": "healthcheck heldso", "ok": True, "detail": "none", "warn": True},
+        {"name": "dns x", "ok": False, "detail": "no host", "warn": False},
+    ]
+    colored = format_doctor(checks, color=True)
+    # Once the escapes are stripped, every line aligns like the plain output.
+    assert _plain(colored) == format_doctor(checks)
+    # The escape wraps the word; the padding spaces stay outside it.
+    assert "\033[33mwarn\033[0m healthcheck" in colored
+    assert "\033[31mFAIL\033[0m dns" in colored
+
+
+def test_colored_table_cells_keep_the_padding():
+    report = status_report()
+    # "unhealthy 3h" is the widest state cell, "down" gets padding after it.
+    report["rows"][0]["health"] = "unhealthy"
+    report["rows"][1]["state"] = "absent"
+    colored = format_status(report, NOW, color=True)
+    assert _plain(colored) == format_status(report, NOW)
+    assert "\033[33munhealthy 2h\033[0m" in colored
+    assert "\033[31mdown\033[0m " in colored
+
+
+def test_colored_app_status_keeps_the_padding():
+    report = status_report()
+    row = report["rows"][0]
+    row["health"] = "unhealthy"
+    page = {
+        "app": {"name": "heldso", "repo": "heldso", "ref": "main", "trigger": "", "env": {}},
+        "env_file": "",
+        "rows": [row],
+        "binds": [],
+        "deploys": [],
+        "log": "",
+    }
+    colored = format_app_status(page, NOW, color=True)
+    assert _plain(colored) == format_app_status(page, NOW)
+    assert "\033[33munhealthy 2h\033[0m" in colored

@@ -11,6 +11,7 @@ from hypothesis import strategies as st
 from app.shared import (
     FORGE_HOSTS,
     YardError,
+    age,
     atomic_write,
     check_app_name,
     check_domain,
@@ -295,3 +296,11 @@ def test_ensure_file_keeps_an_existing_file(tmp_path: Path):
     ensure_file(path)
     assert path.read_text() == "A=1\n"
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_age():
+    assert age(0.5) == "now"
+    assert age(30) == "30s"
+    assert age(300) == "5m"
+    assert age(3 * 3600) == "3h"
+    assert age(15 * 86400) == "15d"

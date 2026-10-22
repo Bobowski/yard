@@ -388,16 +388,38 @@ def _cmd_app_new(args: argparse.Namespace) -> None:
     raw = _api(session, "POST", "/api/v1/apps", body)
     if host:
         _api(session, "PUT", f"/api/v1/binds/{quote(host, safe='')}", {"dial": f"{name}-app-1", "try": window})
-    if _json:
-        print(raw)
-        return
     wrap = _object(raw)
     app = wrap.get("app") if isinstance(wrap, dict) else None
-    if not isinstance(app, dict):
-        print(raw)
+    if args.no_deploy:
+        if _json:
+            print(raw)
+            return
+        if isinstance(app, dict):
+            print(format_record(json.dumps(app)), end="")
+        else:
+            print(raw)
+        print("Not deployed yet. Set its settings first if it needs any, then deploy:")
+        print(f"  yard env set KEY=VALUE --app {name}")
+        print(f"  yard app deploy --app {name}")
         return
-    print(format_record(json.dumps(app)), end="")
-    print(f"The app follows {repo} {ref}. A push to it deploys. Run yard app deploy to deploy now.")
+    if not _json:
+        if isinstance(app, dict):
+            print(format_record(json.dumps(app)), end="")
+        else:
+            print(raw)
+        print(f"Deploying {name} now…")
+    code, text = _api_try(session, "POST", f"/api/v1/apps/{quote(name)}/deploy", {}, DEPLOY_TIMEOUT)
+    if code >= 300:
+        _die(f"{name} was created, but the first deploy failed.\n" + (text if _json else explain(text)))
+    if _json:
+        print(text)
+        return
+    wrap2 = _object(text)
+    note = wrap2.get("deploy") if isinstance(wrap2, dict) else None
+    if isinstance(note, dict):
+        _print_deploy_note(note, name)
+    else:
+        print(text)
 
 
 def _cmd_app_set(args: argparse.Namespace) -> None:
@@ -424,7 +446,10 @@ def _cmd_app_set(args: argparse.Namespace) -> None:
         "ref" in patch and patch["ref"] != str(current.get("ref") or "")
     )
     if moved and str(app.get("trigger") or "") == "push":
-        print("The next check deploys it within 5 minutes. Run yard app deploy to deploy now.")
+        print(f"The next check deploys it within 5 minutes. Deploy now: yard app deploy --app {name}")
+    elif moved:
+        print(f"Saved. {name} still runs the old repo and ref until the next deploy.")
+        print(f"Deploy now: yard app deploy --app {name}")
     else:
         print("Saved.")
 
@@ -528,7 +553,7 @@ def _cmd_app_rm(args: argparse.Namespace) -> None:
         if not sys.stdin.isatty():
             _die("yard app rm deletes the app's data and needs a confirmation.\nRun it in a terminal, or pass --yes.")
         _rm_preview(session, name, args.with_binds)
-        answer = _ask("Type the app name to confirm: ")
+        answer = _ask("Type the app name to confirm: ", stopped="Not removed.")
         if answer != name:
             _die(f"Not removed: you typed '{answer}', the app is '{name}'.")
     path = f"/api/v1/apps/{quote(name)}" + ("?binds=1" if args.with_binds else "")
@@ -613,8 +638,9 @@ def _cmd_env_show(args: argparse.Namespace) -> None:
     print(format_env(env), end="")
 
 
-def _env_saved() -> None:
-    print("Saved. Run yard app deploy to apply.")
+def _env_saved(name: str) -> None:
+    print(f"Saved. {name} keeps its old settings until the next deploy.")
+    print(f"Apply now: yard app deploy --app {name}")
 
 
 def _cmd_env_set(args: argparse.Namespace) -> None:
@@ -630,7 +656,7 @@ def _cmd_env_set(args: argparse.Namespace) -> None:
     if _json:
         print(raw)
         return
-    _env_saved()
+    _env_saved(name)
 
 
 def _cmd_env_unset(args: argparse.Namespace) -> None:
@@ -641,7 +667,7 @@ def _cmd_env_unset(args: argparse.Namespace) -> None:
     if _json:
         print(raw)
         return
-    _env_saved()
+    _env_saved(name)
 
 
 def _cmd_env_edit(args: argparse.Namespace) -> None:
@@ -660,7 +686,7 @@ def _cmd_env_edit(args: argparse.Namespace) -> None:
     if _json:
         print(raw)
         return
-    _env_saved()
+    _env_saved(name)
 
 
 def _cmd_bind_set(args: argparse.Namespace) -> None:
@@ -740,12 +766,12 @@ def _normalize_path(text: str) -> str:
     return os.path.expanduser(text.replace("\\ ", " "))
 
 
-def _ask(prompt: str) -> str:
+def _ask(prompt: str, stopped: str = "stopped; run the command again to continue") -> str:
     """One wizard answer. EOF or Ctrl-C exits without a traceback."""
     try:
         return input(prompt).strip()
     except EOFError, KeyboardInterrupt:
-        _die("stopped; run the command again to continue")
+        _die(stopped)
 
 
 def _ask_key(key_flag: str) -> str:
@@ -1077,6 +1103,7 @@ def _app_parser(subs: argparse._SubParsersAction, common: argparse.ArgumentParse
     new.add_argument("--trigger", default="", help="push or manual")
     new.add_argument("--public", metavar="HOST", default="", help="a name on the public internet")
     new.add_argument("--try", dest="window", default=None, help="how long caddy waits for the upstream")
+    new.add_argument("--no-deploy", action="store_true", help="create the app without a first deploy")
     _add_app_flag(new, "the app name; the repo and branch give a default")
     new.set_defaults(func=_cmd_app_new)
 

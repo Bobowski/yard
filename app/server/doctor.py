@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 from app.server import binds, compose, journal, podman, status
 from app.server.forges import Forge
 from app.server.store import Config
-from app.shared import YardError, duration, format_bytes, parse
+from app.shared import YardError, age, duration, format_bytes, parse
 
 if TYPE_CHECKING:
     from app.server.yard import Yard
@@ -148,8 +148,12 @@ def _ago(stamp: str) -> str:
     moment = parse(stamp)
     if moment is None:
         return "none since boot"
-    age = timedelta(seconds=max(0, time.time() - moment.timestamp()))
-    return f"{duration(age)} ago"
+    return _since(time.time() - moment.timestamp())
+
+
+def _since(seconds: float) -> str:
+    text = age(max(0, seconds))
+    return "just now" if text == "now" else f"{text} ago"
 
 
 def _check(name: str, pair: tuple[bool, str] | tuple[bool, str, bool]) -> Check:
@@ -353,8 +357,7 @@ def _certificate(config: Config, host: str) -> tuple[bool, str]:
     found = list(root.glob(f"*/{host}/{host}.crt")) if root.is_dir() else []
     if not found:
         return False, "not issued yet; check dns, then yard logs yard-caddy-1"
-    age = timedelta(seconds=max(0, time.time() - found[0].stat().st_mtime))
-    return True, f"issued {duration(age)} ago"
+    return True, f"issued {_since(time.time() - found[0].stat().st_mtime)}"
 
 
 async def _disk(yard: Yard) -> tuple[bool, str]:

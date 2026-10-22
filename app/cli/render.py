@@ -200,6 +200,7 @@ def format_app_status(report: dict, now: datetime, *, color: bool = False) -> st
 
     # The id column shows only when a row carries one.
     has_id = any(row.get("id") for row in rows)
+    state_index = 2 if has_id else 1
     containers = _align(
         [
             [
@@ -212,6 +213,7 @@ def format_app_status(report: dict, now: datetime, *, color: bool = False) -> st
             for row in rows
         ],
         {3, 4} if has_id else {2, 3},
+        partial(_paint, state=state_index) if color else None,
     )
     lines += ["", "containers"] + [f"  {line}" for line in containers]
 
@@ -229,6 +231,7 @@ def format_app_status(report: dict, now: datetime, *, color: bool = False) -> st
                 for row in deploys
             ],
             {1, 2},
+            partial(_paint, deploy=0) if color else None,
         )
         lines += [f"  {line}" for line in shown]
     else:
@@ -243,18 +246,22 @@ def format_app_status(report: dict, now: datetime, *, color: bool = False) -> st
     return "\n".join(lines) + "\n"
 
 
-def _align(rows: list[list[str]], right: set[int]) -> list[str]:
+def _align(rows: list[list[str]], right: set[int], paint: Callable[[int, str], str] | None = None) -> list[str]:
     """Columns padded to the widest cell, like _render but without the header."""
     width = [0] * max((len(row) for row in rows), default=0)
     for row in rows:
         for index, cell in enumerate(row):
             width[index] = max(width[index], len(cell))
-    return [
-        "  ".join(
-            cell.rjust(width[index]) if index in right else cell.ljust(width[index]) for index, cell in enumerate(row)
-        ).rstrip()
-        for row in rows
-    ]
+    lines = []
+    for row in rows:
+        cells = []
+        for index, cell in enumerate(row):
+            text = cell.rjust(width[index]) if index in right else cell.ljust(width[index])
+            if paint is not None:
+                text = paint(index, text)
+            cells.append(text)
+        lines.append("  ".join(cells).rstrip())
+    return lines
 
 
 def format_apps(rows: list, *, color: bool = False) -> str:
@@ -414,11 +421,17 @@ def _render(
 
 
 def _paint(index: int, text: str, *, state: int = -1, deploy: int = -1) -> str:
+    """Color the word inside a padded cell; the padding stays outside the escape."""
+    code = ""
     if index == state:
-        return ansi(text, _attention(text.strip()))
-    if index == deploy:
-        return ansi(text, _deploy_attention(text.strip().split(" ", 1)[0]))
-    return text
+        code = _attention(text.strip())
+    elif index == deploy:
+        code = _deploy_attention(text.strip().split(" ", 1)[0])
+    if not code:
+        return text
+    head = len(text) - len(text.lstrip())
+    tail = len(text.rstrip())
+    return text[:head] + ansi(text[head:tail], code) + text[tail:]
 
 
 def _attention(state: str) -> str:
@@ -463,11 +476,13 @@ def format_doctor(checks: list[dict[str, Any]], color: bool = False) -> str:
         word = "ok" if check.get("ok") else "FAIL"
         if check.get("ok") and check.get("warn"):
             word = "warn"
+        # Pad the plain word first; the escape wraps the word, not the spaces.
+        cell = f"{word:<5}"
         if word == "FAIL" and color:
-            word = ansi(word, "31")
+            cell = ansi(word, "31") + cell[len(word) :]
         elif word == "warn" and color:
-            word = ansi(word, "33")
-        lines.append(f"{word:<5}{str(check.get('name') or ''):<{width}}  {check.get('detail') or ''}")
+            cell = ansi(word, "33") + cell[len(word) :]
+        lines.append(f"{cell}{str(check.get('name') or ''):<{width}}  {check.get('detail') or ''}")
     return "\n".join(lines) + ("\n" if lines else "")
 
 

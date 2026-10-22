@@ -425,6 +425,13 @@ def test_app_new(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture)
             )
         if path.startswith("/api/v1/binds/"):
             return 200, json.dumps({"host": "heldso.example.com", "dial": "web-app-1:8000", "state": "absent"})
+        if path == "/api/v1/apps/web/deploy":
+            return 200, json.dumps(
+                {
+                    "app": {"name": "web"},
+                    "deploy": {"status": "ok", "image": "localhost/web:abc", "log": "== started\n"},
+                }
+            )
         raise AssertionError(path)
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
@@ -457,8 +464,75 @@ def test_app_new(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture)
         "/api/v1/binds/heldso.example.com",
         {"dial": "web-app-1", "try": "30s"},
     )
+    # A new app deploys right away.
+    assert seen[2] == ("POST", "/api/v1/apps/web/deploy", {})
     out = capsys.readouterr().out
     assert "https://origin.cursor.com/org/heldso" in out
+    assert "Deploying web now…" in out
+    assert "ok  localhost/web:abc" in out
+    assert "Run yard app deploy to deploy now" not in out
+
+
+def test_app_new_no_deploy(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    seen: list[tuple] = []
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        seen.append((method, path, body))
+        return 200, json.dumps({"app": {"name": "heldso", "repo": body["repo"], "ref": body["ref"]}})
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    _env(monkeypatch)
+    main(["app", "new", "--text", "--repo", "https://origin.cursor.com/org/heldso", "--no-deploy"])
+    assert seen == [
+        ("POST", "/api/v1/apps", {"name": "heldso", "repo": "https://origin.cursor.com/org/heldso", "ref": "main"})
+    ]
+    out = capsys.readouterr().out
+    assert "Not deployed yet. Set its settings first if it needs any, then deploy:" in out
+    assert "  yard env set KEY=VALUE --app heldso" in out
+    assert "  yard app deploy --app heldso" in out
+
+
+def test_app_new_a_failed_deploy_keeps_the_app(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    def fake_api_try(client, method, path, body, timeout=None):
+        if path == "/api/v1/apps":
+            return 200, json.dumps({"app": {"name": "heldso"}})
+        if path == "/api/v1/apps/heldso/deploy":
+            return 500, json.dumps(
+                {
+                    "error": {
+                        "code": "deploy_failed",
+                        "message": "apply exited 1",
+                        "help": "Read the full log: yard app logs --deploy --app heldso",
+                    }
+                }
+            )
+        raise AssertionError(path)
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    _env(monkeypatch)
+    with pytest.raises(SystemExit) as caught:
+        main(["app", "new", "--text", "--repo", "https://origin.cursor.com/org/heldso"])
+    assert caught.value.code == 1
+    err = capsys.readouterr().err
+    assert "heldso was created, but the first deploy failed." in err
+    assert "apply exited 1" in err
+    assert "yard app logs --deploy --app heldso" in err
+
+
+def test_app_rm_ctrl_c_says_not_removed(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    monkeypatch.setattr(cli, "_api_try", lambda *a, **k: (200, json.dumps(_RM_PAGE)))
+    monkeypatch.setattr(sys, "stdin", _TTY())
+
+    def _interrupt(_prompt=""):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", _interrupt)
+    _env(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(["app", "rm", "--app", "heldso", "--text"])
+    err = capsys.readouterr().err
+    assert err.strip() == "Not removed."
+    assert "stopped" not in err
 
 
 def test_app_new_trigger(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
@@ -466,16 +540,18 @@ def test_app_new_trigger(monkeypatch: pytest.MonkeyPatch, capsys: pytest.Capture
 
     def fake_api_try(client, method, path, body, timeout=None):
         seen[(method, path)] = body
-        return 200, json.dumps(
-            {
-                "app": {
-                    "name": body["name"],
-                    "repo": body["repo"],
-                    "ref": body["ref"],
-                    "trigger": body.get("trigger", "push"),
+        if path == "/api/v1/apps":
+            return 200, json.dumps(
+                {
+                    "app": {
+                        "name": body["name"],
+                        "repo": body["repo"],
+                        "ref": body["ref"],
+                        "trigger": body.get("trigger", "push"),
+                    }
                 }
-            }
-        )
+            )
+        return 200, json.dumps({"deploy": {"status": "ok", "image": "localhost/app:dev", "log": ""}})
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
     _env(monkeypatch)
@@ -494,9 +570,11 @@ def test_app_new_ref_follows_the_checkout_repo(monkeypatch: pytest.MonkeyPatch, 
 
     def fake_api_try(client, method, path, body, timeout=None):
         seen[(method, path)] = body
-        return 200, json.dumps(
-            {"app": {"name": body["name"], "repo": body["repo"], "ref": body["ref"], "trigger": "push"}}
-        )
+        if path == "/api/v1/apps":
+            return 200, json.dumps(
+                {"app": {"name": body["name"], "repo": body["repo"], "ref": body["ref"], "trigger": "push"}}
+            )
+        return 200, json.dumps({"deploy": {"status": "ok", "image": "localhost/app:main", "log": ""}})
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
     _env(monkeypatch)
@@ -542,6 +620,7 @@ def test_app_set_message(monkeypatch: pytest.MonkeyPatch, capsys: pytest.Capture
     main(["app", "set", "--app", "heldso", "--ref", "dev", "--text"])
     out = capsys.readouterr().out
     assert "next check deploys it within 5 minutes" in out
+    assert "Deploy now: yard app deploy --app heldso" in out
 
     # A trigger change does not move the code.
     main(["app", "set", "--app", "heldso", "--trigger", "manual", "--text"])
@@ -551,9 +630,12 @@ def test_app_set_message(monkeypatch: pytest.MonkeyPatch, capsys: pytest.Capture
     main(["app", "set", "--app", "heldso", "--ref", "dev", "--text"])
     assert capsys.readouterr().out == "Saved.\n"
 
-    # A ref move on a manual app stays quiet too.
+    # A ref move on a manual app names the deploy command.
     main(["app", "set", "--app", "heldso", "--ref", "main", "--text"])
-    assert capsys.readouterr().out == "Saved.\n"
+    assert capsys.readouterr().out == (
+        "Saved. heldso still runs the old repo and ref until the next deploy.\n"
+        "Deploy now: yard app deploy --app heldso\n"
+    )
 
 
 def test_env_commands(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
@@ -582,7 +664,9 @@ def test_env_commands(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFix
 
     main(["env", "set", "B=2", "C=3", "--app", "heldso", "--text"])
     assert seen[("PATCH", "/api/v1/apps/heldso/env")] == {"B": "2", "C": "3"}
-    assert capsys.readouterr().out == "Saved. Run yard app deploy to apply.\n"
+    assert capsys.readouterr().out == (
+        "Saved. heldso keeps its old settings until the next deploy.\nApply now: yard app deploy --app heldso\n"
+    )
 
     main(["env", "unset", "A", "--app", "heldso", "--text"])
     assert seen[("PATCH", "/api/v1/apps/heldso/env")] == {"A": None}
@@ -760,7 +844,7 @@ def test_app_deduction_feature_branch_names_the_app(monkeypatch: pytest.MonkeyPa
             return 200, json.dumps(
                 {"app": {"name": body["name"], "repo": body["repo"], "ref": body["ref"], "trigger": "push"}}
             )
-        raise AssertionError(path)
+        return 200, json.dumps({"deploy": {"status": "ok", "image": "localhost/app:main", "log": ""}})
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
     _env(monkeypatch)

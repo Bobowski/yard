@@ -1,8 +1,10 @@
 import asyncio
 import collections
+import os
 import shutil
 import socket
 import tempfile
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -181,7 +183,7 @@ def test_doctor_github_status_row(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     github.last_report = now()
     found = _run(yard)
     assert found["github status"]["ok"]
-    assert found["github status"]["detail"].endswith("ago")
+    assert found["github status"]["detail"] == "just now"
 
     github.last_report_error = "github POST /repos/org/app/statuses/abc: 403 write access denied"
     found = _run(yard)
@@ -314,9 +316,16 @@ def test_doctor_routes_and_certificates(tmp_path: Path, monkeypatch: pytest.Monk
     # The certificate file ages out of the not-issued state.
     cert = yard.config.caddy_data() / "caddy" / "certificates" / "acme" / "heldso.example.com"
     cert.mkdir(parents=True)
-    (cert / "heldso.example.com.crt").write_text("pem")
+    issued = cert / "heldso.example.com.crt"
+    issued.write_text("pem")
     found = _run(yard)
     assert found["certificate heldso.example.com"]["ok"]
+
+    # The age uses the short form, not a span.
+    old = time.time() - 15 * 86400
+    os.utime(issued, (old, old))
+    found = _run(yard)
+    assert found["certificate heldso.example.com"]["detail"] == "issued 15d ago"
 
     # A removed route leaves the count at zero. The host checks stop with it.
     routes.clear()
@@ -504,7 +513,7 @@ def test_doctor_prune_row(tmp_path: Path):
     yard.last_prune_freed = 1_200_000_000
     found = _run(yard)
     assert found["prune"]["detail"].startswith("daily, keeps 7 days; last ")
-    assert found["prune"]["detail"].endswith("ago, freed 1.2GB")
+    assert found["prune"]["detail"].endswith("just now, freed 1.2GB")
     assert found["prune"]["warn"] is False
 
     yard.last_prune_error = "podman is down"
