@@ -1,14 +1,18 @@
 """The `yard` argument tree and the entry point. One function per command; `main` dispatches."""
 
 import argparse
+import html
+import http.server
 import json
 import os
+import queue
 import re
 import secrets
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -17,7 +21,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NoReturn
-from urllib.parse import quote, unquote, urlencode, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 
 from app import package_version
 from app.cli.render import (
@@ -847,7 +851,7 @@ def _setup_origin(session: Client, args: argparse.Namespace) -> None:
 
 
 def _setup_github(session: Client, args: argparse.Namespace) -> None:
-    """Connect to GitHub: the key and the webhook secret come from the user."""
+    """Connect to GitHub: shared checks, then the manifest form or --manual."""
     parts = urlsplit(session.url)
     if parts.scheme == "http" and parts.hostname not in {"127.0.0.1", "::1", "localhost"}:
         _die("refusing to send the private key over http; log in with an https url")
@@ -868,7 +872,209 @@ def _setup_github(session: Client, args: argparse.Namespace) -> None:
         _poll_installation(session, "github")
         print("Done.")
         return
+    if args.manual:
+        _setup_github_manual(session, args)
+    else:
+        _setup_github_manifest(session, args)
 
+
+def _pending_manifest(path: Path, url: str) -> dict:
+    """A saved manifest app for this host, or an empty dict."""
+    try:
+        raw = json.loads(path.read_text())
+    except OSError, json.JSONDecodeError:
+        return {}
+    if not isinstance(raw, dict) or raw.get("url") != url:
+        return {}
+    return raw if isinstance(raw.get("pem"), str) else {}
+
+
+def _manifest_page(session: Client, args: argparse.Namespace, base: str, state: str) -> str:
+    """The local page that posts the app manifest to GitHub."""
+    host = urlsplit(session.url).hostname or "host"
+    manifest = {
+        "name": f"yard-{host}"[:34],
+        "url": session.url,
+        "hook_attributes": {"url": f"{session.url}/hooks/github", "active": True},
+        "redirect_url": f"{base}/callback",
+        "public": False,
+        "default_permissions": {"contents": "read", "statuses": "write", "metadata": "read"},
+        "default_events": ["push"],
+    }
+    action = (
+        f"https://github.com/organizations/{quote(str(args.org))}/settings/apps/new"
+        if args.org
+        else "https://github.com/settings/apps/new"
+    )
+    action = f"{action}?state={quote(state)}"
+    return (
+        "<!doctype html><title>yard forge setup</title>"
+        "<p>GitHub creates the Yard app and sends its ID, private key, "
+        "and webhook secret back to this computer.</p>"
+        f'<form method="post" action="{html.escape(action, quote=True)}">'
+        f'<input type="hidden" name="manifest" '
+        f'value="{html.escape(json.dumps(manifest), quote=True)}">'
+        '<button type="submit">Create the GitHub App</button></form>'
+        "<script>document.forms[0].submit()</script>"
+    )
+
+
+class _ManifestServer(http.server.ThreadingHTTPServer):
+    """Carries the run state the handler reads: the page, the state token, the code slot."""
+
+    manifest_page = ""
+    manifest_state = ""
+    manifest_code: queue.Queue[str]
+
+
+class _ManifestHandler(http.server.BaseHTTPRequestHandler):
+    """Serves the manifest page at / and catches GitHub's code at /callback."""
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        """No access log."""
+
+    def _page(self, status: int, body: str) -> None:
+        raw = body.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self) -> None:
+        parsed = urlsplit(self.path)
+        if parsed.path == "/":
+            self._page(200, str(getattr(self.server, "manifest_page", "")))
+            return
+        if parsed.path == "/callback":
+            params = dict(parse_qsl(parsed.query))
+            code = str(params.get("code") or "")
+            if params.get("state") != getattr(self.server, "manifest_state", "") or not code:
+                self._page(400, "<p>This link does not belong to this setup run. Go back to the terminal.</p>")
+                return
+            got = getattr(self.server, "manifest_code", None)
+            if isinstance(got, queue.Queue):
+                got.put(code)
+            self._page(
+                200,
+                "<p>GitHub created the app. Go back to the terminal; it saves the key and opens the install page.</p>",
+            )
+            return
+        self._page(404, "<p>not found</p>")
+
+
+def _manifest_exchange(session: Client, code: str, pending_path: Path) -> dict:
+    """Trade GitHub's one-time code for the app ID, key, and secret; keep a copy on disk."""
+    request = urllib.request.Request(
+        f"https://api.github.com/app-manifests/{quote(code)}/conversions",
+        data=b"",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "yard",
+        },
+        method="POST",
+    )
+    again = "The code works once and for one hour. Run the command again."
+    try:
+        with urllib.request.urlopen(request) as response:
+            reply = json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        body = exc.read()[:400].decode("utf-8", errors="replace")
+        _die(f"GitHub answered {exc.code}: {body}\n{again}")
+    except urllib.error.URLError as exc:
+        _die(f"GitHub did not answer: {exc.reason}\n{again}")
+    if not isinstance(reply, dict) or not isinstance(reply.get("pem"), str):
+        _die(f"GitHub's answer had no key in it. {again}")
+    app = {
+        "url": session.url,
+        "app_id": str(reply.get("id") or ""),
+        "slug": str(reply.get("slug") or ""),
+        "pem": str(reply.get("pem") or ""),
+        "webhook_secret": str(reply.get("webhook_secret") or ""),
+        "html_url": str(reply.get("html_url") or ""),
+        "created": datetime.now(UTC).isoformat(timespec="seconds"),
+    }
+    atomic_write(pending_path, json.dumps(app, indent=2) + "\n")
+    return app
+
+
+def _manifest_run(session: Client, args: argparse.Namespace, pending_path: Path) -> dict:
+    """Serve the manifest page locally until GitHub sends the code back, then exchange it."""
+    state = secrets.token_urlsafe(24)
+    got: queue.Queue[str] = queue.Queue()
+    server = _ManifestServer(("127.0.0.1", 0), _ManifestHandler)
+    server.manifest_state = state
+    server.manifest_code = got
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    server.manifest_page = _manifest_page(session, args, base, state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        print("Opening the GitHub App form. Keep the name or change it, then click Create GitHub App.")
+        _open(args, base + "/")
+        if getattr(args, "no_browser", False):
+            print("Open it in a browser on this computer; GitHub sends you back to it.")
+        try:
+            code = got.get(timeout=SETUP_LIMIT)
+        except queue.Empty:
+            _die("No answer from GitHub in ten minutes. Run the command again.")
+        except EOFError, KeyboardInterrupt:
+            _die("stopped; run the command again to continue")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+    return _manifest_exchange(session, code, pending_path)
+
+
+def _save_github_app(session: Client, app: dict, pending_path: Path) -> dict:
+    """PUT the app credentials to Yard. The file keeps them until the PUT lands."""
+    code, text = _api_try(
+        session,
+        "PUT",
+        "/api/v1/forges/github",
+        {
+            "app_id": str(app.get("app_id") or ""),
+            "private_key": str(app.get("pem") or ""),
+            "webhook_secret": str(app.get("webhook_secret") or ""),
+        },
+    )
+    if code >= 300:
+        detail = text if _json else explain(text)
+        _die(f"{detail}\nThe key is kept in {pending_path}; run the command again to retry.")
+    pending_path.unlink(missing_ok=True)
+    wrap = _object(text)
+    saved = wrap.get("app") if isinstance(wrap, dict) else None
+    return saved if isinstance(saved, dict) else {}
+
+
+def _setup_github_manifest(session: Client, args: argparse.Namespace) -> None:
+    """The manifest form: GitHub makes the key and the webhook secret itself."""
+    pending_path = config_path().parent / "github-manifest.json"
+    if args.new:
+        pending_path.unlink(missing_ok=True)
+        app = {}
+    else:
+        app = _pending_manifest(pending_path, session.url)
+    if app:
+        print(f"Finishing the app created at {app.get('created')}: saving its key in Yard.")
+    else:
+        app = _manifest_run(session, args, pending_path)
+    saved = _save_github_app(session, app, pending_path)
+    slug = str(app.get("slug") or saved.get("slug") or "")
+    html_url = str(app.get("html_url") or "")
+    print("Install the app on your account and pick the repos Yard may deploy.")
+    _open(
+        args,
+        f"{html_url}/installations/new" if html_url else f"https://github.com/apps/{slug}/installations/new",
+    )
+    _poll_installation(session, "github")
+    print("Done.")
+
+
+def _setup_github_manual(session: Client, args: argparse.Namespace) -> None:
+    """Connect to GitHub: the key and the webhook secret come from the user."""
     pending_path = config_path().parent / "github-setup.json"
     pending = {} if args.new else _pending_setup(pending_path, session.url)
     secret = str(pending.get("secret")) if pending else secrets.token_hex(32)
@@ -878,7 +1084,7 @@ def _setup_github(session: Client, args: argparse.Namespace) -> None:
     print(f"webhook secret: {secret}")
     print("Paste this as the webhook secret.")
     print()
-    host = parts.hostname or "host"
+    host = urlsplit(session.url).hostname or "host"
     base = (
         f"https://github.com/organizations/{quote(str(args.org))}/settings/apps/new"
         if args.org
@@ -1144,6 +1350,7 @@ def _forge_parser(subs: argparse._SubParsersAction, common: argparse.ArgumentPar
     setup = subs.add_parser("setup", help="connect this host to a forge", parents=[common])
     setup.add_argument("forge", choices=["origin", "github"], help="the forge")
     setup.add_argument("--key", default="", help="the GitHub app private key PEM")
+    setup.add_argument("--manual", action="store_true", help="paste an App ID and key instead of the one-click form")
     setup.add_argument("--org", default="", help="create the GitHub app in this organization")
     setup.add_argument("--no-browser", action="store_true", help="print the links; open nothing")
     setup.add_argument("--new", action="store_true", help="start the GitHub setup over with a fresh secret")
