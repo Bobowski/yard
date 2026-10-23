@@ -3,8 +3,7 @@ import hmac
 import json
 import stat
 
-from app.server import apps, binds, caddy, journal
-from app.server import apps as apps_mod
+from app.server import apps, binds, caddy, journal, sources
 from app.server.caddy import Caddy
 from app.server.forges import GitHub, Origin
 from app.server.podman import Podman
@@ -921,14 +920,13 @@ async def test_app_files_route(yard, tmp_path):
 
 
 async def test_image_and_recipe_apps(yard, monkeypatch, tmp_path):
-    from app.server import apps as apps_mod
 
     client, token, _root = yard
 
     async def fake_fetch(url):
         return b"# port: 3000\nservices:\n  app:\n    image: x\n    networks:\n      - yard\n"
 
-    monkeypatch.setattr(apps_mod, "fetch_recipe", fake_fetch)
+    monkeypatch.setattr(sources, "fetch_recipe", fake_fetch)
     res = await client.post(
         "/api/v1/apps",
         json={"name": "db", "image": "postgres:17"},
@@ -985,7 +983,7 @@ async def test_cat_source_apps(yard, tmp_path, monkeypatch):
     async def fake_fetch(url):
         return b"services: {}\n"
 
-    monkeypatch.setattr(apps_mod, "fetch_recipe", fake_fetch)
+    monkeypatch.setattr(sources, "fetch_recipe", fake_fetch)
     await client.post(
         "/api/v1/apps", json={"name": "umami", "recipe": "https://example.com/x.yml"}, headers=auth(token)
     )
@@ -999,3 +997,26 @@ async def test_cat_source_apps(yard, tmp_path, monkeypatch):
     res = await client.get("/api/v1/apps/umami/files/compose", headers=auth(token))
     assert res.status_code == 200
     assert res.text == "services: {}\n"
+
+
+async def test_page_record_is_the_record():
+    """app on the status page is the record; the running image and sha are top level."""
+    from app.server.api import page_json
+    from app.server.status import Page
+    from app.server.store import App
+
+    page = Page(
+        app=App("heldso", "https://github.com/org/heldso", "main", "push", "t", containerfile="Dockerfile"),
+        image="localhost/heldso:abc1234",
+        sha="abc1234",
+        env_file="/env",
+        rows=[],
+        binds=[],
+        deploys=[],
+        log="",
+    )
+    data = page_json(page)
+    assert data["app"]["image"] == ""
+    assert data["app"]["containerfile"] == "Dockerfile"
+    assert data["image"] == "localhost/heldso:abc1234"
+    assert data["sha"] == "abc1234"

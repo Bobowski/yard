@@ -1,4 +1,4 @@
-"""A public image's manifest digest. HEAD over the registry HTTP API, anonymous tokens only."""
+"""Outside sources: a registry manifest digest, or a recipe file over https."""
 
 import asyncio
 import json
@@ -16,14 +16,19 @@ _ACCEPT = (
 _TIMEOUT = 30
 
 
-def fetch(url: str, method: str, headers: dict[str, str]) -> tuple[int, dict[str, str], bytes]:
-    """One request, the code/headers/body tuple. Replaced by tests."""
+_RECIPE_MAX = 256 * 1024
+
+
+def fetch(url: str, method: str, headers: dict[str, str], *, code: str = "source") -> tuple[int, dict[str, str], bytes]:
+    """One request, the code/headers/body tuple. Replaced by tests. Connection errors are YardError."""
     req = urllib.request.Request(url, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=_TIMEOUT) as res:
-            return res.status, dict(res.headers), res.read()
+            return res.status, dict(res.headers), res.read(_RECIPE_MAX + 1)
     except urllib.error.HTTPError as exc:
         return exc.code, dict(exc.headers), exc.read()
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise YardError(502, code, f"{url}: {getattr(exc, 'reason', exc)}") from exc
 
 
 def _parse(ref: str) -> tuple[str, str, str]:
@@ -47,14 +52,14 @@ def _parse(ref: str) -> tuple[str, str, str]:
 async def digest(ref: str) -> str:
     """The sha256: digest for a ref. A ref already pinned by digest needs no request."""
     if "@" in ref:
-        return ref.split("@", 1)[1] if ref.split("@", 1)[1].startswith("sha256:") else "sha256:" + ref.split("@", 1)[1]
+        return ref.rsplit("@", 1)[1]
     host, repo, tag = _parse(ref)
     url = f"https://{host}/v2/{repo}/manifests/{tag}"
-    code, headers, _body = await asyncio.to_thread(fetch, url, "HEAD", {"Accept": _ACCEPT})
+    code, headers, _body = await asyncio.to_thread(fetch, url, "HEAD", {"Accept": _ACCEPT}, code="registry")
     if code == 401:
         token = await _token(headers, ref)
         auth = {"Accept": _ACCEPT, "Authorization": f"Bearer {token}"}
-        code, headers, _body = await asyncio.to_thread(fetch, url, "HEAD", auth)
+        code, headers, _body = await asyncio.to_thread(fetch, url, "HEAD", auth, code="registry")
     if code == 404:
         raise YardError(502, "registry", f"{ref}: not found", help_text="tag not found")
     if code >= 300:
@@ -72,7 +77,7 @@ async def _token(headers: dict[str, str], ref: str) -> str:
     if not realm.startswith("https://"):
         raise YardError(502, "registry", f"{ref}: cannot answer the registry's auth challenge")
     query = urllib.parse.urlencode({"service": params.get("service", ""), "scope": params.get("scope", "")})
-    code, _h, body = await asyncio.to_thread(fetch, f"{realm}?{query}", "GET", {})
+    code, _h, body = await asyncio.to_thread(fetch, f"{realm}?{query}", "GET", {}, code="registry")
     if code >= 300:
         raise YardError(502, "registry", f"{ref}: the token service answered HTTP {code}")
     try:
@@ -82,3 +87,28 @@ async def _token(headers: dict[str, str], ref: str) -> str:
     if not token:
         raise YardError(502, "registry", f"{ref}: the token service sent no token")
     return token
+
+
+# --- recipe fetching (moved from apps.py) -----------------------------------
+
+
+def _fetch_recipe(url: str) -> bytes:
+    """The recipe body: https only, redirects stay on https, at most 256 KiB."""
+    for _ in range(6):
+        code, headers, body = fetch(url, "GET", {}, code="recipe")
+        if code in (301, 302, 303, 307, 308):
+            location = headers.get("Location") or headers.get("location") or ""
+            if not location.startswith("https://"):
+                raise YardError(502, "recipe", f"{url}: redirect to {location or 'nowhere'} is not https")
+            url = location
+            continue
+        if code >= 300:
+            raise YardError(502, "recipe", f"{url}: HTTP {code}")
+        if len(body) > _RECIPE_MAX:
+            raise YardError(502, "recipe", "recipe is larger than 256 KiB")
+        return body
+    raise YardError(502, "recipe", f"{url}: too many redirects")
+
+
+async def fetch_recipe(url: str) -> bytes:
+    return await asyncio.to_thread(_fetch_recipe, url)

@@ -180,12 +180,12 @@ def format_app_status(report: dict, now: datetime, *, color: bool = False) -> st
     lines = [name]
     rows = [row for row in report.get("rows") or [] if isinstance(row, dict)]
 
-    sha = str(record.get("sha") or "")
+    sha = str(report.get("sha") or "")
     tip = next((str(row.get("tip") or "") for row in rows if row.get("tip")), "")
     rev = f"rev {_short(sha)}" if sha else ""
     if tip and _short(tip) != _short(sha):
         rev += f" · tip {_short(tip)}"
-    image = str(record.get("image") or "")
+    image = str(report.get("image") or "")
     if image:
         rev += f" · image {image}"
     trigger = str(record.get("trigger") or "")
@@ -195,7 +195,7 @@ def format_app_status(report: dict, now: datetime, *, color: bool = False) -> st
         lines.append(rev)
     data = max((int(row.get("data") or 0) for row in rows), default=0)
     lines.append(f"data {format_bytes(data)} · env {report.get('env_file') or ''}")
-    for field in ("containerfile", "compose", "recipe"):
+    for field in ("containerfile", "compose", "image", "recipe"):
         if str(record.get(field) or ""):
             lines.append(f"{field}  {record[field]}")
 

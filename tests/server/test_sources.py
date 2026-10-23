@@ -1,8 +1,8 @@
-"""registry.digest: ref parsing, anonymous tokens, and the failure modes."""
+"""sources: manifest digests, recipe fetches, and the failure modes."""
 
 import pytest
 
-from app.server import registry
+from app.server import sources
 from app.shared import YardError
 
 
@@ -10,7 +10,7 @@ def _fake(calls, responses):
     async def _no():
         raise AssertionError("unused")
 
-    def fetch(url, method, headers):
+    def fetch(url, method, headers, **_kw):
         calls.append((url, method, dict(headers)))
         item = responses.pop(0)
         if isinstance(item, Exception):
@@ -35,8 +35,8 @@ async def test_docker_hub_normalization(monkeypatch):
         (200, {}, b'{"token":"tok"}'),
         (200, digest_headers, b""),
     ]
-    monkeypatch.setattr(registry, "fetch", _fake(calls, responses))
-    found = await registry.digest("postgres:17")
+    monkeypatch.setattr(sources, "fetch", _fake(calls, responses))
+    found = await sources.digest("postgres:17")
     assert found == "sha256:" + "a" * 64
     assert calls[0][0] == "https://registry-1.docker.io/v2/library/postgres/manifests/17"
     assert calls[1][0].startswith("https://auth.docker.io/token?")
@@ -45,19 +45,19 @@ async def test_docker_hub_normalization(monkeypatch):
 
 async def test_ghcr_host_kept_and_no_auth(monkeypatch):
     calls = []
-    monkeypatch.setattr(registry, "fetch", _fake(calls, [(200, {"Docker-Content-Digest": "sha256:" + "b" * 64}, b"")]))
-    found = await registry.digest("ghcr.io/you/api:1.4")
+    monkeypatch.setattr(sources, "fetch", _fake(calls, [(200, {"Docker-Content-Digest": "sha256:" + "b" * 64}, b"")]))
+    found = await sources.digest("ghcr.io/you/api:1.4")
     assert found == "sha256:" + "b" * 64
     assert calls[0][0] == "https://ghcr.io/v2/you/api/manifests/1.4"
 
 
 async def test_pinned_ref_needs_no_request(monkeypatch):
-    monkeypatch.setattr(registry, "fetch", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no request")))
-    assert await registry.digest("postgres@sha256:" + "c" * 64) == "sha256:" + "c" * 64
+    monkeypatch.setattr(sources, "fetch", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no request")))
+    assert await sources.digest("postgres@sha256:" + "c" * 64) == "sha256:" + "c" * 64
 
 
 async def test_404_is_tag_not_found(monkeypatch):
     calls = []
-    monkeypatch.setattr(registry, "fetch", _fake(calls, [(404, {}, b"")]))
+    monkeypatch.setattr(sources, "fetch", _fake(calls, [(404, {}, b"")]))
     with pytest.raises(YardError, match="not found"):
-        await registry.digest("postgres:999")
+        await sources.digest("postgres:999")

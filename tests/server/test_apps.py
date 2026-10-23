@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from app.server import apps, compose, git, journal, main
+from app.server import apps, compose, git, journal, main, sources
 from app.server.forges import Forge, GitHub, Origin
 from app.server.podman import Podman
 from app.server.store import Config, Store
@@ -990,7 +990,6 @@ async def test_deploy_containerfile_yard_missing_fails(tmp_path: Path, monkeypat
 
 
 async def test_deploy_image_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    from app.server import registry
 
     yard = make_yard(tmp_path, skip=False)
     yard.store.create_app("db", "", image="postgres:17")
@@ -1000,7 +999,7 @@ async def test_deploy_image_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     async def fake_digest(ref):
         return "sha256:" + "d" * 64
 
-    monkeypatch.setattr(registry, "digest", fake_digest)
+    monkeypatch.setattr(sources, "digest", fake_digest)
     outcome = await apps.deploy(yard, "db")
     assert outcome.status == "ok"
     project = recorder.calls[0]["project"]
@@ -1011,7 +1010,6 @@ async def test_deploy_image_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 
 
 async def test_deploy_image_registry_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    from app.server import registry
 
     yard = make_yard(tmp_path, skip=False)
     yard.store.create_app("db", "", image="postgres:17")
@@ -1020,7 +1018,7 @@ async def test_deploy_image_registry_failure(tmp_path: Path, monkeypatch: pytest
     async def fake_digest(ref):
         raise YardError(502, "registry", "postgres:17: not found")
 
-    monkeypatch.setattr(registry, "digest", fake_digest)
+    monkeypatch.setattr(sources, "digest", fake_digest)
     outcome = await apps.deploy(yard, "db")
     assert outcome.status == "failed"
     assert "not found" in outcome.error
@@ -1039,7 +1037,7 @@ async def test_deploy_recipe_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     async def fake_fetch(url):
         return RECIPE_BODY
 
-    monkeypatch.setattr(apps, "fetch_recipe", fake_fetch)
+    monkeypatch.setattr(sources, "fetch_recipe", fake_fetch)
     outcome = await apps.deploy(yard, "umami")
     assert outcome.status == "ok"
     import hashlib
@@ -1071,7 +1069,7 @@ async def test_deploy_recipe_keeps_two_files(tmp_path: Path, monkeypatch: pytest
     async def fake_fetch(url):
         return next(bodies)
 
-    monkeypatch.setattr(apps, "fetch_recipe", fake_fetch)
+    monkeypatch.setattr(sources, "fetch_recipe", fake_fetch)
     for _ in range(3):
         outcome = await apps.deploy(yard, "umami")
         assert outcome.status == "ok"
@@ -1081,25 +1079,21 @@ async def test_deploy_recipe_keeps_two_files(tmp_path: Path, monkeypatch: pytest
 
 async def test_fetch_recipe_http_redirect_fails():
     async def _run():
-        calls = []
-
-        def fake_get(url):
-            calls.append(url)
+        def fake_fetch(url, method, headers, **_kw):
             return 302, {"Location": "http://evil.example.com/x.yml"}, b""
 
-        old = apps._get
-        apps._get = fake_get
+        old = sources.fetch
+        sources.fetch = fake_fetch
         try:
-            await apps.fetch_recipe("https://example.com/x.yml")
+            await sources.fetch_recipe("https://example.com/x.yml")
         finally:
-            apps._get = old
+            sources.fetch = old
 
     with pytest.raises(YardError, match="not https"):
         await _run()
 
 
 async def test_check_source_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    from app.server import registry
 
     yard = make_yard(tmp_path, skip=False)
     yard.store.create_app("db", "", image="postgres:17", trigger="push")
@@ -1110,7 +1104,7 @@ async def test_check_source_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         calls.append(ref)
         return "sha256:" + ("e" if ref == "postgres:17" else "f") * 64
 
-    monkeypatch.setattr(registry, "digest", fake_digest)
+    monkeypatch.setattr(sources, "digest", fake_digest)
     monkeypatch.setattr(compose, "apply", _Apply())
     yard.forges = {}
     await apps.check_all(yard)
@@ -1122,7 +1116,6 @@ async def test_check_source_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
 
 async def test_check_source_error_and_clear(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    from app.server import registry
 
     yard = make_yard(tmp_path, skip=False)
     yard.store.create_app("db", "", image="postgres:17", trigger="push")
@@ -1131,7 +1124,7 @@ async def test_check_source_error_and_clear(tmp_path: Path, monkeypatch: pytest.
     async def fail(ref):
         raise YardError(502, "registry", "postgres:17: boom")
 
-    monkeypatch.setattr(registry, "digest", fail)
+    monkeypatch.setattr(sources, "digest", fail)
     yard.forges = {}
     await apps.check_all(yard)
     assert yard.source_errors["db"] == "postgres:17: boom"
@@ -1140,7 +1133,7 @@ async def test_check_source_error_and_clear(tmp_path: Path, monkeypatch: pytest.
     async def ok(ref):
         return "sha256:" + "a" * 64
 
-    monkeypatch.setattr(registry, "digest", ok)
+    monkeypatch.setattr(sources, "digest", ok)
     await apps.check_all(yard)
     assert "db" not in yard.source_errors
 
@@ -1155,7 +1148,7 @@ async def test_check_source_one_get_per_url(tmp_path: Path, monkeypatch: pytest.
         calls.append(url)
         return b"body\n"
 
-    monkeypatch.setattr(apps, "fetch_recipe", fake_fetch)
+    monkeypatch.setattr(sources, "fetch_recipe", fake_fetch)
     yard.forges = {}
     await apps.check_all(yard)
     assert calls == ["https://example.com/x.yml"]

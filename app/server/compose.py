@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from app.server import git
 from app.server.store import App
-from app.shared import YardError, ensure_file, short_sha
+from app.shared import YardError, atomic_write, ensure_file, short_sha
 
 if TYPE_CHECKING:
     from app.server.store import Config
@@ -20,6 +20,16 @@ DEFAULT_COMPOSE = "/usr/local/share/yard/default.compose.yml"
 IMAGE_COMPOSE = "/usr/local/share/yard/image.compose.yml"
 COMPOSE_NAMES = ("compose.yml", "compose.yaml", "ops/compose.yml", "ops/compose.yaml")
 DOCKERFILES = ("Containerfile", "Dockerfile", "ops/Containerfile", "ops/Dockerfile")
+
+
+def read_revision(config: Config, name: str) -> str:
+    """The revision the last ok deploy ran: a manifest digest or a recipe file sha256."""
+    file = config.app_dir(name) / "revision"
+    return file.read_text().strip() if file.is_file() else ""
+
+
+def write_revision(config: Config, name: str, revision: str) -> None:
+    atomic_write(config.app_dir(name) / "revision", revision + "\n")
 
 
 def image_tag(name: str, sha: str) -> str:

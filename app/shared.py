@@ -533,7 +533,7 @@ def check_image(text: str) -> str:
 def check_recipe(text: str) -> str:
     """A recipe: a name of one Yard recipe, or an https URL. The stored value is the URL."""
     value = text.strip()
-    if _RECIPE_NAME.fullmatch(value) and not value.endswith(".yml"):
+    if _RECIPE_NAME.fullmatch(value):
         return f"{RECIPES}/{value}.yml"
     if value.startswith("http://"):
         raise YardError(

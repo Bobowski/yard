@@ -9,7 +9,7 @@ from stario import Context, Handler, Middleware, Route, Writer, json
 from stario.http.middleware import catch_errors
 from stario.json import JsonValue
 
-from app.server import apps, binds, doctor, journal, status
+from app.server import apps, binds, doctor, journal, sources, status
 from app.server.forges import Forge, GitHub, Origin
 from app.server.store import App, Config, Store
 from app.server.yard import Yard
@@ -88,12 +88,10 @@ def bind_json(bind: binds.Bind) -> dict[str, str]:
 
 
 def page_json(page: status.Page) -> dict[str, Any]:
-    app = app_json(page.app)
-    if page.image:
-        app["image"] = page.image
-        app["sha"] = page.sha
     return {
-        "app": app,
+        "app": app_json(page.app),
+        "image": page.image,
+        "sha": page.sha,
         "env_file": page.env_file,
         "rows": [asdict(row) for row in page.rows],
         "binds": page.binds,
@@ -406,7 +404,7 @@ def apps_create(yard: Yard) -> Handler:
         port = 0
         if isinstance(fields.get("recipe"), str) and fields["recipe"]:
             # The create fails when the recipe cannot be fetched; the port answer binds it.
-            body = await apps.fetch_recipe(check_recipe(fields["recipe"]))
+            body = await sources.fetch_recipe(check_recipe(fields["recipe"]))
             port = apps.recipe_port(body) or 8000
         app = apps.create(yard, name, repo, actor=_actor(c), **cast(dict[str, Any], fields))
         reply: dict[str, JsonValue] = {"app": cast(JsonValue, app_json(app))}

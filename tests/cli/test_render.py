@@ -92,11 +92,11 @@ def test_format_app_status():
             "dir": "",
             "domain": "heldso.example.com",
             "trigger": "",
-            "image": "localhost/heldso:abc1234",
-            "sha": "abc1234",
             "created": stamp(days=2),
             "env": {"A": "1", "B": "2", "C": "3"},
         },
+        "image": "localhost/heldso:abc1234",
+        "sha": "abc1234",
         "env_file": "/srv/yard/env/heldso.env",
         "rows": [row],
         "binds": [
@@ -145,7 +145,7 @@ def test_format_app_status():
 
 def test_format_app_status_minimal():
     page = {
-        "app": {"name": "heldso", "sha": "", "image": "", "env": {}},
+        "app": {"name": "heldso", "env": {}},
         "env_file": "/srv/yard/env/heldso.env",
         "rows": [{"app": "heldso", "state": "absent", "health": "down"}],
         "binds": [],

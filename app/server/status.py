@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from app.server import binds, journal, podman
-from app.server.compose import app_container
+from app.server.compose import app_container, read_revision
 from app.server.podman import Container, Sample
 from app.server.store import App, Config
 from app.shared import APP_PORT, YardError, image_sha, stamp
@@ -238,7 +238,7 @@ async def app_report(yard: Yard, name: str) -> Page:
     return Page(
         app=app,
         image=image,
-        sha=image_sha(image),
+        sha=read_revision(config, app.name) if app and (app.image or app.recipe) else image_sha(image),
         env_file=str(config.env(name)),
         rows=rows,
         binds=bound,
@@ -312,7 +312,7 @@ def _row(
         oom=oom,
         error=error,
         image=image,
-        sha=image_sha(image),
+        sha=read_revision(config, app.name) if app and (app.image or app.recipe) else image_sha(image),
         tip=tip,
         binds=binds,
         trigger=app.trigger if app else "",

@@ -6,13 +6,11 @@ import logging
 import re
 import shutil
 import time
-import urllib.error
-import urllib.request
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from app.server import binds, compose, detect, git, journal, podman, registry
+from app.server import binds, compose, detect, git, journal, podman, sources
 from app.server.forges import Forge
 from app.server.store import App, Config
 from app.server.yard import Yard
@@ -477,11 +475,11 @@ async def _check_source(yard: Yard, app: App, recipes: dict[str, bytes]) -> None
     """The newest revision of an image tag or recipe URL. A failed fetch never deploys."""
     try:
         if app.image:
-            revision = await registry.digest(app.image)
+            revision = await sources.digest(app.image)
         else:
             body = recipes.get(app.recipe)
             if body is None:
-                body = await fetch_recipe(app.recipe)
+                body = await sources.fetch_recipe(app.recipe)
                 recipes[app.recipe] = body
             revision = "sha256:" + hashlib.sha256(body).hexdigest()
     except Exception as exc:
@@ -493,7 +491,7 @@ async def _check_source(yard: Yard, app: App, recipes: dict[str, bytes]) -> None
     yard.tips[app.name] = revision
     if app.trigger != "push":
         return
-    deployed = deployed_revision(yard.config, app.name)
+    deployed = compose.read_revision(yard.config, app.name)
     if revision != deployed:
         journal.send(
             yard.config,
@@ -506,12 +504,6 @@ async def _check_source(yard: Yard, app: App, recipes: dict[str, bytes]) -> None
         await deploy(yard, app.name, cause="check", actor="check")
 
 
-def deployed_revision(config: Config, name: str) -> str:
-    """The revision the last ok deploy ran: a manifest digest or the recipe file sha256."""
-    file = config.app_dir(name) / "revision"
-    return file.read_text().strip() if file.is_file() else ""
-
-
 def _rollback_help(app: App) -> str:
     if app.image:
         return f"an image app rolls back by tag: yard app set --app {app.name} --image REF:OLDER"
@@ -522,12 +514,12 @@ async def _deploy_source(yard: Yard, app: App, *, cause: str, actor: str) -> Out
     """A repo-less deploy: pin an image by digest, or fetch a recipe compose file."""
     try:
         if app.image:
-            revision = await registry.digest(app.image)
+            revision = await sources.digest(app.image)
             image = f"{app.image.split('@', 1)[0]}@{revision}"
             project = _source_project(yard.config, app, compose.IMAGE_COMPOSE, image, revision)
             project.env["SKIP_BUILD"] = "1"
         else:
-            body = await fetch_recipe(app.recipe)
+            body = await sources.fetch_recipe(app.recipe)
             revision = "sha256:" + hashlib.sha256(body).hexdigest()
             image = compose.image_tag(app.name, revision[7:19])
             recipe_file = _write_recipe(yard.config, app.name, revision, body)
@@ -561,9 +553,9 @@ async def _deploy_source(yard: Yard, app: App, *, cause: str, actor: str) -> Out
         outcome = Outcome("ok", image, log, previous=previous)
     _deploy_end(yard, app, revision, outcome)
     if outcome.status == "ok":
-        atomic_write(yard.config.app_dir(app.name) / "revision", revision + "\n")
+        compose.write_revision(yard.config, app.name, revision)
         if app.recipe:
-            _prune_recipes(yard.config, app.name)
+            _prune_recipes(yard.config, app.name, revision[7:19])
     return outcome
 
 
@@ -591,7 +583,7 @@ def _recipe_dir(config: Config, name: str) -> Path:
 
 def _recipe_file(config: Config, name: str) -> Path | None:
     """The compose file of the last ok recipe deploy, for the revert path."""
-    revision = deployed_revision(config, name)
+    revision = compose.read_revision(config, name)
     if not revision.startswith("sha256:"):
         return None
     path = config.app_dir(name) / "recipe" / f"{revision[7:19]}.yml"
@@ -600,52 +592,19 @@ def _recipe_file(config: Config, name: str) -> Path | None:
 
 def _write_recipe(config: Config, name: str, revision: str, body: bytes) -> Path:
     path = _recipe_dir(config, name) / f"{revision[7:19]}.yml"
-    if not path.is_file():
-        atomic_write(path, body.decode("utf-8", "replace"))
+    atomic_write(path, body.decode("utf-8", "replace"))
     return path
 
 
-def _prune_recipes(config: Config, name: str) -> None:
-    """Keep the current and the previous recipe file; drop older ones."""
-    keep = {deployed_revision(config, name)[7:19]}
-    files = sorted(_recipe_dir(config, name).glob("*.yml"), key=lambda p: p.stat().st_mtime, reverse=True)
-    keep.add(files[1].stem if len(files) > 1 else "")
-    for path in files[2:]:
+def _prune_recipes(config: Config, name: str, keep: str) -> None:
+    """Keep the current recipe file and the newest one before it."""
+    others = sorted(
+        (p for p in _recipe_dir(config, name).glob("*.yml") if p.stem != keep),
+        key=lambda p: p.stat().st_mtime_ns,
+        reverse=True,
+    )
+    for path in others[1:]:
         path.unlink()
-
-
-def _get(url: str) -> tuple[int, dict[str, str], bytes]:
-    """One recipe request; redirects surface so they stay on https."""
-    req = urllib.request.Request(url)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as res:
-            return res.status, dict(res.headers), res.read(_RECIPE_MAX + 1)
-    except urllib.error.HTTPError as exc:
-        return exc.code, dict(exc.headers), exc.read()
-    except urllib.error.URLError as exc:
-        raise YardError(502, "recipe", f"{url}: {exc.reason}") from exc
-
-
-async def fetch_recipe(url: str) -> bytes:
-    """The recipe body: https only, ≤ 256 KiB, redirects stay on https."""
-    return await asyncio.to_thread(_fetch_recipe, url)
-
-
-def _fetch_recipe(url: str) -> bytes:
-    for _ in range(6):
-        code, headers, body = _get(url)
-        if code in (301, 302, 303, 307, 308):
-            location = headers.get("Location") or headers.get("location") or ""
-            if not location.startswith("https://"):
-                raise YardError(502, "recipe", f"{url}: redirect to {location or 'nowhere'} is not https")
-            url = location
-            continue
-        if code >= 300:
-            raise YardError(502, "recipe", f"{url}: HTTP {code}")
-        if len(body) > _RECIPE_MAX:
-            raise YardError(502, "recipe", "recipe is larger than 256 KiB")
-        return body
-    raise YardError(502, "recipe", f"{url}: too many redirects")
 
 
 async def _check_forge(yard: Yard, forge: Forge) -> None:
