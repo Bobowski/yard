@@ -3,7 +3,7 @@ import hmac
 import json
 import stat
 
-from app.server import apps, binds, caddy, journal
+from app.server import apps, binds, caddy, journal, sources
 from app.server.caddy import Caddy
 from app.server.forges import GitHub, Origin
 from app.server.podman import Podman
@@ -917,3 +917,106 @@ async def test_app_files_route(yard, tmp_path):
     res = await client.get("/api/v1/apps/other/files/compose", headers=auth(token))
     assert res.status_code == 404
     assert "yard app deploy" in res.text
+
+
+async def test_image_and_recipe_apps(yard, monkeypatch, tmp_path):
+
+    client, token, _root = yard
+
+    async def fake_fetch(url):
+        return b"# port: 3000\nservices:\n  app:\n    image: x\n    networks:\n      - yard\n"
+
+    monkeypatch.setattr(sources, "fetch_recipe", fake_fetch)
+    res = await client.post(
+        "/api/v1/apps",
+        json={"name": "db", "image": "postgres:17"},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+    assert res.json()["app"]["image"] == "postgres:17"
+    assert res.json()["app"]["repo"] == ""
+
+    res = await client.post(
+        "/api/v1/apps",
+        json={"name": "umami", "recipe": "umami"},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+    assert res.json()["app"]["recipe"].endswith("/umami.yml")
+    assert res.json()["port"] == 3000
+
+    res = await client.post("/api/v1/apps", json={"name": "x", "image": "postgres"}, headers=auth(token))
+    assert res.status_code == 400
+    assert "bad_image" in res.text
+
+    res = await client.post(
+        "/api/v1/apps",
+        json={"name": "y", "repo": "https://github.com/org/y", "image": "postgres:17"},
+        headers=auth(token),
+    )
+    assert res.status_code == 400
+    assert "has no repo" in res.text
+
+
+async def test_deploy_sha_on_image_app(yard):
+    client, token, _root = yard
+    await client.post("/api/v1/apps", json={"name": "db", "image": "postgres:17"}, headers=auth(token))
+    res = await client.post(
+        "/api/v1/apps/db/deploy",
+        json={"sha": "abc1234"},
+        headers=auth(token),
+    )
+    assert res.status_code == 400
+    assert "rolls back by tag" in res.text
+
+
+async def test_cat_source_apps(yard, tmp_path, monkeypatch):
+    client, token, _root = yard
+    await client.post("/api/v1/apps", json={"name": "db", "image": "postgres:17"}, headers=auth(token))
+    res = await client.get("/api/v1/apps/db/files/containerfile", headers=auth(token))
+    assert res.status_code == 404
+    assert "runs an image" in res.text
+    res = await client.get("/api/v1/apps/db/files/compose", headers=auth(token))
+    assert res.status_code == 200
+    assert "image: ${IMAGE}" in res.text
+
+    async def fake_fetch(url):
+        return b"services: {}\n"
+
+    monkeypatch.setattr(sources, "fetch_recipe", fake_fetch)
+    await client.post(
+        "/api/v1/apps", json={"name": "umami", "recipe": "https://example.com/x.yml"}, headers=auth(token)
+    )
+    res = await client.get("/api/v1/apps/umami/files/compose", headers=auth(token))
+    assert res.status_code == 404
+    assert "not fetched yet" in res.text
+    recipe_dir = tmp_path / "apps" / "umami" / "recipe"
+    recipe_dir.mkdir(parents=True)
+    (tmp_path / "apps" / "umami" / "revision").write_text("sha256:" + "a" * 64 + "\n")
+    (recipe_dir / ("a" * 12 + ".yml")).write_text("services: {}\n")
+    res = await client.get("/api/v1/apps/umami/files/compose", headers=auth(token))
+    assert res.status_code == 200
+    assert res.text == "services: {}\n"
+
+
+async def test_page_record_is_the_record():
+    """app on the status page is the record; the running image and sha are top level."""
+    from app.server.api import page_json
+    from app.server.status import Page
+    from app.server.store import App
+
+    page = Page(
+        app=App("heldso", "https://github.com/org/heldso", "main", "push", "t", containerfile="Dockerfile"),
+        image="localhost/heldso:abc1234",
+        sha="abc1234",
+        env_file="/env",
+        rows=[],
+        binds=[],
+        deploys=[],
+        log="",
+    )
+    data = page_json(page)
+    assert data["app"]["image"] == ""
+    assert data["app"]["containerfile"] == "Dockerfile"
+    assert data["image"] == "localhost/heldso:abc1234"
+    assert data["sha"] == "abc1234"

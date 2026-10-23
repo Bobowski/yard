@@ -27,5 +27,6 @@ ENV CONTAINER_HOST=unix:///run/podman/podman.sock
 COPY apply.sh /usr/local/bin/apply
 RUN chmod 755 /usr/local/bin/apply
 COPY default.compose.yml /usr/local/share/yard/default.compose.yml
+COPY image.compose.yml /usr/local/share/yard/image.compose.yml
 
 ENTRYPOINT ["/usr/local/bin/apply"]

@@ -92,11 +92,11 @@ def test_format_app_status():
             "dir": "",
             "domain": "heldso.example.com",
             "trigger": "",
-            "image": "localhost/heldso:abc1234",
-            "sha": "abc1234",
             "created": stamp(days=2),
             "env": {"A": "1", "B": "2", "C": "3"},
         },
+        "image": "localhost/heldso:abc1234",
+        "sha": "abc1234",
         "env_file": "/srv/yard/env/heldso.env",
         "rows": [row],
         "binds": [
@@ -145,7 +145,7 @@ def test_format_app_status():
 
 def test_format_app_status_minimal():
     page = {
-        "app": {"name": "heldso", "sha": "", "image": "", "env": {}},
+        "app": {"name": "heldso", "env": {}},
         "env_file": "/srv/yard/env/heldso.env",
         "rows": [{"app": "heldso", "state": "absent", "health": "down"}],
         "binds": [],
@@ -282,3 +282,32 @@ def test_colored_app_status_keeps_the_padding():
     colored = format_app_status(page, NOW, color=True)
     assert _plain(colored) == format_app_status(page, NOW)
     assert "\033[33munhealthy 2h\033[0m" in colored
+
+
+def test_format_record_repoless_hides_ref():
+    import json
+
+    from app.cli.render import format_record
+
+    body = json.dumps({"name": "db", "repo": "", "ref": "main", "trigger": "push", "image": "postgres:17"})
+    out = format_record(body)
+    assert "image  postgres:17" in out
+    assert "ref" not in out
+
+
+def test_format_apps_repoless_shows_source(tmp_path):
+    from app.cli.render import format_apps
+
+    rows = [
+        {"name": "db", "repo": "", "ref": "main", "trigger": "push", "image": "postgres:17"},
+        {"name": "umami", "repo": "", "ref": "main", "trigger": "push", "recipe": "https://x.example/umami.yml"},
+        {"name": "heldso", "repo": "https://github.com/org/heldso", "ref": "main", "trigger": "push"},
+    ]
+    out = format_apps(rows)
+    lines = out.splitlines()
+    assert "db" in lines[1] and "postgres:17" in lines[1]
+    assert "https://x.example/umami.yml" in lines[2]
+    # repo-less rows have an empty ref column; the repo app keeps main
+    assert "main" not in lines[1]
+    assert "main" not in lines[2]
+    assert "main" in lines[3]

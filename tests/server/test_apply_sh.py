@@ -195,3 +195,16 @@ def test_absolute_dockerfile_used_as_is(tmp_path: Path):
     )
     assert code == 0
     assert "podman:build --format docker -t localhost/heldso:abc -f /srv/yard/apps/heldso/Containerfile" in log
+
+
+def test_revert_uses_the_previous_compose_file(tmp_path: Path):
+    code, out, log, _err = _run(
+        tmp_path,
+        "up",
+        FAKE_FAIL="up",
+        PREVIOUS_COMPOSE_FILE="/srv/yard/apps/heldso/recipe/abc123def456.yml",
+    )
+    assert code == 3
+    assert "== revert /srv/yard/apps/heldso/recipe/abc123def456.yml" in out
+    assert "== reverted" in out
+    assert "dc:up -d --no-build" in log

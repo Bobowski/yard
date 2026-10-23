@@ -129,3 +129,30 @@ def test_app_build_fields_need_a_repo(tmp_path: Path):
     store.create_app("yard", "")
     with pytest.raises(YardError, match="no repo|Set the repo"):
         store.update_app("yard", containerfile="Dockerfile")
+
+
+def test_app_source_fields(tmp_path: Path):
+    store = Store.open(tmp_path)
+    app = store.create_app("db", "", image="postgres:17")
+    assert app.image == "postgres:17"
+    assert store.app("db").image == "postgres:17"
+    assert "image postgres:17" in (tmp_path / "apps" / "db" / "app").read_text()
+
+    app = store.update_app("db", recipe="umami")
+    assert app.recipe.endswith("/umami.yml")
+    assert app.image == ""
+
+    with pytest.raises(YardError, match="not both"):
+        store.update_app("db", image="postgres:17", recipe="umami")
+
+    with pytest.raises(YardError, match="no repo|Set the repo"):
+        store.update_app("db", containerfile="Dockerfile")
+
+
+def test_app_source_fields_repo_app(tmp_path: Path):
+    store = Store.open(tmp_path)
+    store.create_app("heldso", "https://github.com/org/heldso")
+    with pytest.raises(YardError, match="an image app has no repo"):
+        store.update_app("heldso", image="postgres:17")
+    with pytest.raises(YardError, match="a recipe app has no repo"):
+        store.update_app("heldso", recipe="umami")

@@ -411,7 +411,7 @@ def test_the_default_compose_meets_the_contract():
     assert "path: ${APP_ENV}" in own
     assert "required: false" in own
     files = sorted(path.name for path in (ops / "apply").iterdir())
-    assert files == ["Containerfile", "apply.sh", "default.compose.yml"]
+    assert files == ["Containerfile", "apply.sh", "default.compose.yml", "image.compose.yml"]
 
 
 def test_image_tag():

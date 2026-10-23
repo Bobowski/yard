@@ -9,11 +9,11 @@ from stario import Context, Handler, Middleware, Route, Writer, json
 from stario.http.middleware import catch_errors
 from stario.json import JsonValue
 
-from app.server import apps, binds, doctor, journal, status
+from app.server import apps, binds, doctor, journal, sources, status
 from app.server.forges import Forge, GitHub, Origin
 from app.server.store import App, Config, Store
 from app.server.yard import Yard
-from app.shared import YardError, now
+from app.shared import YardError, check_recipe, now
 
 HEALTH = Route("GET /health")
 HOOK_ORIGIN = Route("POST /hooks/origin")
@@ -59,7 +59,7 @@ async def json_object(c: Context) -> dict:
 def app_fields(body: dict) -> dict[str, str]:
     """The fields an app PATCH or POST takes: repo, ref, trigger."""
     fields: dict[str, str] = {}
-    for key in ("repo", "ref", "trigger", "containerfile", "compose"):
+    for key in ("repo", "ref", "trigger", "containerfile", "compose", "image", "recipe"):
         if key not in body:
             continue
         value = body[key]
@@ -78,6 +78,8 @@ def app_json(app: App) -> dict[str, Any]:
         "created": app.created,
         "containerfile": app.containerfile,
         "compose": app.compose,
+        "image": app.image,
+        "recipe": app.recipe,
     }
 
 
@@ -86,12 +88,10 @@ def bind_json(bind: binds.Bind) -> dict[str, str]:
 
 
 def page_json(page: status.Page) -> dict[str, Any]:
-    app = app_json(page.app)
-    if page.image:
-        app["image"] = page.image
-        app["sha"] = page.sha
     return {
-        "app": app,
+        "app": app_json(page.app),
+        "image": page.image,
+        "sha": page.sha,
         "env_file": page.env_file,
         "rows": [asdict(row) for row in page.rows],
         "binds": page.binds,
@@ -391,17 +391,26 @@ def apps_create(yard: Yard) -> Handler:
                 help_text="An app name uses lowercase letters, digits, and -",
                 example="staging",
             )
-        if not repo.strip():
+        source = fields.get("image") or fields.get("recipe") or ""
+        if not repo.strip() and not source:
             raise YardError(
                 400,
                 "bad_json",
                 "repo is required",
                 context={"field": "repo"},
-                help_text="The repo as a full https URL.",
+                help_text="The repo as a full https URL; for a repo-less app pass --image or --recipe.",
                 example="https://github.com/org/heldso",
             )
+        port = 0
+        if isinstance(fields.get("recipe"), str) and fields["recipe"]:
+            # The create fails when the recipe cannot be fetched; the port answer binds it.
+            body = await sources.fetch_recipe(check_recipe(fields["recipe"]))
+            port = apps.recipe_port(body) or 8000
         app = apps.create(yard, name, repo, actor=_actor(c), **cast(dict[str, Any], fields))
-        w.json(cast(JsonValue, {"app": app_json(app)}))
+        reply: dict[str, JsonValue] = {"app": cast(JsonValue, app_json(app))}
+        if port:
+            reply["port"] = port
+        w.json(reply)
 
     return handler
 
@@ -456,6 +465,19 @@ def app_deploy(yard: Yard) -> Handler:
         if not isinstance(sha, str):
             raise YardError(400, "bad_json", "bad json", help_text="sha is a string.")
         requested = sha = sha.strip()
+        record = yard.store.app(name)
+        if sha and record.image:
+            raise YardError(
+                400,
+                "bad_request",
+                f"an image app rolls back by tag: yard app set --app {name} --image REF:OLDER",
+            )
+        if sha and record.recipe:
+            raise YardError(
+                400,
+                "bad_request",
+                "a recipe app rolls back by URL: point --recipe at an older commit's raw URL",
+            )
         if sha and not re.fullmatch(r"[0-9a-f]{7,40}", sha):
             raise YardError(
                 400,

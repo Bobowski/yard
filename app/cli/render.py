@@ -109,9 +109,15 @@ def _bind_text(binds: Any) -> str:
     return " · ".join(parts)
 
 
+def _short(sha: str) -> str:
+    """A git sha reads as 7 chars; a sha256: image/recipe revision as the 12 after the prefix."""
+    hexed = sha.removeprefix("sha256:")
+    return hexed[:12] if len(hexed) > 40 else hexed[:7]
+
+
 def _rev(sha: str, tip: str) -> str:
-    short = sha[:7]
-    want = tip[:7]
+    short = _short(sha)
+    want = _short(tip)
     if not want or short == want:
         return short
     if not short:
@@ -174,12 +180,12 @@ def format_app_status(report: dict, now: datetime, *, color: bool = False) -> st
     lines = [name]
     rows = [row for row in report.get("rows") or [] if isinstance(row, dict)]
 
-    sha = str(record.get("sha") or "")
+    sha = str(report.get("sha") or "")
     tip = next((str(row.get("tip") or "") for row in rows if row.get("tip")), "")
-    rev = f"rev {sha[:7]}" if sha else ""
-    if tip and tip[:7] != sha[:7]:
-        rev += f" · tip {tip[:7]}"
-    image = str(record.get("image") or "")
+    rev = f"rev {_short(sha)}" if sha else ""
+    if tip and _short(tip) != _short(sha):
+        rev += f" · tip {_short(tip)}"
+    image = str(report.get("image") or "")
     if image:
         rev += f" · image {image}"
     trigger = str(record.get("trigger") or "")
@@ -189,7 +195,7 @@ def format_app_status(report: dict, now: datetime, *, color: bool = False) -> st
         lines.append(rev)
     data = max((int(row.get("data") or 0) for row in rows), default=0)
     lines.append(f"data {format_bytes(data)} · env {report.get('env_file') or ''}")
-    for field in ("containerfile", "compose"):
+    for field in ("containerfile", "compose", "image", "recipe"):
         if str(record.get(field) or ""):
             lines.append(f"{field}  {record[field]}")
 
@@ -229,7 +235,7 @@ def format_app_status(report: dict, now: datetime, *, color: bool = False) -> st
                     str(row.get("status") or ""),
                     _format_span(str(row.get("started") or ""), str(row.get("ended") or "")),
                     _ago(str(row.get("started") or ""), now),
-                    str(row.get("sha") or "")[:7],
+                    _short(str(row.get("sha") or "")),
                 ]
                 for row in deploys
             ],
@@ -268,16 +274,13 @@ def _align(rows: list[list[str]], right: set[int], paint: Callable[[int, str], s
 
 
 def format_apps(rows: list, *, color: bool = False) -> str:
-    body = [
-        [
-            str(row.get("name") or ""),
-            str(row.get("repo") or ""),
-            str(row.get("ref") or ""),
-            str(row.get("trigger") or ""),
-        ]
-        for row in rows
-        if isinstance(row, dict)
-    ]
+    body = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        source = str(row.get("repo") or row.get("image") or row.get("recipe") or "")
+        ref = str(row.get("ref") or "") if row.get("repo") else ""
+        body.append([str(row.get("name") or ""), source, ref, str(row.get("trigger") or "")])
     return _render(["app", "repo", "ref", "trigger"], body, color=color)
 
 
@@ -297,7 +300,7 @@ def format_events(rows: list, *, color: bool = False) -> str:
                 f"exit {row['exit_code']}" if str(row.get("exit_code") or "") else "",
                 "oom" if row.get("oom") else "",
                 str(row.get("status") or ""),
-                str(row.get("sha") or "")[:7],
+                _short(str(row.get("sha") or "")),
                 str(row.get("actor") or ""),
                 str(row.get("message") or ""),
             )
@@ -381,6 +384,8 @@ def format_record(body: str) -> str:
         return f"{name}\n{secret}\n" if name else f"{secret}\n"
     if "name" in data and set(data) <= {"name", "created"}:
         return f"{data['name']}\n"
+    if not data.get("repo"):
+        data.pop("ref", None)
     lines = [f"{key}  {value}" for key, value in data.items() if value not in ("", None, [], {})]
     return ("\n".join(lines) + "\n") if lines else ""
 
