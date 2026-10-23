@@ -274,16 +274,13 @@ def _align(rows: list[list[str]], right: set[int], paint: Callable[[int, str], s
 
 
 def format_apps(rows: list, *, color: bool = False) -> str:
-    body = [
-        [
-            str(row.get("name") or ""),
-            str(row.get("repo") or ""),
-            str(row.get("ref") or ""),
-            str(row.get("trigger") or ""),
-        ]
-        for row in rows
-        if isinstance(row, dict)
-    ]
+    body = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        source = str(row.get("repo") or row.get("image") or row.get("recipe") or "")
+        ref = str(row.get("ref") or "") if row.get("repo") else ""
+        body.append([str(row.get("name") or ""), source, ref, str(row.get("trigger") or "")])
     return _render(["app", "repo", "ref", "trigger"], body, color=color)
 
 
@@ -387,6 +384,8 @@ def format_record(body: str) -> str:
         return f"{name}\n{secret}\n" if name else f"{secret}\n"
     if "name" in data and set(data) <= {"name", "created"}:
         return f"{data['name']}\n"
+    if not data.get("repo"):
+        data.pop("ref", None)
     lines = [f"{key}  {value}" for key, value in data.items() if value not in ("", None, [], {})]
     return ("\n".join(lines) + "\n") if lines else ""
 

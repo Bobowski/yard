@@ -45,6 +45,7 @@ The docs at [stario.dev/yard](https://stario.dev/yard) read as a short book:
 - [One push, start to finish](https://stario.dev/yard/one-push) — follow a single commit from your laptop to a live container.
 - [Set up a host](https://stario.dev/yard/install) — a fresh VM to a working Yard in one script and a few commands.
 - [Your first app](https://stario.dev/yard/first-app) — the four rules an app follows, then one push.
+- [What an app runs](https://stario.dev/yard/what-runs) — a Containerfile, a compose file, an image, or a recipe: how Yard picks and how you change it.
 - [Day to day](https://stario.dev/yard/day-to-day) — logs, settings, domains, rollbacks, and cleanup.
 - [Your own compose file](https://stario.dev/yard/compose) — workers, sidecars, healthchecks, and apps in any language.
 - [How it works](https://stario.dev/yard/how-it-works) — the internals: files, the check loop, the deploy container, Caddy, journald.
