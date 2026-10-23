@@ -540,7 +540,8 @@ def logs_get(config: Config) -> Handler:
         """Container logs from the journal; they outlive the container.
 
         after is a journald cursor: only entries after it are returned, first
-        `lines` of them, so a poller resumes where it left off. json=1 answers
+        `lines` of them, so a poller resumes where it left off. An Accept
+        header that names application/json answers
         {"entries": [...], "cursor": ...} instead of text lines.
         """
         query = c.req.query
@@ -552,7 +553,7 @@ def logs_get(config: Config) -> Handler:
         if query.get("follow") == "1":
             await _stream_journal(config, c, w, [match], lines)
             return
-        if query.get("json") == "1":
+        if "application/json" in (c.req.headers.get("accept") or ""):
             entries = await journal.read_entries(config, [match], lines=lines, since=since, until=until, after=after)
             w.json(cast(JsonValue, _logs_page(entries)))
             return

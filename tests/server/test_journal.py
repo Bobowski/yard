@@ -382,7 +382,10 @@ async def yard_cursor(tmp_path, monkeypatch):
 
 async def test_logs_json_is_a_page_of_entries(yard_cursor):
     client, token, _argv_log = yard_cursor
-    res = await client.get("/api/v1/logs?container=heldso-app-1&json=1&lines=1", headers=auth(token))
+    res = await client.get(
+        "/api/v1/logs?container=heldso-app-1&lines=1",
+        headers={**auth(token), "accept": "application/json"},
+    )
     assert res.status_code == 200
     assert res.json() == {
         "entries": [
@@ -400,8 +403,8 @@ async def test_logs_json_is_a_page_of_entries(yard_cursor):
 async def test_logs_json_batches_do_not_overlap(yard_cursor):
     client, token, argv_log = yard_cursor
     res = await client.get(
-        "/api/v1/logs?container=heldso-app-1&json=1&lines=2&since=-1h&after=cursor-0",
-        headers=auth(token),
+        "/api/v1/logs?container=heldso-app-1&lines=2&since=-1h&after=cursor-0",
+        headers={**auth(token), "accept": "application/json"},
     )
     assert res.status_code == 200
     batch = res.json()
@@ -413,8 +416,8 @@ async def test_logs_json_batches_do_not_overlap(yard_cursor):
     assert "-n +2" in argv
 
     res = await client.get(
-        f"/api/v1/logs?container=heldso-app-1&json=1&lines=2&after={batch['cursor']}",
-        headers=auth(token),
+        f"/api/v1/logs?container=heldso-app-1&lines=2&after={batch['cursor']}",
+        headers={**auth(token), "accept": "application/json"},
     )
     assert res.status_code == 200
     batch = res.json()
@@ -424,17 +427,26 @@ async def test_logs_json_batches_do_not_overlap(yard_cursor):
 
 async def test_logs_json_after_the_last_entry_is_empty(yard_cursor):
     client, token, _argv_log = yard_cursor
-    res = await client.get("/api/v1/logs?container=heldso-app-1&json=1&after=cursor-4", headers=auth(token))
+    res = await client.get(
+        "/api/v1/logs?container=heldso-app-1&after=cursor-4",
+        headers={**auth(token), "accept": "application/json"},
+    )
     assert res.status_code == 200
     assert res.json() == {"entries": [], "cursor": ""}
 
 
 async def test_logs_text_takes_after_too(yard_cursor):
     client, token, _argv_log = yard_cursor
-    res = await client.get("/api/v1/logs?container=heldso-app-1&after=cursor-1", headers=auth(token))
+    # No Accept header and */* — what curl sends — both answer text lines.
+    for headers in (auth(token), {**auth(token), "accept": "*/*"}):
+        res = await client.get("/api/v1/logs?container=heldso-app-1&after=cursor-1", headers=headers)
+        assert res.status_code == 200
+        assert "line 1" not in res.text
+        assert "line 2" in res.text and "line 4" in res.text
+    # A stale json=1 in the query still answers text.
+    res = await client.get("/api/v1/logs?container=heldso-app-1&json=1&after=cursor-1", headers=auth(token))
     assert res.status_code == 200
-    assert "line 1" not in res.text
-    assert "line 2" in res.text and "line 4" in res.text
+    assert "line 2" in res.text and '"entries"' not in res.text
 
 
 async def test_logs_needs_a_token(yard_journal):
