@@ -32,6 +32,7 @@ class Yard:
         }
         self.skip_deploy = config.skip_deploy
         self.tips: dict[str, str] = {}
+        self.tried: dict[str, str] = {}
         self.source_errors: dict[str, str] = {}
         self.locks: dict[str, asyncio.Lock] = {}
         self.checked: dict[str, float] = {}

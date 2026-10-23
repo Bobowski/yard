@@ -33,3 +33,11 @@ def test_every_recipe_meets_the_contract():
         assert not problems, f"{recipe.name}: {'; '.join(problems)}"
         port = apps.recipe_port(recipe.read_bytes())
         assert port, f"{recipe.name}: recipe_port found no port"
+
+
+def test_image_compose_leaves_the_image_alone():
+    text = (Path(__file__).resolve().parents[1] / "ops" / "apply" / "image.compose.yml").read_text()
+    for key in ("PORT", "STARIO", "expose"):
+        assert key not in text, f"image.compose.yml injects {key}"
+    for need in ("PROJECT_NAME", "PROJECT_DATA_DIR", "SHA", "${APP_ENV}", "${DATA_DIR}", "yard:"):
+        assert need in text

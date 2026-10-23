@@ -417,3 +417,36 @@ def test_the_default_compose_meets_the_contract():
 def test_image_tag():
     assert image_tag("mono", "abc1234def") == "localhost/mono:abc1234def"
     assert image_tag("yard", "abc") == "localhost/yard:abc"
+
+
+def test_saved_project_image_app(tmp_path: Path):
+    config = _config(tmp_path)
+    (tmp_path / "apps" / "db").mkdir(parents=True)
+    app = App("db", "", "main", "push", "", image="postgres:17")
+    compose.write_revision(config, "db", "sha256:" + "a" * 64)
+    project = saved_project(config, app)
+    assert project is not None
+    assert project.files == [compose.IMAGE_COMPOSE]
+    assert project.env["IMAGE"] == "postgres:17@sha256:" + "a" * 64
+    project2 = saved_project(config, App("db2", "", "main", "push", "", image="nginx:1"))
+    assert project2 is not None and project2.env["IMAGE"] == "nginx:1"
+
+
+def test_saved_project_recipe_app(tmp_path: Path):
+    config = _config(tmp_path)
+    directory = tmp_path / "apps" / "umami" / "recipe"
+    directory.mkdir(parents=True)
+    (directory / "abc123def456.yml").write_text("services: {}\n")
+    app = App("umami", "", "main", "push", "", recipe="https://example.com/x.yml")
+    compose.write_revision(config, "umami", "sha256:" + "a" * 64)
+    project = saved_project(config, app)
+    assert project is not None
+    assert project.files == [str(directory / "abc123def456.yml")]
+    # no revision but a recipe file exists -> newest file
+    config2 = _config(tmp_path / "other")
+    (tmp_path / "other" / "apps" / "u2" / "recipe").mkdir(parents=True)
+    (tmp_path / "other" / "apps" / "u2" / "recipe" / "f00baa111222.yml").write_text("x\n")
+    project2 = saved_project(config2, App("u2", "", "main", "push", "", recipe="https://example.com/x.yml"))
+    assert project2 is not None
+    assert project2.files == [str(tmp_path / "other" / "apps" / "u2" / "recipe" / "f00baa111222.yml")]
+    assert saved_project(config2, App("u3", "", "main", "push", "", recipe="https://example.com/x.yml")) is None

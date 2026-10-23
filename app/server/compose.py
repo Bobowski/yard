@@ -104,8 +104,35 @@ def prepare(config: Config, app: App, checkout: Path, image: str, sha: str) -> P
     return Project(app.name, files, env)
 
 
+def recipe_file(config: Config, name: str) -> Path | None:
+    """The compose file of the last ok recipe deploy, or the newest one on disk."""
+    revision = read_revision(config, name)
+    if revision.startswith("sha256:"):
+        path = config.app_dir(name) / "recipe" / f"{revision[7:19]}.yml"
+        if path.is_file():
+            return path
+    directory = config.app_dir(name) / "recipe"
+    files = (
+        sorted(directory.glob("*.yml"), key=lambda p: p.stat().st_mtime_ns, reverse=True) if directory.is_dir() else []
+    )
+    return files[0] if files else None
+
+
 def saved_project(config: Config, app: App) -> Project | None:
-    """Rebuild the project from the app clone. The checkout SHA is the image tag."""
+    """Rebuild the project for a purge: the clone for repo apps, the deployed source for others."""
+    if app.image:
+        revision = read_revision(config, app.name)
+        image = f"{app.image.split('@', 1)[0]}@{revision}" if revision else app.image
+        env = run_env(config, app, config.app_dir(app.name), image, revision)
+        ensure_env(config.env(app.name))
+        return Project(app.name, [IMAGE_COMPOSE], env)
+    if app.recipe:
+        file = recipe_file(config, app.name)
+        if file is None:
+            return None
+        env = run_env(config, app, config.app_dir(app.name), image_tag(app.name, "recipe"), "")
+        ensure_env(config.env(app.name))
+        return Project(app.name, [str(file)], env)
     checkout = config.clone(app.name)
     if not (checkout / ".git").exists():
         return None

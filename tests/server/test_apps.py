@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from app.server import apps, compose, git, journal, main, sources
+from app.server import apps, binds, compose, git, journal, main, sources
 from app.server.forges import Forge, GitHub, Origin
 from app.server.podman import Podman
 from app.server.store import Config, Store
@@ -973,7 +973,7 @@ async def test_deploy_repo_path_missing_fails(tmp_path: Path, monkeypatch: pytes
     assert "yard app detect" in outcome.log
 
 
-async def test_deploy_containerfile_yard_missing_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+async def test_deploy_containerfile_yard_missing_fails_on_detect(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yard = make_yard(tmp_path, skip=False)
     yard.store.create_app("heldso", "https://origin.cursor.com/org/app", containerfile="yard")
     _clone(yard, "heldso")
@@ -986,7 +986,7 @@ async def test_deploy_containerfile_yard_missing_fails(tmp_path: Path, monkeypat
     monkeypatch.setattr(git, "sync", fake_sync)
     outcome = await apps.deploy(yard, "heldso")
     assert outcome.status == "failed"
-    assert "yard app detect" in outcome.log
+    assert "no compose file, Containerfile, or known language" in outcome.log
 
 
 async def test_deploy_image_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1152,3 +1152,63 @@ async def test_check_source_one_get_per_url(tmp_path: Path, monkeypatch: pytest.
     yard.forges = {}
     await apps.check_all(yard)
     assert calls == ["https://example.com/x.yml"]
+
+
+async def test_source_deploy_failed_is_not_retried(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard = make_yard(tmp_path, skip=False)
+    yard.store.create_app("db", "", image="postgres:17", trigger="push")
+    revision = "sha256:" + "a" * 64
+
+    async def fake_digest2(ref):
+        return revision
+
+    monkeypatch.setattr(sources, "digest", fake_digest2)
+    monkeypatch.setattr(compose, "apply", _Apply(code=1, text="boom"))
+    yard.forges = {}
+    await apps.check_all(yard)  # check -> deploy -> fails
+    assert not (tmp_path / "apps" / "db" / "revision").exists()
+    recorder = _Apply(code=0)
+    monkeypatch.setattr(compose, "apply", recorder)
+    await apps.check_all(yard)  # same revision: tried, do not redeploy
+    assert not recorder.calls
+    newer = "sha256:" + "b" * 64
+
+    async def fake_digest3(ref):
+        return newer
+
+    monkeypatch.setattr(sources, "digest", fake_digest3)
+    await apps.check_all(yard)  # new revision deploys
+    assert recorder.calls
+
+
+async def test_containerfile_yard_explicit_writes_on_first_deploy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard = make_yard(tmp_path, skip=False)
+    yard.store.create_app("heldso", "https://origin.cursor.com/org/app", containerfile="yard")
+    clone = _stario_clone(yard, "heldso")
+    (clone / "Dockerfile").write_text("FROM scratch\n")  # repo file ignored: user said yard
+    _connect(monkeypatch)
+    recorder = _Apply()
+    monkeypatch.setattr(compose, "apply", recorder)
+
+    async def fake_sync(clone, url, ref, token=""):
+        return git.head(clone)
+
+    monkeypatch.setattr(git, "sync", fake_sync)
+    outcome = await apps.deploy(yard, "heldso")
+    assert outcome.status == "ok"
+    stored = (yard.config.app_dir("heldso") / "Containerfile").read_text()
+    assert "STARIO_PORT" in stored
+    assert recorder.calls[0]["project"].env["DOCKERFILE"] == str(yard.config.app_dir("heldso") / "Containerfile")
+    assert "== runs containerfile yard (stario:" in outcome.log
+
+
+async def test_delete_image_app_purges(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard = make_yard(tmp_path, skip=False)
+    yard.store.create_app("db", "", image="postgres:17")
+    compose.write_revision(yard.config, "db", "sha256:" + "a" * 64)
+    recorder = _Apply()
+    monkeypatch.setattr(compose, "apply", recorder)
+    monkeypatch.setattr(binds, "read", lambda yard: asyncio.sleep(0, result=[]))
+    await apps.delete(yard, "db")
+    assert recorder.calls and recorder.calls[0]["command"] == "purge"
+    assert recorder.calls[0]["project"].files == [compose.IMAGE_COMPOSE]

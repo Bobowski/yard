@@ -414,13 +414,12 @@ def _runs(yard: Yard, app: App, sha: str) -> tuple[App, str]:
         return app, ""
     if app.containerfile:
         if app.containerfile == "yard":
-            if not (yard.config.app_dir(app.name) / "Containerfile").is_file():
-                raise YardError(
-                    502,
-                    "compose",
-                    f"containerfile is set to yard, but {app.name}'s Containerfile is missing",
-                    help_text="Run yard app detect to write it again.",
-                )
+            stored = yard.config.app_dir(app.name) / "Containerfile"
+            if not stored.is_file():
+                # "yard" means Yard writes one: detect the language, keep the repo files out of it.
+                resolved = detect.language(clone, app.name)
+                atomic_write(stored, resolved.generated)
+                return app, f"== runs containerfile yard ({resolved.kind}: {resolved.reason})\n"
         elif not (clone / app.containerfile).is_file():
             raise YardError(
                 502,
@@ -492,7 +491,7 @@ async def _check_source(yard: Yard, app: App, recipes: dict[str, bytes]) -> None
     if app.trigger != "push":
         return
     deployed = compose.read_revision(yard.config, app.name)
-    if revision != deployed:
+    if revision != deployed and revision != yard.tried.get(app.name):
         journal.send(
             yard.config,
             "check.moved",
@@ -529,6 +528,7 @@ async def _deploy_source(yard: Yard, app: App, *, cause: str, actor: str) -> Out
                 project.env["PREVIOUS_COMPOSE_FILE"] = str(previous_recipe)
     except YardError as exc:
         return Outcome("failed", error=str(exc), log=f"{exc}\n")
+    yard.tried[app.name] = revision
     journal.send(
         yard.config,
         "deploy.start",
