@@ -3,6 +3,7 @@
 import json
 import socket
 import struct
+import sys
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -119,6 +120,15 @@ async def test_read_builds_the_argv(tmp_path: Path):
     ]
     assert "2025-10-05T21:00:00Z heldso-app-1 hello" in text
     assert "2025-10-05T21:00:00Z heldso-app-1 hi�" in text
+
+
+async def test_read_after_a_cursor_starts_at_the_oldest(tmp_path: Path):
+    script, argv_log = _journalctl(tmp_path, out=ENTRY + "\n")
+    config = _config(tmp_path, script)
+    await journal.read(config, ["CONTAINER_NAME=heldso-app-1"], lines=50, after="s=abc;n=2;i=3")
+    argv = argv_log.read_text().splitlines()
+    assert argv[argv.index("-n") + 1] == "+50"
+    assert argv[argv.index("--after-cursor") + 1] == "s=abc;n=2;i=3"
 
 
 async def test_follow_passes_dash_f(tmp_path: Path):
@@ -287,6 +297,144 @@ async def test_logs_follow_streams(yard_journal):
     assert res.status_code == 200
     assert "heldso-app-1 hello" in res.text
     assert "-f" in argv_log.read_text().splitlines()
+
+
+_CURSOR_JOURNALCTL = """\
+import json
+import sys
+
+argv = sys.argv[1:]
+with open({argv_log!r}, "a") as log:
+    log.write(" ".join(argv) + "\\n")
+
+lines, after, matches = "", "", []
+pos = 0
+while pos < len(argv):
+    arg = argv[pos]
+    if arg in ("-D", "-o", "--since", "--until"):
+        pos += 2
+    elif arg in ("-n", "--lines"):
+        lines, pos = argv[pos + 1], pos + 2
+    elif arg == "--after-cursor":
+        after, pos = argv[pos + 1], pos + 2
+    elif arg == "-f":
+        pos += 1
+    else:
+        matches.append(arg)
+        pos += 1
+
+want = {{}}
+for match in matches:
+    field, _, value = match.partition("=")
+    want.setdefault(field, set()).add(value)
+entries = [
+    entry
+    for entry in (json.loads(line) for line in open({data!r}) if line.strip())
+    if all(str(entry.get(field) or "") in values for field, values in want.items())
+]
+if after:
+    found = [i for i, entry in enumerate(entries) if str(entry.get("__CURSOR") or "") == after]
+    entries = entries[found[0] + 1 :] if found else entries
+if lines:
+    count = int(lines.lstrip("+"))
+    entries = entries[:count] if lines.startswith("+") else entries[-count:]
+for entry in entries:
+    print(json.dumps(entry))
+"""
+
+
+def _cursor_journalctl(tmp_path: Path, entries: list[dict]) -> tuple[Path, Path]:
+    """A fake journalctl that honors matches, --after-cursor, and -n [+]N."""
+    data = tmp_path / "journal.jsonl"
+    data.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+    argv_log = tmp_path / "argv"
+    script = tmp_path / "journalctl"
+    script.write_text(f"#!{sys.executable}\n" + _CURSOR_JOURNALCTL.format(argv_log=str(argv_log), data=str(data)))
+    script.chmod(0o755)
+    (tmp_path / "journal").mkdir()
+    return script, argv_log
+
+
+@pytest.fixture
+async def yard_cursor(tmp_path, monkeypatch):
+    """The API over a journalctl that honors --after-cursor and -n [+]N."""
+    micros = int(WHEN.timestamp() * 1_000_000)
+    entries = [
+        {
+            "__CURSOR": f"cursor-{n}",
+            "__REALTIME_TIMESTAMP": str(micros + n * 1_000_000),
+            "CONTAINER_NAME": "heldso-app-1",
+            "MESSAGE": f"line {n}",
+        }
+        for n in range(5)
+    ]
+    script, argv_log = _cursor_journalctl(tmp_path, entries)
+    monkeypatch.setenv("YARD_ROOT", str(tmp_path))
+    monkeypatch.setenv("YARD_SKIP_DEPLOY", "1")
+    monkeypatch.setenv("YARD_BOOT", "0")
+    monkeypatch.setenv("YARD_PODMAN_BIN", "yard-podman-missing")
+    monkeypatch.setenv("YARD_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.setenv("YARD_JOURNALCTL_BIN", str(script))
+    async with TestClient(bootstrap) as client:
+        token = (tmp_path / "tokens" / "admin.token").read_text().strip()
+        yield client, token, argv_log
+
+
+async def test_logs_json_is_a_page_of_entries(yard_cursor):
+    client, token, _argv_log = yard_cursor
+    res = await client.get("/api/v1/logs?container=heldso-app-1&json=1&lines=1", headers=auth(token))
+    assert res.status_code == 200
+    assert res.json() == {
+        "entries": [
+            {
+                "cursor": "cursor-4",
+                "container": "heldso-app-1",
+                "time": "2025-10-05T21:00:04Z",
+                "message": "line 4",
+            }
+        ],
+        "cursor": "cursor-4",
+    }
+
+
+async def test_logs_json_batches_do_not_overlap(yard_cursor):
+    client, token, argv_log = yard_cursor
+    res = await client.get(
+        "/api/v1/logs?container=heldso-app-1&json=1&lines=2&since=-1h&after=cursor-0",
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+    batch = res.json()
+    assert [entry["message"] for entry in batch["entries"]] == ["line 1", "line 2"]
+    assert batch["cursor"] == "cursor-2"
+    argv = argv_log.read_text()
+    assert "--after-cursor cursor-0" in argv
+    assert "--since -1h" in argv
+    assert "-n +2" in argv
+
+    res = await client.get(
+        f"/api/v1/logs?container=heldso-app-1&json=1&lines=2&after={batch['cursor']}",
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+    batch = res.json()
+    assert [entry["message"] for entry in batch["entries"]] == ["line 3", "line 4"]
+    assert batch["cursor"] == "cursor-4"
+
+
+async def test_logs_json_after_the_last_entry_is_empty(yard_cursor):
+    client, token, _argv_log = yard_cursor
+    res = await client.get("/api/v1/logs?container=heldso-app-1&json=1&after=cursor-4", headers=auth(token))
+    assert res.status_code == 200
+    assert res.json() == {"entries": [], "cursor": ""}
+
+
+async def test_logs_text_takes_after_too(yard_cursor):
+    client, token, _argv_log = yard_cursor
+    res = await client.get("/api/v1/logs?container=heldso-app-1&after=cursor-1", headers=auth(token))
+    assert res.status_code == 200
+    assert "line 1" not in res.text
+    assert "line 2" in res.text and "line 4" in res.text
 
 
 async def test_logs_needs_a_token(yard_journal):

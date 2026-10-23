@@ -26,6 +26,7 @@ def _argv(
     lines: int,
     since: str = "",
     until: str = "",
+    after: str = "",
     follow: bool = False,
 ) -> list[str]:
     argv = [
@@ -36,12 +37,16 @@ def _argv(
         "-o",
         "json",
         "-n",
-        str(lines),
+        # "+N" takes the first lines after the cursor; a tail of the window
+        # would silently drop the backlog a poller has not seen yet.
+        f"+{lines}" if after else str(lines),
     ]
     if since:
         argv += ["--since", since]
     if until:
         argv += ["--until", until]
+    if after:
+        argv += ["--after-cursor", after]
     if follow:
         argv.append("-f")
     # Repeating one field name is OR for journalctl.
@@ -82,9 +87,10 @@ async def read(
     lines: int,
     since: str = "",
     until: str = "",
+    after: str = "",
 ) -> str:
     """Formatted lines, oldest first. journalctl -n already picks the tail."""
-    out = await _run(config, _argv(config, matches, lines, since, until))
+    out = await _run(config, _argv(config, matches, lines, since, until, after))
     return "".join(line for entry in entries(out) if (line := format_line(entry)))
 
 
@@ -95,9 +101,10 @@ async def read_entries(
     lines: int,
     since: str = "",
     until: str = "",
+    after: str = "",
 ) -> list[dict]:
     """The raw entries, oldest first."""
-    out = await _run(config, _argv(config, matches, lines, since, until))
+    out = await _run(config, _argv(config, matches, lines, since, until, after))
     return list(entries(out))
 
 

@@ -537,19 +537,43 @@ _YARD_TOP = {"YARD_EVENT", "YARD_APP", "YARD_CONTAINER", "YARD_ACTOR", "YARD_SHA
 
 def logs_get(config: Config) -> Handler:
     async def handler(c: Context, w: Writer) -> None:
-        """Container logs from the journal; they outlive the container."""
+        """Container logs from the journal; they outlive the container.
+
+        after is a journald cursor: only entries after it are returned, first
+        `lines` of them, so a poller resumes where it left off. json=1 answers
+        {"entries": [...], "cursor": ...} instead of text lines.
+        """
         query = c.req.query
         lines = _log_lines(str(query.get("lines") or ""))
         since = _log_time(str(query.get("since") or ""))
         until = _log_time(str(query.get("until") or ""))
+        after = str(query.get("after") or "")
         match = _container_match(str(query.get("container") or ""))
         if query.get("follow") == "1":
             await _stream_journal(config, c, w, [match], lines)
             return
-        text = await journal.read(config, [match], lines=lines, since=since, until=until)
+        if query.get("json") == "1":
+            entries = await journal.read_entries(config, [match], lines=lines, since=since, until=until, after=after)
+            w.json(cast(JsonValue, _logs_page(entries)))
+            return
+        text = await journal.read(config, [match], lines=lines, since=since, until=until, after=after)
         w.text(text if text.endswith("\n") or not text else text + "\n")
 
     return handler
+
+
+def _logs_page(entries: list[dict]) -> dict[str, Any]:
+    """One page of log entries and the cursor a poller passes back as after."""
+    rows = [
+        {
+            "cursor": str(entry.get("__CURSOR") or ""),
+            "container": str(entry.get("CONTAINER_NAME") or ""),
+            "time": journal.timestamp(entry),
+            "message": journal.message_text(entry),
+        }
+        for entry in entries
+    ]
+    return {"entries": rows, "cursor": rows[-1]["cursor"] if rows else ""}
 
 
 def _container_match(given: str) -> str:
