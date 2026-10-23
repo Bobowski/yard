@@ -2,7 +2,6 @@
 
 import re
 from dataclasses import asdict
-from pathlib import Path
 from typing import Any, cast
 
 from stario import App as StarioApp
@@ -10,7 +9,7 @@ from stario import Context, Handler, Middleware, Route, Writer, json
 from stario.http.middleware import catch_errors
 from stario.json import JsonValue
 
-from app.server import apps, binds, compose, doctor, journal, status
+from app.server import apps, binds, doctor, journal, status
 from app.server.forges import Forge, GitHub, Origin
 from app.server.store import App, Config, Store
 from app.server.yard import Yard
@@ -499,59 +498,9 @@ def app_file(yard: Yard) -> Handler:
     async def handler(c: Context, w: Writer) -> None:
         """The compose or Containerfile an app runs, as text/plain."""
         app = yard.store.app(c.match.params["name"])
-        w.text(_app_file(yard.config, app, c.match.params["which"]))
+        w.text(apps.app_file(yard.config, app, c.match.params["which"]))
 
     return handler
-
-
-def _app_file(config: Config, app: App, which: str) -> str:
-    deploy = f"Yard decides on the first deploy: yard app deploy --app {app.name}"
-    if which == "compose":
-        if app.compose:
-            return _clone_file(config.clone(app.name), app.compose, app.name)
-        if app.containerfile:
-            path = Path(compose.APPLY_DIR) / "default.compose.yml"
-            if path.is_file():
-                return path.read_text()
-            raise YardError(404, "no_file", "Yard's compose file is missing on this host", help_text=deploy)
-        raise YardError(404, "no_file", f"{app.name} has no compose file yet", help_text=deploy)
-    if which == "containerfile":
-        if app.containerfile == "yard":
-            path = config.app_dir(app.name) / "Containerfile"
-            if path.is_file():
-                return path.read_text()
-            raise YardError(
-                404,
-                "no_file",
-                f"{app.name}'s Containerfile is missing",
-                help_text="Run yard app detect to write it again.",
-            )
-        if app.containerfile:
-            return _clone_file(config.clone(app.name), app.containerfile, app.name)
-        if app.compose:
-            raise YardError(
-                404,
-                "no_file",
-                f"{app.name} runs its own compose file; that file names its build",
-                help_text="yard app cat compose",
-            )
-        raise YardError(404, "no_file", f"{app.name} has no Containerfile yet", help_text=deploy)
-    raise YardError(404, "no_file", f"no file {which}", help_text="The files are compose and containerfile.")
-
-
-def _clone_file(clone: Path, rel: str, name: str) -> str:
-    root = clone.resolve()
-    path = (root / rel).resolve()
-    if path.parent != root and root not in path.parents:
-        raise YardError(404, "no_file", f"{rel} is outside the clone")
-    if not path.is_file():
-        raise YardError(
-            404,
-            "no_file",
-            f"{rel} is not in {name}'s clone",
-            help_text=f"The clone is the deployed commit: yard app deploy --app {name}",
-        )
-    return path.read_text()
 
 
 async def _resolve_sha(config: Config, name: str, prefix: str) -> str:

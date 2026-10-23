@@ -11,7 +11,6 @@ import pytest
 from app.server import compose
 from app.server.compose import APPLY_DIR, DEFAULT_COMPOSE, image_tag, prepare, run_env, saved_project
 from app.server.store import App, Config
-from app.shared import YardError
 
 ON_YARD = "services:\n  app:\n    networks:\n      - yard\n"
 FULL = ON_YARD + "    env_file:\n      - ${APP_ENV}\n    volumes:\n      - ${DATA_DIR}:/data\n"
@@ -82,7 +81,6 @@ def test_run_env_is_the_interpolation_env(tmp_path: Path):
         "CHECKOUT": str(checkout),
         "DATA_DIR": str(tmp_path / "apps" / "heldso" / "data"),
         "APP_ENV": str(tmp_path / "apps" / "heldso" / "env"),
-        "DOCKERFILE": "Containerfile",
     }
     assert (tmp_path / "apps" / "heldso" / "data").is_dir()
     assert not any(key.startswith("STARIO") for key in env)
@@ -94,7 +92,7 @@ def test_prepare_with_the_default_compose(tmp_path: Path):
     project = _prepare(config, _app("heldso"), checkout, "localhost/heldso:abc", "abc")
 
     assert project.files == [DEFAULT_COMPOSE]
-    assert project.env["DOCKERFILE"] == "Containerfile"
+    assert "DOCKERFILE" not in project.env
     assert project.env["APP_ENV"] == str(tmp_path / "apps" / "heldso" / "env")
 
     # The env file exists for compose, closed to other users. Nothing else is written.
@@ -104,11 +102,26 @@ def test_prepare_with_the_default_compose(tmp_path: Path):
     assert not (tmp_path / "run").exists()
 
 
-def test_prepare_needs_a_build_source(tmp_path: Path):
+def test_prepare_uses_the_record_build_path(tmp_path: Path):
     config = _config(tmp_path)
     checkout = _checkout(tmp_path, {"README": "hi\n"})
-    with pytest.raises(YardError, match="no compose file or Containerfile"):
-        _prepare(config, _app("heldso"), checkout, "img", "abc")
+    app = _app("heldso")
+    app.containerfile = "ops/api.Containerfile"
+    project = _prepare(config, app, checkout, "localhost/heldso:abc", "abc")
+    assert project.env["DOCKERFILE"] == "ops/api.Containerfile"
+    app.containerfile = "yard"
+    (tmp_path / "apps" / "heldso" / "Containerfile").write_text("FROM scratch\n")
+    project = _prepare(config, app, checkout, "localhost/heldso:abc", "abc")
+    assert project.env["DOCKERFILE"] == str(tmp_path / "apps" / "heldso" / "Containerfile")
+
+
+def test_prepare_unset_record_still_prepares(tmp_path: Path):
+    """A purge of an unset record works: the find fallback, no DOCKERFILE."""
+    config = _config(tmp_path)
+    checkout = _checkout(tmp_path, {"README": "hi\n"})
+    project = _prepare(config, _app("heldso"), checkout, "localhost/heldso:abc", "abc")
+    assert project.files == [DEFAULT_COMPOSE]
+    assert "DOCKERFILE" not in project.env
 
 
 def test_prepare_with_a_repo_compose(tmp_path: Path):

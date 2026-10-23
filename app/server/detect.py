@@ -5,7 +5,6 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from app import package_version
 from app.server import git
 from app.server.compose import COMPOSE_NAMES, DOCKERFILES
 from app.shared import YardError
@@ -89,7 +88,7 @@ def _python_version(pyproject: str) -> str:
 
 def _header(kind: str, reason: str, name: str) -> str:
     return (
-        f"# Written by Yard {package_version()} for a {kind} app ({reason})."
+        f"# Written by Yard for a {kind} app ({reason})."
         f" To change it, copy it into your repo: yard app cat containerfile --app {name or '<name>'} > Containerfile\n"
     )
 
@@ -242,7 +241,7 @@ def _node(checkout: Path, name: str) -> Resolved:
     engines_raw = package.get("engines")
     engines: dict = engines_raw if isinstance(engines_raw, dict) else {}
     found = _NODE_ENGINE.search(str(engines.get("node") or ""))
-    version = f"{found.group(0)}-slim" if found else "24-slim"
+    version = found.group(0) if found else "24"
     install = "npm ci" if (checkout / "package-lock.json").is_file() else "npm install"
     return Resolved(
         "containerfile",

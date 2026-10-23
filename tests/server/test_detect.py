@@ -37,9 +37,9 @@ def test_stario(tmp_path: Path):
     resolved = detect.resolve(tmp_path, "heldso")
     assert (resolved.field, resolved.value, resolved.kind) == ("containerfile", "yard", "stario")
     assert resolved.reason == "pyproject.toml declares stario"
-    assert resolved.generated.startswith("# Written by Yard")
+    assert resolved.generated.startswith("# Written by Yard for a stario app (pyproject.toml declares stario).")
     assert "yard app cat containerfile --app heldso" in resolved.generated
-    assert "FROM python:3.14-slim-trixie AS builder" in resolved.generated
+    assert "\nFROM python:3.14-slim-trixie AS builder\n" in "\n" + resolved.generated
     assert "HEALTHCHECK" not in resolved.generated
 
 
@@ -54,7 +54,7 @@ def test_stario_marker(tmp_path: Path):
     _write(tmp_path, "uv.lock", "lock")
     resolved = detect.resolve(tmp_path, "heldso")
     assert resolved.kind == "stario"
-    assert "python:3.15-slim-trixie" in resolved.generated
+    assert "\nFROM python:3.15-slim-trixie AS builder\n" in "\n" + resolved.generated
 
 
 def test_python_requirements(tmp_path: Path):
@@ -96,7 +96,7 @@ def test_go_root_main(tmp_path: Path):
     _write(tmp_path, "main.go", "package main\n")
     resolved = detect.resolve(tmp_path, "heldso")
     assert resolved.kind == "go"
-    assert "FROM golang:1.24 AS builder" in resolved.generated
+    assert "\nFROM golang:1.24 AS builder\n" in "\n" + resolved.generated
     assert "go build -trimpath -o /out/app ." in resolved.generated
     assert "gcr.io/distroless/static-debian12" in resolved.generated
 
@@ -121,7 +121,7 @@ def test_node(tmp_path: Path):
     _write(tmp_path, "package-lock.json", "{}")
     resolved = detect.resolve(tmp_path, "heldso")
     assert resolved.kind == "node"
-    assert "FROM node:20-slim" in resolved.generated
+    assert "\nFROM node:20-slim\n" in "\n" + resolved.generated
     assert "RUN npm ci" in resolved.generated
     assert 'CMD ["npm", "start"]' in resolved.generated
 
@@ -131,7 +131,7 @@ def test_node_build_script(tmp_path: Path):
     resolved = detect.resolve(tmp_path, "heldso")
     assert "RUN npm install" in resolved.generated
     assert "RUN npm run build" in resolved.generated
-    assert "node:24-slim" in resolved.generated
+    assert "\nFROM node:24-slim\n" in "\n" + resolved.generated
 
 
 def test_node_no_start(tmp_path: Path):
