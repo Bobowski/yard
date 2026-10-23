@@ -258,6 +258,48 @@ def check_window(text: str) -> str:
     )
 
 
+def check_build_path(text: str) -> str:
+    """A repo-relative build path: a compose file or a Containerfile."""
+    value = text.strip()
+    if (
+        not value
+        or len(value) > 200
+        or value.startswith("/")
+        or "\\" in value
+        or ".." in value.split("/")
+        or any(ch.isspace() or ord(ch) < 32 for ch in value)
+    ):
+        raise YardError(
+            400,
+            "bad_path",
+            "path must be a file inside the repo",
+            context={"path": text},
+            help_text="A relative path like Containerfile or ops/compose.yml. No leading slash, no .., no spaces.",
+            example="ops/Containerfile",
+        )
+    return value
+
+
+def check_containerfile(text: str) -> str:
+    """The app's Containerfile: `yard` writes one, anything else is a repo path."""
+    if text.strip() == "yard":
+        return "yard"
+    return check_build_path(text)
+
+
+def check_compose(text: str) -> str:
+    """The app's compose file: always a repo-relative path."""
+    if text.strip() == "yard":
+        raise YardError(
+            400,
+            "bad_compose",
+            "compose must be a file inside the repo",
+            context={"compose": text},
+            help_text="Yard's own compose file comes with --containerfile.",
+        )
+    return check_build_path(text)
+
+
 def name_ok(name: str) -> bool:
     if not name or len(name) > 128:
         return False

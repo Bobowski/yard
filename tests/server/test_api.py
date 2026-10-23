@@ -838,3 +838,82 @@ async def test_events_log_actors_and_never_secrets(yard, capsys):
     assert create["actor"] == "admin" and create["app"] == "heldso"
     env = next(row for row in rows if row["yard"] == "env.set")
     assert env["keys"] == "PASSWORD" and env["actor"] == "admin"
+
+
+async def test_app_build_fields(yard):
+    client, token, _root = yard
+    res = await client.post(
+        "/api/v1/apps",
+        json={"name": "heldso", "repo": "https://github.com/org/heldso", "containerfile": "Dockerfile"},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+    assert res.json()["app"]["containerfile"] == "Dockerfile"
+    assert res.json()["app"]["compose"] == ""
+
+    res = await client.patch(
+        "/api/v1/apps/heldso",
+        json={"containerfile": "x", "compose": "y"},
+        headers=auth(token),
+    )
+    assert res.status_code == 400
+    assert "not both" in res.text
+
+    res = await client.patch("/api/v1/apps/heldso", json={"compose": "compose.yml"}, headers=auth(token))
+    assert res.status_code == 200
+    assert res.json()["app"]["compose"] == "compose.yml"
+    assert res.json()["app"]["containerfile"] == ""
+
+    res = await client.patch("/api/v1/apps/heldso", json={"compose": "yard"}, headers=auth(token))
+    assert res.status_code == 400
+    assert "bad_compose" in res.text
+
+    res = await client.patch("/api/v1/apps/heldso", json={"containerfile": "", "compose": ""}, headers=auth(token))
+    assert res.status_code == 200
+    assert res.json()["app"]["compose"] == ""
+
+
+async def test_app_files_route(yard, tmp_path):
+    client, token, _root = yard
+    await client.post(
+        "/api/v1/apps",
+        json={"name": "heldso", "repo": "https://github.com/org/heldso", "compose": "compose.yml"},
+        headers=auth(token),
+    )
+    res = await client.get("/api/v1/apps/heldso/files/compose", headers=auth(token))
+    assert res.status_code == 404
+    assert "not in heldso's clone" in res.text
+
+    clone = tmp_path / "apps" / "heldso" / "repo"
+    clone.mkdir(parents=True)
+    (clone / "compose.yml").write_text("services: {}\n")
+    res = await client.get("/api/v1/apps/heldso/files/compose", headers=auth(token))
+    assert res.status_code == 200
+    assert res.text == "services: {}\n"
+
+    res = await client.get("/api/v1/apps/heldso/files/containerfile", headers=auth(token))
+    assert res.status_code == 404
+    assert "runs its own compose file" in res.text
+
+    res = await client.get("/api/v1/apps/heldso/files/bogus", headers=auth(token))
+    assert res.status_code == 404
+
+    await client.patch("/api/v1/apps/heldso", json={"containerfile": "yard"}, headers=auth(token))
+    res = await client.get("/api/v1/apps/heldso/files/containerfile", headers=auth(token))
+    assert res.status_code == 404
+    (tmp_path / "apps" / "heldso" / "Containerfile").write_text("FROM scratch\n")
+    res = await client.get("/api/v1/apps/heldso/files/containerfile", headers=auth(token))
+    assert res.status_code == 200
+    assert res.text == "FROM scratch\n"
+    res = await client.get("/api/v1/apps/heldso/files/compose", headers=auth(token))
+    assert res.status_code == 200
+    assert "services:" in res.text
+
+    await client.post(
+        "/api/v1/apps",
+        json={"name": "other", "repo": "https://github.com/org/other"},
+        headers=auth(token),
+    )
+    res = await client.get("/api/v1/apps/other/files/compose", headers=auth(token))
+    assert res.status_code == 404
+    assert "yard app deploy" in res.text

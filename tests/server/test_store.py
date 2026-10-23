@@ -1,5 +1,7 @@
 """The file store: apps, tokens, and the admin token."""
 
+from pathlib import Path
+
 import pytest
 
 from app.server.store import Store, ensure_admin
@@ -83,3 +85,47 @@ def test_env_files_round_trip(tmp_path):
     assert store.read_env("heldso") == {"A": "1", "C": "3"}
     path = tmp_path / "apps" / "heldso" / "env"
     assert oct(path.stat().st_mode & 0o777) == "0o600"
+
+
+def test_app_build_fields_round_trip(tmp_path: Path):
+    store = Store.open(tmp_path)
+    app = store.create_app("heldso", "https://github.com/org/heldso", containerfile="Dockerfile")
+    assert app.containerfile == "Dockerfile"
+    assert store.app("heldso").containerfile == "Dockerfile"
+    app = store.update_app("heldso", compose="compose.yml")
+    assert app.compose == "compose.yml"
+    assert app.containerfile == ""
+    app = store.update_app("heldso", compose="")
+    assert app.compose == ""
+    app = store.update_app("heldso", containerfile="yard")
+    assert app.containerfile == "yard"
+    assert "containerfile yard" in (tmp_path / "apps" / "heldso" / "app").read_text()
+
+
+def test_app_build_fields_old_record(tmp_path: Path):
+    store = Store.open(tmp_path)
+    store.create_app("heldso", "https://github.com/org/heldso")
+    record = "repo https://github.com/org/heldso\nref main\ntrigger push\ncreated now\n"
+    (tmp_path / "apps" / "heldso" / "app").write_text(record)
+    app = store.app("heldso")
+    assert app.containerfile == ""
+    assert app.compose == ""
+
+
+def test_app_build_fields_validate(tmp_path: Path):
+    store = Store.open(tmp_path)
+    store.create_app("heldso", "https://github.com/org/heldso")
+    for bad in ("/abs", "a/../b", "a b", "a\\b"):
+        with pytest.raises(YardError, match="bad_path|inside the repo"):
+            store.update_app("heldso", containerfile=bad)
+    with pytest.raises(YardError, match="bad_compose|compose"):
+        store.update_app("heldso", compose="yard")
+    with pytest.raises(YardError, match="not both"):
+        store.update_app("heldso", containerfile="Dockerfile", compose="compose.yml")
+
+
+def test_app_build_fields_need_a_repo(tmp_path: Path):
+    store = Store.open(tmp_path)
+    store.create_app("yard", "")
+    with pytest.raises(YardError, match="no repo|Set the repo"):
+        store.update_app("yard", containerfile="Dockerfile")

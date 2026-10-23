@@ -189,6 +189,9 @@ def format_app_status(report: dict, now: datetime, *, color: bool = False) -> st
         lines.append(rev)
     data = max((int(row.get("data") or 0) for row in rows), default=0)
     lines.append(f"data {format_bytes(data)} · env {report.get('env_file') or ''}")
+    for field in ("containerfile", "compose"):
+        if str(record.get(field) or ""):
+            lines.append(f"{field}  {record[field]}")
 
     binds = [row for row in report.get("binds") or [] if isinstance(row, dict) and row.get("host")]
     if binds:

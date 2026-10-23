@@ -50,7 +50,13 @@ build() {
     # in ~2s where dc build needs ~18s on the same socket.
     */default.compose.yml)
       # Docker format keeps HEALTHCHECK; podman-remote defaults to OCI, which drops it.
-      podman-remote build --format docker -t "$IMAGE" -f "$CHECKOUT/${DOCKERFILE:-Containerfile}" "$CHECKOUT" || exit 1
+      # An absolute DOCKERFILE is the one Yard wrote outside the checkout.
+      df="${DOCKERFILE:-Containerfile}"
+      case "$df" in
+        /*) ;;
+        *) df="$CHECKOUT/$df" ;;
+      esac
+      podman-remote build --format docker -t "$IMAGE" -f "$df" "$CHECKOUT" || exit 1
       ;;
     *)
       dc build || exit 1

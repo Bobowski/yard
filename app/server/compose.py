@@ -36,6 +36,16 @@ def find_compose(checkout: Path) -> Path | None:
     return next((checkout / name for name in COMPOSE_NAMES if (checkout / name).is_file()), None)
 
 
+def compose_files(app: App, checkout: Path) -> list[str]:
+    """The compose file a deploy or purge runs. The record wins; unset falls back to the repo scan."""
+    if app.compose:
+        return [str(checkout / app.compose)]
+    if app.containerfile:
+        return [DEFAULT_COMPOSE]
+    found = find_compose(checkout)
+    return [str(found)] if found else [DEFAULT_COMPOSE]
+
+
 def run_env(config: Config, app: App, checkout: Path, image: str, sha: str) -> dict[str, str]:
     """The values the compose files interpolate. The same names reach the apply container as process env."""
     data = config.data(app.name)
@@ -49,16 +59,13 @@ def run_env(config: Config, app: App, checkout: Path, image: str, sha: str) -> d
         "APP_ENV": str(config.env(app.name)),
     }
 
-    if find_compose(checkout) is None:
-        dockerfile = next((name for name in DOCKERFILES if (checkout / name).is_file()), "")
-        if not dockerfile:
-            raise YardError(
-                502,
-                "compose",
-                f"no compose file or Containerfile in {checkout}",
-                help_text="Add a Containerfile or a compose file to the repo: stario.dev/yard/compose",
-            )
-        env["DOCKERFILE"] = dockerfile
+    if app.compose:
+        pass  # The repo's compose file names its own build.
+    elif app.containerfile == "yard":
+        # Absolute, so apply.sh uses the stored file instead of a repo path.
+        env["DOCKERFILE"] = str(config.app_dir(app.name) / "Containerfile")
+    elif app.containerfile:
+        env["DOCKERFILE"] = app.containerfile
     if app.name == "yard":
         # ops/compose.yml binds these host paths.
         sock = config.podman_sock or "/run/podman/podman.sock"
@@ -82,10 +89,8 @@ def prepare(config: Config, app: App, checkout: Path, image: str, sha: str) -> P
     """The project a deploy runs. The apply container checks the compose file."""
     env = run_env(config, app, checkout, image, sha)
     ensure_env(config.env(app.name))
-    compose_file = find_compose(checkout)
-    if compose_file is None:
-        return Project(app.name, [DEFAULT_COMPOSE], env)
-    return Project(app.name, [str(compose_file)], env)
+    files = compose_files(app, checkout)
+    return Project(app.name, files, env)
 
 
 def saved_project(config: Config, app: App) -> Project | None:
@@ -97,8 +102,7 @@ def saved_project(config: Config, app: App) -> Project | None:
     if not sha:
         return None
     image = image_tag(app.name, sha)
-    compose_file = find_compose(checkout)
-    files = [str(compose_file) if compose_file else DEFAULT_COMPOSE]
+    files = compose_files(app, checkout)
     env = run_env(config, app, checkout, image, sha)
     ensure_env(config.env(app.name))
     return Project(app.name, files, env)

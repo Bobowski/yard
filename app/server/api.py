@@ -30,6 +30,7 @@ APP = Route("GET /api/v1/apps/{name}")
 APP_PATCH = Route("PATCH /api/v1/apps/{name}")
 APP_DELETE = Route("DELETE /api/v1/apps/{name}")
 APP_DEPLOY = Route("POST /api/v1/apps/{name}/deploy")
+APP_FILE = Route("GET /api/v1/apps/{name}/files/{which}")
 ENV = Route("GET /api/v1/apps/{name}/env")
 ENV_PATCH = Route("PATCH /api/v1/apps/{name}/env")
 ENV_PUT = Route("PUT /api/v1/apps/{name}/env")
@@ -58,7 +59,7 @@ async def json_object(c: Context) -> dict:
 def app_fields(body: dict) -> dict[str, str]:
     """The fields an app PATCH or POST takes: repo, ref, trigger."""
     fields: dict[str, str] = {}
-    for key in ("repo", "ref", "trigger"):
+    for key in ("repo", "ref", "trigger", "containerfile", "compose"):
         if key not in body:
             continue
         value = body[key]
@@ -75,6 +76,8 @@ def app_json(app: App) -> dict[str, Any]:
         "ref": app.ref,
         "trigger": app.trigger,
         "created": app.created,
+        "containerfile": app.containerfile,
+        "compose": app.compose,
     }
 
 
@@ -487,6 +490,15 @@ def app_deploy(yard: Yard) -> Handler:
                 },
             ),
         )
+
+    return handler
+
+
+def app_file(yard: Yard) -> Handler:
+    async def handler(c: Context, w: Writer) -> None:
+        """The compose or Containerfile an app runs, as text/plain."""
+        app = yard.store.app(c.match.params["name"])
+        w.text(apps.app_file(yard.config, app, c.match.params["which"]))
 
     return handler
 
@@ -974,6 +986,7 @@ def register(app: StarioApp, yard: Yard) -> None:
     app.add(APP_PATCH, app_patch(yard), middleware=auth)
     app.add(APP_DELETE, app_delete(yard), middleware=auth)
     app.add(APP_DEPLOY, app_deploy(yard), middleware=auth)
+    app.add(APP_FILE, app_file(yard), middleware=auth)
     app.add(ENV, env_show(yard.store), middleware=auth)
     app.add(ENV_PATCH, env_patch(yard.store, yard.config), middleware=auth)
     app.add(ENV_PUT, env_put(yard.store, yard.config), middleware=auth)
