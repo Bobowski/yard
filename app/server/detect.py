@@ -40,8 +40,7 @@ def resolve(checkout: Path, name: str = "") -> Resolved:
 
 
 def language(checkout: Path, name: str = "") -> Resolved:
-    """Which bundled Containerfile the repo's language gets. compose/Containerfile files are not read."""
-    """Language detection, when the repo ships no compose file and no Containerfile."""
+    """Which bundled Containerfile the repo's language gets. Repo compose and Containerfile files are not read."""
     pyproject = (checkout / "pyproject.toml").read_text() if (checkout / "pyproject.toml").is_file() else ""
     if pyproject and ("[tool.stario-create]" in pyproject or _STARIO_DEP.search(pyproject)):
         return _stario(checkout, name, pyproject)
