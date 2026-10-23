@@ -389,6 +389,9 @@ def _cmd_app_new(args: argparse.Namespace) -> None:
     body: dict[str, object] = {"name": name, "repo": repo, "ref": ref}
     if args.trigger:
         body["trigger"] = args.trigger
+    for key in ("containerfile", "compose"):
+        if getattr(args, key):
+            body[key] = getattr(args, key)
     raw = _api(session, "POST", "/api/v1/apps", body)
     if host:
         _api(session, "PUT", f"/api/v1/binds/{quote(host, safe='')}", {"dial": f"{name}-app-1", "try": window})
@@ -430,12 +433,12 @@ def _cmd_app_set(args: argparse.Namespace) -> None:
     session = _load(args)
     name = _app_name(session, args)
     patch: dict[str, str] = {}
-    for key in ("repo", "ref", "trigger"):
+    for key in ("repo", "ref", "trigger", "containerfile", "compose"):
         value = str(getattr(args, key, "") or "").strip()
         if value:
             patch[key] = value
     if not patch:
-        _die("yard app set needs --repo, --ref, or --trigger")
+        _die("yard app set needs --repo, --ref, --trigger, --containerfile, or --compose")
     page = _object(_api(session, "GET", "/api/v1/apps/" + quote(name), None))
     current = page.get("app") if isinstance(page, dict) else None
     current = current if isinstance(current, dict) else {}
@@ -446,16 +449,51 @@ def _cmd_app_set(args: argparse.Namespace) -> None:
     wrap = _object(raw)
     found = wrap.get("app") if isinstance(wrap, dict) else None
     app = found if isinstance(found, dict) else {}
-    moved = ("repo" in patch and patch["repo"] != str(current.get("repo") or "")) or (
-        "ref" in patch and patch["ref"] != str(current.get("ref") or "")
-    )
+    moved = any(key in patch and patch[key] != str(current.get(key) or "") for key in ("repo", "ref"))
+    built = any(key in patch and patch[key] != str(current.get(key) or "") for key in ("containerfile", "compose"))
     if moved and str(app.get("trigger") or "") == "push":
         print(f"The next check deploys it within 5 minutes. Deploy now: yard app deploy --app {name}")
     elif moved:
         print(f"Saved. {name} still runs the old repo and ref until the next deploy.")
         print(f"Deploy now: yard app deploy --app {name}")
+    elif built:
+        print(f"Saved. {name} still builds the old way until the next deploy.")
+        print(f"Deploy now: yard app deploy --app {name}")
     else:
         print("Saved.")
+
+
+def _cmd_app_detect(args: argparse.Namespace) -> None:
+    session = _load(args)
+    name = _app_name(session, args)
+    page = _object(_api(session, "GET", f"/api/v1/apps/{quote(name)}", None))
+    record = page.get("app") if isinstance(page, dict) else {}
+    record = record if isinstance(record, dict) else {}
+    was = ""
+    if str(record.get("containerfile") or ""):
+        was = f"containerfile {record['containerfile']}"
+    elif str(record.get("compose") or ""):
+        was = f"compose {record['compose']}"
+    raw = _api(session, "PATCH", f"/api/v1/apps/{quote(name)}", {"containerfile": "", "compose": ""})
+    if _json:
+        print(raw)
+        return
+    if was:
+        print(f"{name}: the next deploy decides what to run again (was: {was}).")
+    else:
+        print(f"{name}: the next deploy decides what to run.")
+    print(f"Deploy now: yard app deploy --app {name}")
+
+
+def _cmd_app_cat(args: argparse.Namespace) -> None:
+    session = _load(args)
+    name = _app_name(session, args)
+    code, text = _api_try(session, "GET", f"/api/v1/apps/{quote(name)}/files/{args.which}", None)
+    if code >= 300:
+        _die(text if _json else explain(text))
+    sys.stdout.write(text)
+    if text and not text.endswith("\n"):
+        sys.stdout.write("\n")
 
 
 def _cmd_app_status(args: argparse.Namespace) -> None:
@@ -1310,6 +1348,11 @@ def _app_parser(subs: argparse._SubParsersAction, common: argparse.ArgumentParse
     new.add_argument("--public", metavar="HOST", default="", help="a name on the public internet")
     new.add_argument("--try", dest="window", default=None, help="how long caddy waits for the upstream")
     new.add_argument("--no-deploy", action="store_true", help="create the app without a first deploy")
+    newbuild = new.add_mutually_exclusive_group()
+    newbuild.add_argument(
+        "--containerfile", default="", help="a Containerfile in the repo, or yard for one Yard writes"
+    )
+    newbuild.add_argument("--compose", default="", help="a compose file in the repo")
     _add_app_flag(new, "the app name; the repo and branch give a default")
     new.set_defaults(func=_cmd_app_new)
 
@@ -1317,12 +1360,24 @@ def _app_parser(subs: argparse._SubParsersAction, common: argparse.ArgumentParse
     set_.add_argument("--repo", default="", help="the repo https URL")
     set_.add_argument("--ref", default="", help="the branch to follow")
     set_.add_argument("--trigger", default="", help="push or manual")
+    build = set_.add_mutually_exclusive_group()
+    build.add_argument("--containerfile", default="", help="a Containerfile in the repo, or yard for one Yard writes")
+    build.add_argument("--compose", default="", help="a compose file in the repo")
     _add_app_flag(set_)
     set_.set_defaults(func=_cmd_app_set)
 
     stat = subs.add_parser("status", help="one app's page", parents=[common])
     _add_app_flag(stat)
     stat.set_defaults(func=_cmd_app_status)
+
+    detect = subs.add_parser("detect", help="let the next deploy decide what to run again", parents=[common])
+    _add_app_flag(detect)
+    detect.set_defaults(func=_cmd_app_detect)
+
+    cat = subs.add_parser("cat", help="print the compose or Containerfile the app runs", parents=[common])
+    cat.add_argument("which", choices=["compose", "containerfile"], help="which file to print")
+    _add_app_flag(cat)
+    cat.set_defaults(func=_cmd_app_cat)
 
     logs = subs.add_parser("logs", help="container logs", parents=[common])
     _log_flags(logs)

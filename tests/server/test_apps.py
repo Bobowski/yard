@@ -891,3 +891,99 @@ def test_prune_one_day_removes_the_recent_ones(tmp_path: Path):
     assert "localhost/app:fr3sh" in fake.removed
     tags = {row["tag"] for row in found["images"]}
     assert tags == {"localhost/app:0ld", "localhost/app:st4le", "localhost/app:fr3sh", "localhost/busy:t4g"}
+
+
+def _stario_clone(yard: Yard, name: str) -> Path:
+    clone = yard.config.clone(name)
+    clone.mkdir(parents=True, exist_ok=True)
+    (clone / "pyproject.toml").write_text('[project]\ndependencies = ["stario>=5"]\n')
+    (clone / "uv.lock").write_text("lock")
+    (clone / "app").mkdir()
+    (clone / "app" / "main.py").write_text("")
+    subprocess.run(["git", "-C", str(clone), "init", "-b", "main"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(clone), "-c", "user.email=t@t", "-c", "user.name=t", "add", "."],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(clone), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "one"],
+        check=True,
+        capture_output=True,
+    )
+    return clone
+
+
+async def test_first_deploy_resolves_and_writes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard = make_yard(tmp_path, skip=False)
+    yard.store.create_app("heldso", "https://origin.cursor.com/org/app")
+    _stario_clone(yard, "heldso")
+    _connect(monkeypatch)
+    recorder = _Apply()
+    monkeypatch.setattr(compose, "apply", recorder)
+
+    async def fake_sync(clone, url, ref, token=""):
+        return git.head(clone)
+
+    monkeypatch.setattr(git, "sync", fake_sync)
+    outcome = await apps.deploy(yard, "heldso")
+    assert outcome.status == "ok"
+    app = yard.store.app("heldso")
+    assert app.containerfile == "yard"
+    written = (yard.config.app_dir("heldso") / "Containerfile").read_text()
+    assert written.startswith("# Written by Yard")
+    env = recorder.calls[0]["project"].env
+    assert env["DOCKERFILE"] == str(yard.config.app_dir("heldso") / "Containerfile")
+    assert outcome.log.startswith("== runs containerfile yard (stario: pyproject.toml declares stario)")
+
+
+async def test_second_deploy_keeps_the_written_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard = make_yard(tmp_path, skip=False)
+    yard.store.create_app("heldso", "https://origin.cursor.com/org/app")
+    _stario_clone(yard, "heldso")
+    _connect(monkeypatch)
+    monkeypatch.setattr(compose, "apply", _Apply())
+
+    async def fake_sync(clone, url, ref, token=""):
+        return git.head(clone)
+
+    monkeypatch.setattr(git, "sync", fake_sync)
+    await apps.deploy(yard, "heldso")
+    stored = yard.config.app_dir("heldso") / "Containerfile"
+    stored.write_text("# custom\nFROM scratch\n")
+    outcome = await apps.deploy(yard, "heldso")
+    assert outcome.status == "ok"
+    assert stored.read_text() == "# custom\nFROM scratch\n"
+
+
+async def test_deploy_repo_path_missing_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard = make_yard(tmp_path, skip=False)
+    yard.store.create_app("heldso", "https://origin.cursor.com/org/app", compose="deploy/x.yml")
+    _clone(yard, "heldso")
+    _connect(monkeypatch)
+    monkeypatch.setattr(compose, "apply", _Apply())
+
+    async def fake_sync(clone, url, ref, token=""):
+        return git.head(clone)
+
+    monkeypatch.setattr(git, "sync", fake_sync)
+    outcome = await apps.deploy(yard, "heldso")
+    assert outcome.status == "failed"
+    assert "compose is set to deploy/x.yml; it is not in " in outcome.error
+    assert "yard app detect" in outcome.log
+
+
+async def test_deploy_containerfile_yard_missing_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard = make_yard(tmp_path, skip=False)
+    yard.store.create_app("heldso", "https://origin.cursor.com/org/app", containerfile="yard")
+    _clone(yard, "heldso")
+    _connect(monkeypatch)
+    monkeypatch.setattr(compose, "apply", _Apply())
+
+    async def fake_sync(clone, url, ref, token=""):
+        return git.head(clone)
+
+    monkeypatch.setattr(git, "sync", fake_sync)
+    outcome = await apps.deploy(yard, "heldso")
+    assert outcome.status == "failed"
+    assert "yard app detect" in outcome.log

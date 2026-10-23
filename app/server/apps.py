@@ -7,11 +7,11 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
-from app.server import binds, compose, git, journal, podman
+from app.server import binds, compose, detect, git, journal, podman
 from app.server.forges import Forge
 from app.server.store import App
 from app.server.yard import Yard
-from app.shared import YardError, clone_url, ensure_file, now
+from app.shared import YardError, atomic_write, clone_url, ensure_file, now
 
 log = logging.getLogger("yard")
 
@@ -27,8 +27,18 @@ def ensure_host(yard: Yard) -> None:
         yard.store.create_app("yard", "", "main", "manual")
 
 
-def create(yard: Yard, name: str, repo: str, ref: str = "", trigger: str = "", *, actor: str = "") -> App:
-    app = yard.store.create_app(name, repo, ref, trigger)
+def create(
+    yard: Yard,
+    name: str,
+    repo: str,
+    ref: str = "",
+    trigger: str = "",
+    containerfile: str = "",
+    compose: str = "",
+    *,
+    actor: str = "",
+) -> App:
+    app = yard.store.create_app(name, repo, ref, trigger, containerfile, compose)
     ensure_file(yard.config.env(app.name))
     journal.send(
         yard.config,
@@ -50,9 +60,11 @@ def update(
     repo: str | None = None,
     ref: str | None = None,
     trigger: str | None = None,
+    containerfile: str | None = None,
+    compose: str | None = None,
     actor: str = "",
 ) -> App:
-    app = yard.store.update_app(name, repo=repo, ref=ref, trigger=trigger)
+    app = yard.store.update_app(name, repo=repo, ref=ref, trigger=trigger, containerfile=containerfile, compose=compose)
     journal.send(
         yard.config,
         "app.update",
@@ -61,6 +73,8 @@ def update(
         repo=app.repo,
         ref=app.ref,
         trigger=app.trigger,
+        containerfile=app.containerfile,
+        compose=app.compose,
         actor=actor,
     )
     return app
@@ -274,8 +288,9 @@ async def _apply(yard: Yard, app: App, sha: str) -> Outcome:
     """The compose check, then one apply container for the rest."""
     image = compose.image_tag(app.name, sha)
 
-    # The compose check. Any failure here stops before a build.
+    # What the app runs: the record decides, or the first deploy resolves and saves it.
     try:
+        app, runs = _runs(yard, app, sha)
         project = compose.prepare(yard.config, app, yard.config.clone(app.name), image, sha)
     except Exception as exc:
         return Outcome("failed", image, f"{exc}\n", str(exc))
@@ -298,6 +313,7 @@ async def _apply(yard: Yard, app: App, sha: str) -> Outcome:
         detach=app.name == "yard",
     )
     log = text if text.endswith("\n") or not text else text + "\n"
+    log = runs + log
     if app.name == "yard":
         # Upgrading yard replaces this process, so that apply run is detached.
         return Outcome("pending", image, log, previous=previous)
@@ -306,6 +322,45 @@ async def _apply(yard: Yard, app: App, sha: str) -> Outcome:
     if code:
         return Outcome("failed", image, log, f"apply exited {code}", previous)
     return Outcome("ok", image, log, previous=previous)
+
+
+def _runs(yard: Yard, app: App, sha: str) -> tuple[App, str]:
+    """What the app runs. Set fields are checked against the clone; an unset record is resolved and saved."""
+    clone = yard.config.clone(app.name)
+    if app.compose:
+        if not (clone / app.compose).is_file():
+            raise YardError(
+                502,
+                "compose",
+                f"compose is set to {app.compose}; it is not in {sha[:12]}",
+                help_text="Add the file, run yard app set --compose PATH, or run yard app detect.",
+            )
+        return app, ""
+    if app.containerfile:
+        if app.containerfile == "yard":
+            if not (yard.config.app_dir(app.name) / "Containerfile").is_file():
+                raise YardError(
+                    502,
+                    "compose",
+                    f"containerfile is set to yard, but {app.name}'s Containerfile is missing",
+                    help_text="Run yard app detect to write it again.",
+                )
+        elif not (clone / app.containerfile).is_file():
+            raise YardError(
+                502,
+                "compose",
+                f"containerfile is set to {app.containerfile}; it is not in {sha[:12]}",
+                help_text="Add the file, run yard app set --containerfile PATH, or run yard app detect.",
+            )
+        return app, ""
+    resolved = detect.resolve(clone, app.name)
+    if resolved.generated:
+        atomic_write(yard.config.app_dir(app.name) / "Containerfile", resolved.generated)
+    app = update(yard, app.name, **{resolved.field: resolved.value})
+    line = f"== runs {resolved.field} {resolved.value}"
+    if resolved.generated:
+        line += f" ({resolved.kind}: {resolved.reason})"
+    return app, line + "\n"
 
 
 async def _image_exists(yard: Yard, image: str) -> bool:

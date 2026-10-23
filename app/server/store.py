@@ -12,6 +12,8 @@ from app.shared import (
     YardError,
     atomic_write,
     check_app_name,
+    check_compose,
+    check_containerfile,
     check_env,
     check_name,
     check_ref,
@@ -97,6 +99,9 @@ class App:
     ref: str
     trigger: str
     created: str
+    # What the app runs. At most one is set; neither means the deploy decides.
+    containerfile: str = ""
+    compose: str = ""
 
 
 @dataclass(slots=True)
@@ -150,6 +155,8 @@ class Store:
         repo: str,
         ref: str = "",
         trigger: str = "",
+        containerfile: str = "",
+        compose: str = "",
     ) -> App:
         check_app_name(name)
         if repo:
@@ -159,6 +166,7 @@ class Store:
         if self._record(name).is_file():
             raise YardError(409, "exists", "already exists", help_text="Pick another name.")
         app = App(name, repo, ref, check_trigger(trigger), now())
+        self._build_fields(app, containerfile, compose)
         self._write(app)
         return app
 
@@ -169,6 +177,8 @@ class Store:
         repo: str | None = None,
         ref: str | None = None,
         trigger: str | None = None,
+        containerfile: str | None = None,
+        compose: str | None = None,
     ) -> App:
         app = self.app(name)
         if repo is not None:
@@ -179,6 +189,11 @@ class Store:
             app.ref = ref
         if trigger is not None:
             app.trigger = check_trigger(trigger)
+        if containerfile is not None or compose is not None:
+            # Setting one non-empty clears the other; "" clears only its own field.
+            cf = containerfile if containerfile is not None else ("" if compose else app.containerfile)
+            co = compose if compose is not None else ("" if containerfile else app.compose)
+            self._build_fields(app, cf, co)
         self._write(app)
         return self.app(name)
 
@@ -273,8 +288,32 @@ class Store:
                 return token
         return None
 
+    def _build_fields(self, app: App, containerfile: str, compose: str) -> None:
+        """What the app runs. Setting one clears the other; "" clears it."""
+        if containerfile and compose:
+            raise YardError(
+                400,
+                "bad_request",
+                "set --containerfile or --compose, not both",
+                context={"containerfile": containerfile, "compose": compose},
+            )
+        if (containerfile or compose) and not app.repo:
+            raise YardError(
+                400,
+                "bad_request",
+                f"app {app.name} has no repo",
+                context={"name": app.name},
+                help_text="Set the repo first: yard app set --repo https://<host>/<owner>/<name>",
+            )
+        app.containerfile = check_containerfile(containerfile) if containerfile else ""
+        app.compose = check_compose(compose) if compose else ""
+
     def _write(self, app: App) -> None:
         text = f"repo {app.repo}\nref {app.ref}\ntrigger {app.trigger}\ncreated {app.created}\n"
+        if app.containerfile:
+            text += f"containerfile {app.containerfile}\n"
+        if app.compose:
+            text += f"compose {app.compose}\n"
         atomic_write(self._record(app.name), text)
 
     def _env(self, name: str) -> Path:
@@ -303,12 +342,20 @@ def _name_ok(name: str) -> bool:
 
 
 def _read_app(name: str, text: str) -> App:
-    fields = {"repo": "", "ref": "main", "trigger": "push", "created": ""}
+    fields = {"repo": "", "ref": "main", "trigger": "push", "created": "", "containerfile": "", "compose": ""}
     for line in text.splitlines():
         key, _, value = line.partition(" ")
         if key in fields:
             fields[key] = value.strip()
-    return App(name, fields["repo"], fields["ref"] or "main", fields["trigger"] or "push", fields["created"])
+    return App(
+        name,
+        fields["repo"],
+        fields["ref"] or "main",
+        fields["trigger"] or "push",
+        fields["created"],
+        fields["containerfile"],
+        fields["compose"],
+    )
 
 
 def ensure_admin(store: Store) -> str:

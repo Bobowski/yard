@@ -1615,3 +1615,48 @@ def test_events_build_the_query(monkeypatch: pytest.MonkeyPatch, capsys: pytest.
     assert calls[-1] == ("GET", "/api/v1/events?lines=200&since=-1h&app=heldso&source=podman", None)
     out = capsys.readouterr().out
     assert "died" in out and "heldso-app-1 abc123def456" in out and "exit 1" in out
+
+
+def test_app_detect(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    def fake_api_try(client, method, path, body, timeout=None):
+        if method == "GET" and path == "/api/v1/apps/heldso":
+            return 200, json.dumps({"app": {"name": "heldso", "containerfile": "yard"}})
+        if method == "PATCH":
+            return 200, json.dumps({"app": {"name": "heldso", "containerfile": "", "compose": ""}})
+        raise AssertionError(path)
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    _env(monkeypatch)
+    main(["app", "detect", "--app", "heldso", "--text"])
+    out = capsys.readouterr().out
+    assert "decides what to run again (was: containerfile yard)" in out
+    assert "Deploy now: yard app deploy --app heldso" in out
+
+
+def test_app_detect_nothing_set(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    def fake_api_try(client, method, path, body, timeout=None):
+        if method == "GET":
+            return 200, json.dumps({"app": {"name": "heldso"}})
+        return 200, json.dumps({"app": {"name": "heldso"}})
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    _env(monkeypatch)
+    main(["app", "detect", "--app", "heldso", "--text"])
+    assert "decides what to run.\n" in capsys.readouterr().out
+
+
+def test_app_cat(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    def fake_api_try(client, method, path, body, timeout=None):
+        if path == "/api/v1/apps/heldso/files/containerfile":
+            return 200, "FROM scratch\n"
+        raise AssertionError(path)
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    _env(monkeypatch)
+    main(["app", "cat", "containerfile", "--app", "heldso"])
+    assert capsys.readouterr().out == "FROM scratch\n"
+
+
+def test_app_new_build_flags_exclusive(capsys: pytest.CaptureFixture):
+    with pytest.raises(SystemExit):
+        main(["app", "new", "--repo", "https://github.com/org/x", "--containerfile", "a", "--compose", "b"])

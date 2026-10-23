@@ -183,3 +183,15 @@ def test_default_compose_builds_a_docker_image(tmp_path: Path):
     )
     assert code == 0
     assert "podman:build --format docker -t localhost/heldso:abc" in log
+
+
+def test_absolute_dockerfile_used_as_is(tmp_path: Path):
+    code, _out, log, _err = _run(
+        tmp_path,
+        "up",
+        COMPOSE_FILE="/srv/yard/apps/heldso/repo/default.compose.yml",
+        CHECKOUT="/srv/yard/apps/heldso/repo",
+        DOCKERFILE="/srv/yard/apps/heldso/Containerfile",
+    )
+    assert code == 0
+    assert "podman:build --format docker -t localhost/heldso:abc -f /srv/yard/apps/heldso/Containerfile" in log
