@@ -17,6 +17,7 @@ APPLY_DIR = "/usr/local/share/yard/apply"
 if not Path(APPLY_DIR).is_dir():
     APPLY_DIR = str(Path(__file__).resolve().parents[2] / "ops" / "apply")
 DEFAULT_COMPOSE = "/usr/local/share/yard/default.compose.yml"
+IMAGE_COMPOSE = "/usr/local/share/yard/image.compose.yml"
 COMPOSE_NAMES = ("compose.yml", "compose.yaml", "ops/compose.yml", "ops/compose.yaml")
 DOCKERFILES = ("Containerfile", "Dockerfile", "ops/Containerfile", "ops/Dockerfile")
 

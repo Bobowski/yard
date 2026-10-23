@@ -1,0 +1,27 @@
+# A repo-less app that runs a pulled image. Same contract as default.compose.yml,
+# minus the build: the image is pulled by tag@digest.
+services:
+  app:
+    image: ${IMAGE}
+    restart: always
+    networks:
+      - yard
+    volumes:
+      - ${DATA_DIR}:/data
+    env_file:
+      - ${APP_ENV}
+    environment:
+      PROJECT_NAME: ${PROJECT_NAME}
+      PROJECT_DATA_DIR: /data
+      SHA: ${SHA}
+      PORT: "8000"
+      # A Stario app binds this address. 127.0.0.1 would hide it from Caddy.
+      STARIO_HOST: 0.0.0.0
+      STARIO_PORT: "8000"
+      STARIO_TRACER: json
+    expose:
+      - "8000"
+networks:
+  yard:
+    external: true
+    name: yard

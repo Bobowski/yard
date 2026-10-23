@@ -304,3 +304,32 @@ def test_age():
     assert age(300) == "5m"
     assert age(3 * 3600) == "3h"
     assert age(15 * 86400) == "15d"
+
+
+def test_check_image(tmp_path):
+    from app.shared import check_image
+
+    assert check_image("postgres:17") == "postgres:17"
+    assert check_image("ghcr.io/you/api:1.4") == "ghcr.io/you/api:1.4"
+    assert check_image("postgres@sha256:" + "a" * 64) == "postgres@sha256:" + "a" * 64
+    assert check_image("gcr.io/distroless/static-debian12:latest") == "gcr.io/distroless/static-debian12:latest"
+    with pytest.raises(YardError, match="Name a tag"):
+        check_image("postgres")
+    with pytest.raises(YardError):
+        check_image("Postgres:17")
+    with pytest.raises(YardError):
+        check_image("https://registry/postgres:17")
+    with pytest.raises(YardError):
+        check_image("postgres:17@sha256:short")
+
+
+def test_check_recipe(tmp_path):
+    from app.shared import RECIPES, check_recipe
+
+    assert check_recipe("umami") == f"{RECIPES}/umami.yml"
+    assert check_recipe("my-app-2") == f"{RECIPES}/my-app-2.yml"
+    assert check_recipe("https://example.com/umami.yml") == "https://example.com/umami.yml"
+    with pytest.raises(YardError, match="https"):
+        check_recipe("http://example.com/umami.yml")
+    with pytest.raises(YardError):
+        check_recipe("Bad Name")

@@ -71,6 +71,22 @@ async def run(yard: Yard) -> list[Check]:
     checks += await _forge_rows(yard)
     checks.append(_check("prune", _prune(yard)))
     checks.append(_check("disk", await _disk(yard)))
+    for name in sorted(yard.source_errors):
+        source = ""
+        try:
+            app = yard.store.app(name)
+            source = app.image or app.recipe
+        except YardError:
+            pass
+        checks.append(
+            Check(
+                f"source {name}",
+                True,
+                f"{yard.source_errors[name]} ({source});"
+                " Yard keeps running the last version and tries again at the next check.",
+                warn=True,
+            )
+        )
     return checks
 
 

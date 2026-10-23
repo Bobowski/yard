@@ -239,6 +239,14 @@ def _remote_repo(remote: str) -> str:
     return f"https://{host}/{found[0]}/{found[1]}"
 
 
+def _source_name(image: str, recipe: str) -> str:
+    """The app name for a repo-less app: the image's last repo segment, or the recipe name."""
+    if image:
+        return image.split("@", 1)[0].rsplit(":", 1)[0].rsplit("/", 1)[-1]
+    tail = recipe.rsplit("/", 1)[-1]
+    return tail.removesuffix(".yml")
+
+
 def _default_name(repo: str, ref: str) -> str:
     """repo name for main and master; otherwise <repo>-<branch> as an app name."""
     name = repo.split("/")[-1]
@@ -364,19 +372,28 @@ def _cmd_app_ls(args: argparse.Namespace) -> None:
 
 
 def _cmd_app_new(args: argparse.Namespace) -> None:
+    image = args.image.strip()
+    recipe = args.recipe.strip()
     repo, ref = args.repo.strip(), args.ref.strip()
-    if not repo or not ref:
-        found_repo, found_ref = _checkout_pair()
-        repo = repo or found_repo
-        if not ref:
-            # The checkout branch counts only when the repo is the checkout's.
-            ref = found_ref if found_repo and repo.lower() == found_repo.lower() else ""
+    if not (image or recipe):
+        if not repo or not ref:
+            found_repo, found_ref = _checkout_pair()
+            repo = repo or found_repo
+            if not ref:
+                # The checkout branch counts only when the repo is the checkout's.
+                ref = found_ref if found_repo and repo.lower() == found_repo.lower() else ""
     ref = ref or "main"
-    if not repo:
-        _die("no repo; pass --repo https://<host>/<owner>/<name> or run inside a forge checkout")
-    name = args.app.strip() or _default_name(repo, ref)
+    name = args.app.strip()
     try:
-        repo = check_repo(repo)
+        if image or recipe:
+            if repo:
+                _die("an image or recipe app has no repo")
+            name = name or _source_name(image, recipe)
+        else:
+            if not repo:
+                _die("no repo; pass --repo https://<host>/<owner>/<name> or run inside a forge checkout")
+            name = name or _default_name(repo, ref)
+            repo = check_repo(repo)
         check_app_name(name)
         host = (args.public or "").strip()
         window = check_window(args.window or "") if host else ""
@@ -389,12 +406,13 @@ def _cmd_app_new(args: argparse.Namespace) -> None:
     body: dict[str, object] = {"name": name, "repo": repo, "ref": ref}
     if args.trigger:
         body["trigger"] = args.trigger
-    for key in ("containerfile", "compose"):
+    for key in ("containerfile", "compose", "image", "recipe"):
         if getattr(args, key):
             body[key] = getattr(args, key)
     raw = _api(session, "POST", "/api/v1/apps", body)
     if host:
-        _api(session, "PUT", f"/api/v1/binds/{quote(host, safe='')}", {"dial": f"{name}-app-1", "try": window})
+        port = args.port or int(_object(raw).get("port") or 0) or 8000
+        _api(session, "PUT", f"/api/v1/binds/{quote(host, safe='')}", {"dial": f"{name}-app-1:{port}", "try": window})
     wrap = _object(raw)
     app = wrap.get("app") if isinstance(wrap, dict) else None
     if args.no_deploy:
@@ -433,12 +451,12 @@ def _cmd_app_set(args: argparse.Namespace) -> None:
     session = _load(args)
     name = _app_name(session, args)
     patch: dict[str, str] = {}
-    for key in ("repo", "ref", "trigger", "containerfile", "compose"):
+    for key in ("repo", "ref", "trigger", "containerfile", "compose", "image", "recipe"):
         value = str(getattr(args, key, "") or "").strip()
         if value:
             patch[key] = value
     if not patch:
-        _die("yard app set needs --repo, --ref, --trigger, --containerfile, or --compose")
+        _die("yard app set needs --repo, --ref, --trigger, --containerfile, --compose, --image, or --recipe")
     page = _object(_api(session, "GET", "/api/v1/apps/" + quote(name), None))
     current = page.get("app") if isinstance(page, dict) else None
     current = current if isinstance(current, dict) else {}
@@ -450,7 +468,10 @@ def _cmd_app_set(args: argparse.Namespace) -> None:
     found = wrap.get("app") if isinstance(wrap, dict) else None
     app = found if isinstance(found, dict) else {}
     moved = any(key in patch and patch[key] != str(current.get(key) or "") for key in ("repo", "ref"))
-    built = any(key in patch and patch[key] != str(current.get(key) or "") for key in ("containerfile", "compose"))
+    built = any(
+        key in patch and patch[key] != str(current.get(key) or "")
+        for key in ("containerfile", "compose", "image", "recipe")
+    )
     if moved and str(app.get("trigger") or "") == "push":
         print(f"The next check deploys it within 5 minutes. Deploy now: yard app deploy --app {name}")
     elif moved:
@@ -469,6 +490,12 @@ def _cmd_app_detect(args: argparse.Namespace) -> None:
     page = _object(_api(session, "GET", f"/api/v1/apps/{quote(name)}", None))
     record = page.get("app") if isinstance(page, dict) else {}
     record = record if isinstance(record, dict) else {}
+    if str(record.get("image") or ""):
+        print(f"{name} runs an image ({record['image']}); there is nothing to detect.")
+        return
+    if str(record.get("recipe") or ""):
+        print(f"{name} runs a recipe ({record['recipe']}); there is nothing to detect.")
+        return
     was = ""
     if str(record.get("containerfile") or ""):
         was = f"containerfile {record['containerfile']}"
@@ -1353,6 +1380,9 @@ def _app_parser(subs: argparse._SubParsersAction, common: argparse.ArgumentParse
         "--containerfile", default="", help="a Containerfile in the repo, or yard for one Yard writes"
     )
     newbuild.add_argument("--compose", default="", help="a compose file in the repo")
+    newbuild.add_argument("--image", default="", help="run a pulled image: [registry/]name:tag")
+    newbuild.add_argument("--recipe", default="", help="run a recipe by name or https URL")
+    new.add_argument("--port", type=int, default=0, help="the port --public binds (default: the recipe's, else 8000)")
     _add_app_flag(new, "the app name; the repo and branch give a default")
     new.set_defaults(func=_cmd_app_new)
 
@@ -1363,6 +1393,8 @@ def _app_parser(subs: argparse._SubParsersAction, common: argparse.ArgumentParse
     build = set_.add_mutually_exclusive_group()
     build.add_argument("--containerfile", default="", help="a Containerfile in the repo, or yard for one Yard writes")
     build.add_argument("--compose", default="", help="a compose file in the repo")
+    build.add_argument("--image", default="", help="run a pulled image: [registry/]name:tag")
+    build.add_argument("--recipe", default="", help="run a recipe by name or https URL")
     _add_app_flag(set_)
     set_.set_defaults(func=_cmd_app_set)
 

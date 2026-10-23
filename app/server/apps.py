@@ -1,14 +1,18 @@
 """The app records, the deploy, the checks, and prune. The yard record is ensured at boot."""
 
 import asyncio
+import hashlib
 import logging
+import re
 import shutil
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from app.server import binds, compose, detect, git, journal, podman
+from app.server import binds, compose, detect, git, journal, podman, registry
 from app.server.forges import Forge
 from app.server.store import App, Config
 from app.server.yard import Yard
@@ -36,10 +40,12 @@ def create(
     trigger: str = "",
     containerfile: str = "",
     compose: str = "",
+    image: str = "",
+    recipe: str = "",
     *,
     actor: str = "",
 ) -> App:
-    app = yard.store.create_app(name, repo, ref, trigger, containerfile, compose)
+    app = yard.store.create_app(name, repo, ref, trigger, containerfile, compose, image, recipe)
     ensure_file(yard.config.env(app.name))
     journal.send(
         yard.config,
@@ -76,6 +82,8 @@ def update(
         trigger=app.trigger,
         containerfile=app.containerfile,
         compose=app.compose,
+        image=app.image,
+        recipe=app.recipe,
         actor=actor,
     )
     return app
@@ -170,11 +178,17 @@ async def deploy(
         except YardError as exc:
             return Outcome("failed", error=str(exc))
         if not app.repo:
-            return Outcome(
-                "failed",
-                error=f"app {name} has no repo",
-                log="Set the repo: yard app set --repo https://<host>/<owner>/<name>\n",
-            )
+            if not (app.image or app.recipe):
+                return Outcome(
+                    "failed",
+                    error=f"app {name} has no repo",
+                    log="Set the repo: yard app set --repo https://<host>/<owner>/<name>\n",
+                )
+            if sha:
+                return Outcome("failed", error=_rollback_help(app), log=f"{_rollback_help(app)}\n")
+            if yard.skip_deploy:
+                return Outcome("skipped", log="YARD_SKIP_DEPLOY is set. Deploy did not run.\n")
+            return await _deploy_source(yard, app, cause=cause, actor=actor)
         if yard.skip_deploy:
             return Outcome("skipped", log="YARD_SKIP_DEPLOY is set. Deploy did not run.\n")
         try:
@@ -330,6 +344,16 @@ def app_file(config: Config, app: App, which: str) -> str:
     if which == "compose":
         if app.compose:
             return _clone_file(config.clone(app.name), app.compose, app.name)
+        if app.image:
+            path = Path(compose.APPLY_DIR) / "image.compose.yml"
+            if path.is_file():
+                return path.read_text()
+            raise YardError(404, "no_file", "Yard's image compose file is missing on this host", help_text=deploy)
+        if app.recipe:
+            path = _recipe_file(config, app.name)
+            if path is not None:
+                return path.read_text()
+            raise YardError(404, "no_file", f"{app.name}'s recipe is not fetched yet", help_text=deploy)
         if app.containerfile:
             path = Path(compose.APPLY_DIR) / "default.compose.yml"
             if path.is_file():
@@ -337,6 +361,9 @@ def app_file(config: Config, app: App, which: str) -> str:
             raise YardError(404, "no_file", "Yard's compose file is missing on this host", help_text=deploy)
         raise YardError(404, "no_file", f"{app.name} has no compose file yet", help_text=deploy)
     if which == "containerfile":
+        if app.image or app.recipe:
+            kind = "an image" if app.image else "a recipe"
+            raise YardError(404, "no_file", f"{app.name} runs {kind}; there is no Containerfile")
         if app.containerfile == "yard":
             path = config.app_dir(app.name) / "Containerfile"
             if path.is_file():
@@ -440,6 +467,185 @@ async def check_all(yard: Yard) -> None:
     """Poll every push app once per forge. A remote tip newer than the clone HEAD deploys."""
     for forge in yard.forges.values():
         await _check_forge(yard, forge)
+    recipes: dict[str, bytes] = {}
+    for app in yard.store.list_apps():
+        if app.image or app.recipe:
+            await _check_source(yard, app, recipes)
+
+
+async def _check_source(yard: Yard, app: App, recipes: dict[str, bytes]) -> None:
+    """The newest revision of an image tag or recipe URL. A failed fetch never deploys."""
+    try:
+        if app.image:
+            revision = await registry.digest(app.image)
+        else:
+            body = recipes.get(app.recipe)
+            if body is None:
+                body = await fetch_recipe(app.recipe)
+                recipes[app.recipe] = body
+            revision = "sha256:" + hashlib.sha256(body).hexdigest()
+    except Exception as exc:
+        message = exc.message if isinstance(exc, YardError) else str(exc)
+        yard.source_errors[app.name] = message
+        log.warning("%s source: %s", app.name, message)
+        return
+    yard.source_errors.pop(app.name, None)
+    yard.tips[app.name] = revision
+    if app.trigger != "push":
+        return
+    deployed = deployed_revision(yard.config, app.name)
+    if revision != deployed:
+        journal.send(
+            yard.config,
+            "check.moved",
+            f"{app.name} revision moved",
+            app=app.name,
+            head=deployed,
+            tip=revision,
+        )
+        await deploy(yard, app.name, cause="check", actor="check")
+
+
+def deployed_revision(config: Config, name: str) -> str:
+    """The revision the last ok deploy ran: a manifest digest or the recipe file sha256."""
+    file = config.app_dir(name) / "revision"
+    return file.read_text().strip() if file.is_file() else ""
+
+
+def _rollback_help(app: App) -> str:
+    if app.image:
+        return f"an image app rolls back by tag: yard app set --app {app.name} --image REF:OLDER"
+    return "a recipe app rolls back by URL: point --recipe at an older commit's raw URL"
+
+
+async def _deploy_source(yard: Yard, app: App, *, cause: str, actor: str) -> Outcome:
+    """A repo-less deploy: pin an image by digest, or fetch a recipe compose file."""
+    try:
+        if app.image:
+            revision = await registry.digest(app.image)
+            image = f"{app.image.split('@', 1)[0]}@{revision}"
+            project = _source_project(yard.config, app, compose.IMAGE_COMPOSE, image, revision)
+            project.env["SKIP_BUILD"] = "1"
+        else:
+            body = await fetch_recipe(app.recipe)
+            revision = "sha256:" + hashlib.sha256(body).hexdigest()
+            image = compose.image_tag(app.name, revision[7:19])
+            recipe_file = _write_recipe(yard.config, app.name, revision, body)
+            project = _source_project(yard.config, app, str(recipe_file), image, revision)
+            previous_recipe = _recipe_file(yard.config, app.name)
+            if previous_recipe is not None:
+                project.env["PREVIOUS_COMPOSE_FILE"] = str(previous_recipe)
+    except YardError as exc:
+        return Outcome("failed", error=str(exc), log=f"{exc}\n")
+    journal.send(
+        yard.config,
+        "deploy.start",
+        f"deploy {app.name} {revision[:12]}",
+        app=app.name,
+        sha=revision,
+        image=image,
+        cause=cause,
+        actor=actor,
+        requested="",
+    )
+    previous = await _running_image(yard, app.name)
+    if previous and app.image and previous != image:
+        project.env["PREVIOUS_IMAGE"] = previous
+    code, text = await compose.apply(yard.config, app.name, "up", project)
+    log = text if text.endswith("\n") or not text else text + "\n"
+    if code == 3:
+        outcome = Outcome("reverted", image, log, f"unhealthy; reverted to {previous}", previous)
+    elif code:
+        outcome = Outcome("failed", image, log, f"apply exited {code}", previous)
+    else:
+        outcome = Outcome("ok", image, log, previous=previous)
+    _deploy_end(yard, app, revision, outcome)
+    if outcome.status == "ok":
+        atomic_write(yard.config.app_dir(app.name) / "revision", revision + "\n")
+        if app.recipe:
+            _prune_recipes(yard.config, app.name)
+    return outcome
+
+
+def _source_project(config: Config, app: App, file: str, image: str, revision: str) -> compose.Project:
+    env = compose.run_env(config, app, config.app_dir(app.name), image, revision)
+    compose.ensure_env(config.env(app.name))
+    return compose.Project(app.name, [file], env)
+
+
+_RECIPE_MAX = 256 * 1024
+_RECIPE_PORT = re.compile(r"^#\s*port:\s*(\d{1,5})\s*$", re.M)
+
+
+def recipe_port(body: bytes) -> int:
+    """A recipe may declare `# port: 3000`; --public binds it."""
+    found = _RECIPE_PORT.search(body.decode("utf-8", "replace"))
+    return int(found.group(1)) if found else 0
+
+
+def _recipe_dir(config: Config, name: str) -> Path:
+    directory = config.app_dir(name) / "recipe"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _recipe_file(config: Config, name: str) -> Path | None:
+    """The compose file of the last ok recipe deploy, for the revert path."""
+    revision = deployed_revision(config, name)
+    if not revision.startswith("sha256:"):
+        return None
+    path = config.app_dir(name) / "recipe" / f"{revision[7:19]}.yml"
+    return path if path.is_file() else None
+
+
+def _write_recipe(config: Config, name: str, revision: str, body: bytes) -> Path:
+    path = _recipe_dir(config, name) / f"{revision[7:19]}.yml"
+    if not path.is_file():
+        atomic_write(path, body.decode("utf-8", "replace"))
+    return path
+
+
+def _prune_recipes(config: Config, name: str) -> None:
+    """Keep the current and the previous recipe file; drop older ones."""
+    keep = {deployed_revision(config, name)[7:19]}
+    files = sorted(_recipe_dir(config, name).glob("*.yml"), key=lambda p: p.stat().st_mtime, reverse=True)
+    keep.add(files[1].stem if len(files) > 1 else "")
+    for path in files[2:]:
+        path.unlink()
+
+
+def _get(url: str) -> tuple[int, dict[str, str], bytes]:
+    """One recipe request; redirects surface so they stay on https."""
+    req = urllib.request.Request(url)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as res:
+            return res.status, dict(res.headers), res.read(_RECIPE_MAX + 1)
+    except urllib.error.HTTPError as exc:
+        return exc.code, dict(exc.headers), exc.read()
+    except urllib.error.URLError as exc:
+        raise YardError(502, "recipe", f"{url}: {exc.reason}") from exc
+
+
+async def fetch_recipe(url: str) -> bytes:
+    """The recipe body: https only, ≤ 256 KiB, redirects stay on https."""
+    return await asyncio.to_thread(_fetch_recipe, url)
+
+
+def _fetch_recipe(url: str) -> bytes:
+    for _ in range(6):
+        code, headers, body = _get(url)
+        if code in (301, 302, 303, 307, 308):
+            location = headers.get("Location") or headers.get("location") or ""
+            if not location.startswith("https://"):
+                raise YardError(502, "recipe", f"{url}: redirect to {location or 'nowhere'} is not https")
+            url = location
+            continue
+        if code >= 300:
+            raise YardError(502, "recipe", f"{url}: HTTP {code}")
+        if len(body) > _RECIPE_MAX:
+            raise YardError(502, "recipe", "recipe is larger than 256 KiB")
+        return body
+    raise YardError(502, "recipe", f"{url}: too many redirects")
 
 
 async def _check_forge(yard: Yard, forge: Forge) -> None:

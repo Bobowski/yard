@@ -15,7 +15,7 @@ dc() {
 # data mount is a warning. The default compose already meets the contract.
 check() {
   case "$COMPOSE_FILE" in
-    */default.compose.yml) return 0 ;;
+    */default.compose.yml|*/image.compose.yml) return 0 ;;
   esac
   oldifs=$IFS
   IFS=:
@@ -66,6 +66,15 @@ build() {
 }
 
 revert() {
+  if [ -n "${PREVIOUS_COMPOSE_FILE:-}" ]; then
+    echo "== revert $PREVIOUS_COMPOSE_FILE"
+    if COMPOSE_FILE="$PREVIOUS_COMPOSE_FILE" dc up -d --no-build; then
+      echo "== reverted $PREVIOUS_COMPOSE_FILE"
+      exit 3
+    fi
+    echo "== revert failed"
+    exit 1
+  fi
   if [ -n "${PREVIOUS_IMAGE:-}" ]; then
     echo "== revert $PREVIOUS_IMAGE"
     if IMAGE="$PREVIOUS_IMAGE" dc up -d --no-build; then

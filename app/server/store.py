@@ -15,7 +15,9 @@ from app.shared import (
     check_compose,
     check_containerfile,
     check_env,
+    check_image,
     check_name,
+    check_recipe,
     check_ref,
     check_repo,
     check_trigger,
@@ -102,6 +104,9 @@ class App:
     # What the app runs. At most one is set; neither means the deploy decides.
     containerfile: str = ""
     compose: str = ""
+    # Repo-less apps run a pulled image or a fetched recipe instead.
+    image: str = ""
+    recipe: str = ""
 
 
 @dataclass(slots=True)
@@ -157,6 +162,8 @@ class Store:
         trigger: str = "",
         containerfile: str = "",
         compose: str = "",
+        image: str = "",
+        recipe: str = "",
     ) -> App:
         check_app_name(name)
         if repo:
@@ -166,7 +173,7 @@ class Store:
         if self._record(name).is_file():
             raise YardError(409, "exists", "already exists", help_text="Pick another name.")
         app = App(name, repo, ref, check_trigger(trigger), now())
-        self._build_fields(app, containerfile, compose)
+        self._build_fields(app, containerfile, compose, image, recipe)
         self._write(app)
         return app
 
@@ -179,6 +186,8 @@ class Store:
         trigger: str | None = None,
         containerfile: str | None = None,
         compose: str | None = None,
+        image: str | None = None,
+        recipe: str | None = None,
     ) -> App:
         app = self.app(name)
         if repo is not None:
@@ -189,11 +198,31 @@ class Store:
             app.ref = ref
         if trigger is not None:
             app.trigger = check_trigger(trigger)
-        if containerfile is not None or compose is not None:
-            # Setting one non-empty clears the other; "" clears only its own field.
-            cf = containerfile if containerfile is not None else ("" if compose else app.containerfile)
-            co = compose if compose is not None else ("" if containerfile else app.compose)
-            self._build_fields(app, cf, co)
+        fields = {"containerfile": containerfile, "compose": compose, "image": image, "recipe": recipe}
+        given = {key: value for key, value in fields.items() if value is not None}
+        if given:
+            wanted = {key: value for key, value in given.items() if value}
+            if len(wanted) > 1:
+                names = sorted(wanted)
+                raise YardError(
+                    400,
+                    "bad_request",
+                    f"set --{names[0]} or --{names[1]}, not both",
+                    context={key: wanted[key] for key in names},
+                )
+            if wanted:
+                # One non-empty field clears the other three.
+                self._build_fields(
+                    app,
+                    wanted.get("containerfile", ""),
+                    wanted.get("compose", ""),
+                    wanted.get("image", ""),
+                    wanted.get("recipe", ""),
+                )
+            else:
+                # "" clears only its own field.
+                for key in given:
+                    setattr(app, key, "")
         self._write(app)
         return self.app(name)
 
@@ -288,14 +317,23 @@ class Store:
                 return token
         return None
 
-    def _build_fields(self, app: App, containerfile: str, compose: str) -> None:
-        """What the app runs. Setting one clears the other; "" clears it."""
-        if containerfile and compose:
+    def _build_fields(self, app: App, containerfile: str, compose: str, image: str, recipe: str) -> None:
+        """What the app runs: one of the four. A repo app builds; a repo-less app pulls."""
+        if image and app.repo:
             raise YardError(
                 400,
                 "bad_request",
-                "set --containerfile or --compose, not both",
-                context={"containerfile": containerfile, "compose": compose},
+                "an image app has no repo",
+                context={"image": image},
+                help_text="Create a new app: yard app new --app NAME --image REF",
+            )
+        if recipe and app.repo:
+            raise YardError(
+                400,
+                "bad_request",
+                "a recipe app has no repo",
+                context={"recipe": recipe},
+                help_text="Create a new app: yard app new --app NAME --recipe NAME",
             )
         if (containerfile or compose) and not app.repo:
             raise YardError(
@@ -307,13 +345,14 @@ class Store:
             )
         app.containerfile = check_containerfile(containerfile) if containerfile else ""
         app.compose = check_compose(compose) if compose else ""
+        app.image = check_image(image) if image else ""
+        app.recipe = check_recipe(recipe) if recipe else ""
 
     def _write(self, app: App) -> None:
         text = f"repo {app.repo}\nref {app.ref}\ntrigger {app.trigger}\ncreated {app.created}\n"
-        if app.containerfile:
-            text += f"containerfile {app.containerfile}\n"
-        if app.compose:
-            text += f"compose {app.compose}\n"
+        for field in ("containerfile", "compose", "image", "recipe"):
+            if getattr(app, field):
+                text += f"{field} {getattr(app, field)}\n"
         atomic_write(self._record(app.name), text)
 
     def _env(self, name: str) -> Path:
@@ -342,7 +381,16 @@ def _name_ok(name: str) -> bool:
 
 
 def _read_app(name: str, text: str) -> App:
-    fields = {"repo": "", "ref": "main", "trigger": "push", "created": "", "containerfile": "", "compose": ""}
+    fields = {
+        "repo": "",
+        "ref": "main",
+        "trigger": "push",
+        "created": "",
+        "containerfile": "",
+        "compose": "",
+        "image": "",
+        "recipe": "",
+    }
     for line in text.splitlines():
         key, _, value = line.partition(" ")
         if key in fields:
@@ -355,6 +403,8 @@ def _read_app(name: str, text: str) -> App:
         fields["created"],
         fields["containerfile"],
         fields["compose"],
+        fields["image"],
+        fields["recipe"],
     )
 
 

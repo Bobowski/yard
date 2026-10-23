@@ -492,3 +492,63 @@ def ensure_file(path: Path, mode: int = 0o600) -> None:
         path.chmod(mode)
     else:
         atomic_write(path, "", mode)
+
+
+RECIPES = "https://raw.githubusercontent.com/Bobowski/yard/main/recipes"
+
+_IMAGE_REPO = re.compile(r"[a-z0-9._-]+")
+_IMAGE_TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
+_IMAGE_DIGEST = re.compile(r"[0-9a-f]{64}")
+_RECIPE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+
+
+def check_image(text: str) -> str:
+    """An image ref: [registry/]repo[:tag][@sha256:<64 hex>]. A tag or a digest is required."""
+    ref = text.strip()
+    bad = YardError(
+        400,
+        "bad_image",
+        "an image is [registry/]name[:tag][@sha256:<64 hex>]",
+        context={"image": text},
+        help_text="Name a tag: postgres:17 follows every 17.x release.",
+        example="postgres:17",
+    )
+    name, sep, digest = ref.partition("@")
+    if sep and not _IMAGE_DIGEST.fullmatch(digest.removeprefix("sha256:")):
+        raise bad
+    if len(name) > 255 or "://" in name:
+        raise bad
+    last = name.rsplit("/", 1)[-1]
+    repo, colon, tag = last.rpartition(":")
+    if colon and not _IMAGE_TAG.fullmatch(tag):
+        raise bad
+    base = name[: -len(last)] + (repo if colon else last)
+    if not all(_IMAGE_REPO.fullmatch(part) for part in base.split("/")):
+        raise bad
+    if not colon and not sep:
+        raise bad
+    return ref
+
+
+def check_recipe(text: str) -> str:
+    """A recipe: a name of one Yard recipe, or an https URL. The stored value is the URL."""
+    value = text.strip()
+    if _RECIPE_NAME.fullmatch(value) and not value.endswith(".yml"):
+        return f"{RECIPES}/{value}.yml"
+    if value.startswith("http://"):
+        raise YardError(
+            400,
+            "bad_recipe",
+            "recipes are fetched over https",
+            context={"recipe": text},
+            help_text=f"Use the https URL, or a name of one: {RECIPES}/",
+        )
+    if value.startswith("https://") and len(value) <= 500:
+        return value
+    raise YardError(
+        400,
+        "bad_recipe",
+        "a recipe is a name or an https URL",
+        context={"recipe": text},
+        help_text=f"Like postgres, or an https URL to a compose file. Yard recipes: {RECIPES}/",
+    )
