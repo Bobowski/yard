@@ -61,3 +61,10 @@ async def test_404_is_tag_not_found(monkeypatch):
     monkeypatch.setattr(sources, "fetch", _fake(calls, [(404, {}, b"")]))
     with pytest.raises(YardError, match="not found"):
         await sources.digest("postgres:999")
+
+
+async def test_docker_io_host_maps_to_registry(monkeypatch):
+    calls = []
+    monkeypatch.setattr(sources, "fetch", _fake(calls, [(200, {"Docker-Content-Digest": "sha256:" + "e" * 64}, b"")]))
+    await sources.digest("docker.io/louislam/uptime-kuma:1")
+    assert calls[0][0] == "https://registry-1.docker.io/v2/louislam/uptime-kuma/manifests/1"

@@ -14,8 +14,6 @@ _ACCEPT = (
     " application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
 )
 _TIMEOUT = 30
-
-
 _RECIPE_MAX = 256 * 1024
 
 
@@ -38,7 +36,9 @@ def _parse(ref: str) -> tuple[str, str, str]:
     if sep and ("." in first or ":" in first or first == "localhost"):
         host, repo = first, rest
     else:
-        host, repo = "registry-1.docker.io", name
+        host, repo = "docker.io", name
+    if host in ("docker.io", "index.docker.io", "registry-1.docker.io", "registry.hub.docker.com"):
+        host = "registry-1.docker.io"
         if "/" not in repo:
             repo = f"library/{repo}"
     last = repo.rsplit("/", 1)[-1]
@@ -87,9 +87,6 @@ async def _token(headers: dict[str, str], ref: str) -> str:
     if not token:
         raise YardError(502, "registry", f"{ref}: the token service sent no token")
     return token
-
-
-# --- recipe fetching (moved from apps.py) -----------------------------------
 
 
 def _fetch_recipe(url: str) -> bytes:
