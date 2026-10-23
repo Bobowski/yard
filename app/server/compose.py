@@ -130,7 +130,7 @@ def saved_project(config: Config, app: App) -> Project | None:
         file = recipe_file(config, app.name)
         if file is None:
             return None
-        env = run_env(config, app, config.app_dir(app.name), image_tag(app.name, "recipe"), "")
+        env = run_env(config, app, config.app_dir(app.name), "recipe:" + read_revision(config, app.name)[7:19], "")
         ensure_env(config.env(app.name))
         return Project(app.name, [str(file)], env)
     checkout = config.clone(app.name)

@@ -520,9 +520,10 @@ async def _deploy_source(yard: Yard, app: App, *, cause: str, actor: str) -> Out
         else:
             body = await sources.fetch_recipe(app.recipe)
             revision = "sha256:" + hashlib.sha256(body).hexdigest()
-            image = compose.image_tag(app.name, revision[7:19])
+            image = f"recipe:{revision[7:19]}"
             recipe_file = _write_recipe(yard.config, app.name, revision, body)
             project = _source_project(yard.config, app, str(recipe_file), image, revision)
+            project.env["SKIP_BUILD"] = "1"
             previous_recipe = _recipe_file(yard.config, app.name)
             if previous_recipe is not None:
                 project.env["PREVIOUS_COMPOSE_FILE"] = str(previous_recipe)

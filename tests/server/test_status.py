@@ -273,3 +273,86 @@ def test_recipe_row_shows_the_revision(tmp_path):
     assert row.sha == revision
     row2 = status._row(config, item, app, None, "sha256:" + "c" * 64, None, [], {})
     assert row2.tip == "sha256:" + "c" * 64
+
+
+async def test_probe_uses_the_bind_port(tmp_path, monkeypatch):
+    """A bound row is probed on its dial port; an unbound repo-less row is not probed."""
+    probed = []
+
+    async def fake_probe(host, port, timeout=1.0):
+        probed.append((host, port))
+        return True
+
+    monkeypatch.setattr(status, "probe", fake_probe)
+    bound = status.Row(
+        app="u",
+        container="u-app-1",
+        service="app",
+        state="running",
+        running=True,
+        health="",
+        exit_code=0,
+        id="",
+        oom=False,
+        error="",
+        started="",
+        exited="",
+        image="x",
+        sha="",
+        tip="",
+        binds=[{"host": "u.example.com", "dial": "u-app-1:3001"}],
+        trigger="",
+        cpu="",
+        mem="",
+        data=0,
+        deploy=None,
+    )
+    loose = status.Row(
+        app="v",
+        container="v-app-1",
+        service="app",
+        state="running",
+        running=True,
+        health="",
+        exit_code=0,
+        id="",
+        oom=False,
+        error="",
+        started="",
+        exited="",
+        image="x",
+        sha="",
+        tip="",
+        binds=[],
+        trigger="",
+        cpu="",
+        mem="",
+        data=0,
+        deploy=None,
+    )
+    code = status.Row(
+        app="c",
+        container="c-app-1",
+        service="app",
+        state="running",
+        running=True,
+        health="",
+        exit_code=0,
+        id="",
+        oom=False,
+        error="",
+        started="",
+        exited="",
+        image="x",
+        sha="",
+        tip="",
+        binds=[],
+        trigger="",
+        cpu="",
+        mem="",
+        data=0,
+        deploy=None,
+    )
+    await status._probe_rows([bound, loose, code], {"u", "v"})
+    assert probed == [("u-app-1", 3001), ("c-app-1", 8000)]
+    assert bound.answers is True and loose.answers is None and code.answers is True

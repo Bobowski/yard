@@ -116,7 +116,7 @@ async def report(yard: Yard, running_only: bool = False) -> Report:
             continue
         rows.append(_row(config, item, None, samples.get(item.name), "", None, [], crashes))
     if config.boot:
-        await _probe_rows(rows)
+        await _probe_rows(rows, {app.name for app in apps if app.image or app.recipe})
     shown = [samples.get(row.container) for row in rows]
     return Report(
         host=Host(
@@ -232,7 +232,7 @@ async def app_report(yard: Yard, name: str) -> Page:
     crashes = await _crashes(yard, listed)
     rows = _app_rows(config, app, items, samples, tip, note, bound, crashes, False)
     if config.boot:
-        await _probe_rows(rows)
+        await _probe_rows(rows, {app.name} if (app.image or app.recipe) else set())
     page_log = await _container_tail(yard, f"{name}-app-1")
     image = items[0].image if items else ""
     return Page(
@@ -247,9 +247,23 @@ async def app_report(yard: Yard, name: str) -> Page:
     )
 
 
-async def _probe_rows(rows: list[Row]) -> None:
-    targets = [row for row in rows if row.container and row.running and row.service == "app"]
-    found = await asyncio.gather(*(probe(row.container, APP_PORT) for row in targets))
+def _dial_port(row: Row) -> int:
+    """The port to probe: the row's bind dial when it has one, else the app contract's 8000."""
+    if row.binds:
+        dial = str(row.binds[0].get("dial") or "")
+        if ":" in dial and dial.rsplit(":", 1)[1].isdigit():
+            return int(dial.rsplit(":", 1)[1])
+    return APP_PORT
+
+
+async def _probe_rows(rows: list[Row], source_apps: set[str]) -> None:
+    """An HTTP probe per running app row. A repo-less app without a bind has no known port."""
+    targets = [
+        row
+        for row in rows
+        if row.container and row.running and row.service == "app" and (row.app not in source_apps or row.binds)
+    ]
+    found = await asyncio.gather(*(probe(row.container, _dial_port(row)) for row in targets))
     for row, up in zip(targets, found, strict=True):
         row.answers = up
 

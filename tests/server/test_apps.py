@@ -1212,3 +1212,24 @@ async def test_delete_image_app_purges(tmp_path: Path, monkeypatch: pytest.Monke
     await apps.delete(yard, "db")
     assert recorder.calls and recorder.calls[0]["command"] == "purge"
     assert recorder.calls[0]["project"].files == [compose.IMAGE_COMPOSE]
+
+
+async def test_recipe_deploy_uses_recipe_label_and_no_build(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard = make_yard(tmp_path, skip=False)
+    yard.store.create_app("umami", "", recipe="https://example.com/x.yml")
+    recorder = _Apply()
+    monkeypatch.setattr(compose, "apply", recorder)
+
+    async def fake_fetch(url):
+        return b"# port: 3000\nservices: {}\n"
+
+    monkeypatch.setattr(sources, "fetch_recipe", fake_fetch)
+    outcome = await apps.deploy(yard, "umami")
+    assert outcome.status == "ok"
+    project = recorder.calls[0]["project"]
+    assert project.env["SKIP_BUILD"] == "1"
+    import hashlib
+
+    rev = "sha256:" + hashlib.sha256(b"# port: 3000\nservices: {}\n").hexdigest()
+    assert project.env["IMAGE"] == f"recipe:{rev[7:19]}"
+    assert outcome.image == f"recipe:{rev[7:19]}"
