@@ -1724,3 +1724,31 @@ def test_app_detect_image_app(monkeypatch: pytest.MonkeyPatch, capsys: pytest.Ca
 def test_app_new_source_flags_exclusive(capsys: pytest.CaptureFixture):
     with pytest.raises(SystemExit):
         main(["app", "new", "--image", "postgres:17", "--containerfile", "Dockerfile"])
+
+
+def test_app_set_image_push_message(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    def fake_api_try(client, method, path, body, timeout=None):
+        if method == "GET":
+            return 200, json.dumps({"app": {"name": "db", "image": "postgres:16", "trigger": "push"}})
+        return 200, json.dumps({"app": {"name": "db", "image": "postgres:17", "trigger": "push"}})
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    _env(monkeypatch)
+    main(["app", "set", "--app", "db", "--image", "postgres:17", "--text"])
+    out = capsys.readouterr().out
+    assert "The next check deploys it within 5 minutes" in out
+    assert "still builds the old way" not in out
+
+
+def test_app_set_image_manual_message(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    def fake_api_try(client, method, path, body, timeout=None):
+        if method == "GET":
+            return 200, json.dumps({"app": {"name": "db", "image": "postgres:16", "trigger": "manual"}})
+        return 200, json.dumps({"app": {"name": "db", "image": "postgres:17", "trigger": "manual"}})
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    _env(monkeypatch)
+    main(["app", "set", "--app", "db", "--image", "postgres:17", "--text"])
+    out = capsys.readouterr().out
+    assert "still runs the old version until the next deploy" in out
+    assert "Deploy now: yard app deploy --app db" in out

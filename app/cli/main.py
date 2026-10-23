@@ -468,14 +468,15 @@ def _cmd_app_set(args: argparse.Namespace) -> None:
     found = wrap.get("app") if isinstance(wrap, dict) else None
     app = found if isinstance(found, dict) else {}
     moved = any(key in patch and patch[key] != str(current.get(key) or "") for key in ("repo", "ref"))
-    built = any(
-        key in patch and patch[key] != str(current.get(key) or "")
-        for key in ("containerfile", "compose", "image", "recipe")
-    )
-    if moved and str(app.get("trigger") or "") == "push":
+    sourced = any(key in patch and patch[key] != str(current.get(key) or "") for key in ("image", "recipe"))
+    built = any(key in patch and patch[key] != str(current.get(key) or "") for key in ("containerfile", "compose"))
+    if (moved or sourced) and str(app.get("trigger") or "") == "push":
         print(f"The next check deploys it within 5 minutes. Deploy now: yard app deploy --app {name}")
     elif moved:
         print(f"Saved. {name} still runs the old repo and ref until the next deploy.")
+        print(f"Deploy now: yard app deploy --app {name}")
+    elif sourced:
+        print(f"Saved. {name} still runs the old version until the next deploy.")
         print(f"Deploy now: yard app deploy --app {name}")
     elif built:
         print(f"Saved. {name} still builds the old way until the next deploy.")
