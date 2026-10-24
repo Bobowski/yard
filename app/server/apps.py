@@ -154,6 +154,7 @@ class Outcome:
     log: str = ""
     error: str = ""
     previous: str = ""
+    missing_env: str = ""
 
 
 async def deploy(
@@ -327,14 +328,37 @@ async def _apply(yard: Yard, app: App, sha: str) -> Outcome:
     )
     log = text if text.endswith("\n") or not text else text + "\n"
     log = runs + log
+    log, missing_env = _env_hint(yard, app, log)
     if app.name == "yard":
         # Upgrading yard replaces this process, so that apply run is detached.
-        return Outcome("pending", image, log, previous=previous)
+        return Outcome("pending", image, log, previous=previous, missing_env=missing_env)
     if code == 3:
-        return Outcome("reverted", image, log, f"unhealthy; reverted to {previous}", previous)
+        return Outcome("reverted", image, log, f"unhealthy; reverted to {previous}", previous, missing_env)
     if code:
-        return Outcome("failed", image, log, f"apply exited {code}", previous)
-    return Outcome("ok", image, log, previous=previous)
+        return Outcome("failed", image, log, f"apply exited {code}", previous, missing_env)
+    return Outcome("ok", image, log, previous=previous, missing_env=missing_env)
+
+
+def _env_hint(yard: Yard, app: App, log: str) -> tuple[str, str]:
+    """A deploy-log hint when the app's code reads env keys that its env file does not set."""
+    try:
+        env = yard.store.read_env(app.name)
+        missing = [s for s in detect.settings(yard.config.clone(app.name)) if s.required and s.key not in env]
+    except Exception:
+        return log, ""
+    if not missing:
+        return log, ""
+    width = max(len(s.key) for s in missing)
+    rows = "".join(f"  {s.key:<{width}}  {s.where}\n" for s in missing)
+    keys = " ".join(f"{s.key}=\u2026" for s in missing)
+    log += (
+        f"hint: {app.name} reads settings that its env does not set:\n"
+        f"{rows}"
+        f"Set them: yard env set --app {app.name} {keys}\n"
+        f"Or edit the env: yard env edit --app {app.name}\n"
+        f"Then deploy: yard app deploy --app {app.name}\n"
+    )
+    return log, ",".join(s.key for s in missing)
 
 
 def app_file(config: Config, app: App, which: str) -> str:

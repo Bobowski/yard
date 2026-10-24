@@ -8,7 +8,9 @@ services:
     pull_policy: never
     restart: always
     networks:
-      - yard
+      yard:
+        aliases:
+          - ${PROJECT_NAME}
     volumes:
       - ${DATA_DIR}:/data
     env_file:

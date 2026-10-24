@@ -1233,3 +1233,28 @@ async def test_recipe_deploy_uses_recipe_label_and_no_build(tmp_path: Path, monk
     rev = "sha256:" + hashlib.sha256(b"# port: 3000\nservices: {}\n").hexdigest()
     assert project.env["IMAGE"] == f"recipe:{rev[7:19]}"
     assert outcome.image == f"recipe:{rev[7:19]}"
+
+
+async def test_deploy_hint_for_unset_required_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard = make_yard(tmp_path, skip=False)
+    yard.store.create_app("heldso", "https://origin.cursor.com/org/app")
+    clone = _stario_clone(yard, "heldso")
+    (clone / "app" / "config.py").parent.mkdir(exist_ok=True)
+    (clone / "app" / "config.py").write_text('import os\nA = os.environ["SECRET_KEY"]\nB = os.getenv("OPT")\n')
+    _connect(monkeypatch)
+    recorder = _Apply()
+    monkeypatch.setattr(compose, "apply", recorder)
+
+    async def fake_sync(clone, url, ref, token=""):
+        return git.head(clone)
+
+    monkeypatch.setattr(git, "sync", fake_sync)
+    outcome = await apps.deploy(yard, "heldso")
+    assert outcome.status == "ok"
+    assert "hint: heldso reads settings that its env does not set:" in outcome.log
+    assert "SECRET_KEY" in outcome.log and "app/config.py:2" in outcome.log
+    assert "OPT=…" not in outcome.log  # optional keys are not required
+    # the key set (even empty) silences the hint
+    yard.store.write_env("heldso", {"SECRET_KEY": ""})
+    outcome = await apps.deploy(yard, "heldso")
+    assert "hint:" not in outcome.log
