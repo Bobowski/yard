@@ -383,8 +383,9 @@ def test_the_default_compose_meets_the_contract():
     # The file Yard ships passes its own check, and no app container carries yard labels.
     ops = Path(__file__).resolve().parents[2] / "ops"
     text = (ops / "apply" / "default.compose.yml").read_text()
-    assert "aliases:" not in text
-    assert "- yard" in text
+    # The app is reachable on the yard network as its project name.
+    assert "yard:" in text
+    assert "- ${PROJECT_NAME}" in text
     assert "- ${APP_ENV}" in text
     assert "- ${DATA_DIR}:/data" in text
     for line in (

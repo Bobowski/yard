@@ -4,7 +4,9 @@ services:
     image: ${IMAGE}
     restart: always
     networks:
-      - yard
+      yard:
+        aliases:
+          - ${PROJECT_NAME}
     volumes:
       - ${DATA_DIR}:/data
     env_file:
