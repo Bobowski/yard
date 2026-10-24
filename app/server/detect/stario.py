@@ -2,7 +2,9 @@
 
 import re
 
-from app.server.detect import Plan, Repo, YardError, python
+from app.server.detect import python
+from app.server.detect.base import Plan, Repo
+from app.shared import YardError
 
 LANGUAGE = "python"
 MARKERS = ("pyproject.toml",)

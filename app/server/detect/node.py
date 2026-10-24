@@ -3,7 +3,8 @@
 import json
 import re
 
-from app.server.detect import Plan, Repo, YardError, _render
+from app.server.detect.base import Plan, Repo, render
+from app.shared import YardError
 
 LANGUAGE = "node"
 MARKERS = ("package.json",)
@@ -42,7 +43,7 @@ def detect(repo: Repo, name: str) -> Plan | None:
         "containerfile",
         "yard",
         reason,
-        _render(
+        render(
             "node",
             reason,
             name,

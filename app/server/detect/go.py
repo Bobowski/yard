@@ -2,7 +2,8 @@
 
 import re
 
-from app.server.detect import Plan, Repo, YardError, _render
+from app.server.detect.base import Plan, Repo, render
+from app.shared import YardError
 
 LANGUAGE = "go"
 MARKERS = ("go.mod",)
@@ -29,4 +30,4 @@ def detect(repo: Repo, name: str) -> Plan | None:
             f"found go.mod but no single main package at the root or in cmd/ ({listed})",
             help_text="Add a Containerfile, or keep one main package.",
         )
-    return Plan("containerfile", "yard", reason, _render("go", reason, name, version=version, pkg=pkg), "go")
+    return Plan("containerfile", "yard", reason, render("go", reason, name, version=version, pkg=pkg), "go")

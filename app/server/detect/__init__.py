@@ -7,102 +7,28 @@ A detector is one module in this package for one language or framework. It expos
 - detect(repo, name) -> Plan | None: None means "not mine"; YardError means "mine but broken".
 - settings(repo) -> list[Setting], optional: the env keys the code reads.
 
-A generated Containerfile lives in templates/ next to this file and renders through _render.
+A detector imports Repo, Plan, Setting, SET_BY_YARD, and render from detect.base.
+A generated Containerfile lives in templates/ next to this file and renders through render.
 A detector must refuse (YardError or None) rather than guess an install or entrypoint.
 
 A PR adding a detector adds the module, its template, an entry in DETECTORS (specific
 before generic), and tests under tests/server/.
 """
 
-import tomllib
-from dataclasses import dataclass
+import logging
 from pathlib import Path
 
 from app.server import git
 from app.server.compose import COMPOSE_NAMES, DOCKERFILES
+from app.server.detect import go, node, python, stario
+from app.server.detect.base import Plan, Repo, Setting, _join
 from app.shared import YardError
 
-_TEMPLATES = Path(__file__).resolve().parent / "templates"
-
-SET_BY_YARD = {
-    "PROJECT_NAME",
-    "PROJECT_DATA_DIR",
-    "SHA",
-    "PORT",
-    "STARIO_HOST",
-    "STARIO_PORT",
-    "STARIO_TRACER",
-}
-
-
-class Repo:
-    """A checkout path with small cached helpers."""
-
-    def __init__(self, root: Path) -> None:
-        self.root = Path(root)
-        self._pyproject: dict | None = None
-
-    def exists(self, rel: str) -> bool:
-        return (self.root / rel).is_file()
-
-    def text(self, rel: str) -> str:
-        path = self.root / rel
-        return path.read_text() if path.is_file() else ""
-
-    @property
-    def pyproject(self) -> dict:
-        if self._pyproject is None:
-            try:
-                self._pyproject = tomllib.loads(self.text("pyproject.toml"))
-            except ValueError:
-                self._pyproject = {}
-        return self._pyproject
-
-
-@dataclass(slots=True)
-class Plan:
-    """One answer to "what does the app run"."""
-
-    field: str  # "compose" or "containerfile"
-    value: str  # a repo-relative path, or "yard" for the written Containerfile
-    reason: str  # human text: "found compose.yml", "pyproject.toml declares stario"
-    generated: str = ""  # the rendered Containerfile when value is "yard"
-    kind: str = ""  # stario, python, go, or node
-
-
-@dataclass(frozen=True, slots=True)
-class Setting:
-    """One env key the app's code reads."""
-
-    key: str
-    required: bool
-    where: str  # "app/config.py:37"
-
-
-def _header(kind: str, reason: str, name: str) -> str:
-    return (
-        f"# Written by Yard for a {kind} app ({reason})."
-        f" To change it, copy it into your repo: yard app cat containerfile --app {name or '<name>'} > Containerfile\n"
-    )
-
-
-def _render(kind: str, reason: str, name: str, template: str = "", **values: str) -> str:
-    text = (_TEMPLATES / f"{template or kind}.Containerfile").read_text()
-    values["name"] = name or "<name>"
-    for key, value in values.items():
-        text = text.replace(f"{{{{{key}}}}}", value)
-    return _header(kind, reason, name) + text
-
-
-def _join(items: list[str]) -> str:
-    if len(items) <= 2:
-        return " and ".join(items)
-    return ", ".join(items[:-1]) + f", and {items[-1]}"
-
-
-from app.server.detect import go, node, python, stario  # noqa: E402
+log = logging.getLogger("yard")
 
 DETECTORS = (stario, python, go, node)
+
+__all__ = ["DETECTORS", "Plan", "Repo", "Setting", "language", "resolve", "settings"]
 
 
 def _languages(repo: Repo) -> dict[str, list[str]]:
@@ -167,6 +93,6 @@ def settings(checkout: Path) -> list[Setting]:
         for mod in DETECTORS:
             if mod.LANGUAGE == lang and hasattr(mod, "settings"):
                 return mod.settings(repo)
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("detect.settings %s: %s", checkout, exc)
     return []

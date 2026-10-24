@@ -5,7 +5,8 @@ import os
 import re
 from pathlib import Path
 
-from app.server.detect import SET_BY_YARD, Plan, Repo, Setting, YardError, _render
+from app.server.detect.base import SET_BY_YARD, Plan, Repo, Setting, render
+from app.shared import YardError
 
 LANGUAGE = "python"
 MARKERS = ("pyproject.toml", "requirements.txt")
@@ -86,7 +87,7 @@ def plan(repo: Repo, name: str, *, kind: str = "python", reason: str = "", env: 
         "containerfile",
         "yard",
         reason,
-        _render(kind, reason, name, template="python", python=_version(repo), cmd=cmd, **install),
+        render(kind, reason, name, template="python", python=_version(repo), cmd=cmd, **install),
         kind,
     )
 
