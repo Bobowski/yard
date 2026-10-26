@@ -323,13 +323,26 @@ def test_check_image(tmp_path):
         check_image("postgres:17@sha256:short")
 
 
-def test_check_recipe(tmp_path):
-    from app.shared import RECIPES, check_recipe
+def test_parse_runs():
+    from app.shared import YardError, parse_runs
 
-    assert check_recipe("umami") == f"{RECIPES}/umami.yml"
-    assert check_recipe("my-app-2") == f"{RECIPES}/my-app-2.yml"
-    assert check_recipe("https://example.com/umami.yml") == "https://example.com/umami.yml"
-    with pytest.raises(YardError, match="https"):
-        check_recipe("http://example.com/umami.yml")
-    with pytest.raises(YardError):
-        check_recipe("Bad Name")
+    assert parse_runs("") == ("auto", "")
+    assert parse_runs("auto") == ("auto", "")
+    assert parse_runs("yard:python-uv") == ("template", "yard:python-uv")
+    assert parse_runs("https://example.com/x.yml") == ("url", "https://example.com/x.yml")
+    assert parse_runs("postgres:17") == ("image", "postgres:17")
+    assert parse_runs("ops/stack.yml") == ("path", "ops/stack.yml")
+    import pytest as _p
+
+    for bad in ("http://example.com/x", "ftp://x", "yard:Bad", "yard:", "weird:thing:x"):
+        with _p.raises(YardError):
+            parse_runs(bad)
+
+
+def test_image_sha_drops_the_template_suffix():
+    from app.shared import image_sha
+
+    assert image_sha("localhost/x:abcdef123456-3f9a1c2e") == "abcdef123456"
+    assert image_sha("localhost/x:abcdef123456") == "abcdef123456"
+    assert image_sha("postgres:17") == "17"
+    assert image_sha("foo:1.2-deadbeef") == "1.2-deadbeef"

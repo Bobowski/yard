@@ -3,11 +3,13 @@
 import json
 import re
 
-from app.server.detect.base import Plan, Repo, render
+from app.server.detect.base import Plan, Repo, pin, plan_template
 from app.shared import YardError
 
 LANGUAGE = "node"
 MARKERS = ("package.json",)
+
+VERSIONS = ("22", "24")
 
 _NODE_ENGINE = re.compile(r"\d+")
 
@@ -33,24 +35,31 @@ def detect(repo: Repo, name: str) -> Plan | None:
                 "detect",
                 f"Yard's Node template uses npm; this repo uses {manager} ({lockfile}). Add a Containerfile.",
             )
-    reason = "package.json start script"
     engines_raw = package.get("engines")
     engines: dict = engines_raw if isinstance(engines_raw, dict) else {}
     found = _NODE_ENGINE.search(str(engines.get("node") or ""))
-    version = found.group(0) if found else "24"
+    version = _version(int(found.group(0))) if found else "24"
     install = "npm ci" if repo.exists("package-lock.json") else "npm install"
-    return Plan(
-        "containerfile",
-        "yard",
-        reason,
-        render(
-            "node",
-            reason,
-            name,
-            version=version,
-            install=install,
-            build="RUN npm run build" if scripts.get("build") else "",
-            cmd='["npm", "start"]',
-        ),
-        "node",
+    return plan_template(
+        "yard:node-npm",
+        "node: package.json start script",
+        name,
+        template="node",
+        node=pin(f"node:{version}-slim"),
+        install=install,
+        build="RUN npm run build" if scripts.get("build") else "",
+        cmd='["npm", "start"]',
+    )
+
+
+def _version(ask: int) -> str:
+    """The engines number is a minimum: the smallest supported version >= it."""
+    for version in VERSIONS:
+        if int(version) >= ask:
+            return version
+    raise YardError(
+        502,
+        "detect",
+        f"Yard's node templates cover {', '.join(VERSIONS)}; this repo asks {ask}",
+        help_text="Add a Containerfile.",
     )

@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
@@ -13,6 +14,16 @@ from app.shared import YardError
 
 if TYPE_CHECKING:
     from stario import App as StarioApp
+
+
+@dataclass(slots=True)
+class Tip:
+    """What a check last saw for one app."""
+
+    revision: str = ""
+    template: str = ""
+    error: str = ""
+    tried: tuple[str, str] = ("", "")
 
 
 class Yard:
@@ -31,9 +42,7 @@ class Yard:
             )
         }
         self.skip_deploy = config.skip_deploy
-        self.tips: dict[str, str] = {}
-        self.tried: dict[str, str] = {}
-        self.source_errors: dict[str, str] = {}
+        self.tips: dict[str, Tip] = {}
         self.locks: dict[str, asyncio.Lock] = {}
         self.checked: dict[str, float] = {}
         self.queued: dict[str, Callable[[], Awaitable[None]]] = {}

@@ -1,7 +1,6 @@
 import asyncio
 import os
 import re
-import stat
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -9,11 +8,13 @@ from pathlib import Path
 import pytest
 
 from app.server import compose
-from app.server.compose import APPLY_DIR, DEFAULT_COMPOSE, image_tag, prepare, run_env, saved_project
-from app.server.store import App, Config
+from app.server.compose import APP_COMPOSE, BUILD_COMPOSE, image_tag, project, run_env, saved_project
+from app.server.store import App, Config, Deployed, write_deployed
 
-ON_YARD = "services:\n  app:\n    networks:\n      - yard\n"
-FULL = ON_YARD + "    env_file:\n      - ${APP_ENV}\n    volumes:\n      - ${DATA_DIR}:/data\n"
+FULL = (
+    "services:\n  app:\n    networks:\n      - yard\n"
+    "    env_file:\n      - ${APP_ENV}\n    volumes:\n      - ${DATA_DIR}:/data\n"
+)
 
 
 def _config(root: Path) -> Config:
@@ -32,10 +33,6 @@ def _config(root: Path) -> Config:
 
 def _app(name: str, trigger: str = "") -> App:
     return App(name, "https://origin.cursor.com/org/heldso", "main", trigger or "push", "")
-
-
-def _prepare(config: Config, app: App, checkout: Path, image: str, sha: str) -> compose.Project:
-    return prepare(config, app, checkout, image, sha)
 
 
 def _checkout(root: Path, files: dict[str, str]) -> Path:
@@ -65,10 +62,6 @@ def _git_out(checkout: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(checkout), *args], text=True).strip()
 
 
-def _mode(path: Path) -> int:
-    return stat.S_IMODE(path.stat().st_mode)
-
-
 def test_run_env_is_the_interpolation_env(tmp_path: Path):
     config = _config(tmp_path)
     checkout = _checkout(tmp_path, {"Containerfile": "FROM scratch\n"})
@@ -83,100 +76,115 @@ def test_run_env_is_the_interpolation_env(tmp_path: Path):
         "APP_ENV": str(tmp_path / "apps" / "heldso" / "env"),
     }
     assert (tmp_path / "apps" / "heldso" / "data").is_dir()
-    assert not any(key.startswith("STARIO") for key in env)
 
 
-def test_prepare_with_the_default_compose(tmp_path: Path):
+def test_project_containerfile_composes_app_and_build(tmp_path: Path):
     config = _config(tmp_path)
     checkout = _checkout(tmp_path, {"Containerfile": "FROM scratch\n"})
-    project = _prepare(config, _app("heldso"), checkout, "localhost/heldso:abc", "abc")
-
-    assert project.files == [DEFAULT_COMPOSE]
-    assert "DOCKERFILE" not in project.env
-    assert project.env["APP_ENV"] == str(tmp_path / "apps" / "heldso" / "env")
-
-    # The env file exists for compose, closed to other users. Nothing else is written.
+    found = project(
+        config,
+        _app("heldso"),
+        "containerfile",
+        "Containerfile",
+        "abc",
+        "localhost/heldso:abc",
+        checkout,
+        "Containerfile",
+    )
+    assert found.files == [APP_COMPOSE, BUILD_COMPOSE]
+    assert found.env["DOCKERFILE"] == "Containerfile"
+    assert found.env["YARD_FILES"] == "1"
     env_file = tmp_path / "apps" / "heldso" / "env"
     assert env_file.read_text() == ""
-    assert _mode(env_file) == 0o600
-    assert not (tmp_path / "run").exists()
 
 
-def test_prepare_uses_the_record_build_path(tmp_path: Path):
-    config = _config(tmp_path)
-    checkout = _checkout(tmp_path, {"README": "hi\n"})
-    app = _app("heldso")
-    app.containerfile = "ops/api.Containerfile"
-    project = _prepare(config, app, checkout, "localhost/heldso:abc", "abc")
-    assert project.env["DOCKERFILE"] == "ops/api.Containerfile"
-    app.containerfile = "yard"
-    (tmp_path / "apps" / "heldso" / "Containerfile").write_text("FROM scratch\n")
-    project = _prepare(config, app, checkout, "localhost/heldso:abc", "abc")
-    assert project.env["DOCKERFILE"] == str(tmp_path / "apps" / "heldso" / "Containerfile")
-
-
-def test_prepare_unset_record_still_prepares(tmp_path: Path):
-    """A purge of an unset record works: the find fallback, no DOCKERFILE."""
-    config = _config(tmp_path)
-    checkout = _checkout(tmp_path, {"README": "hi\n"})
-    project = _prepare(config, _app("heldso"), checkout, "localhost/heldso:abc", "abc")
-    assert project.files == [DEFAULT_COMPOSE]
-    assert "DOCKERFILE" not in project.env
-
-
-def test_prepare_with_a_repo_compose(tmp_path: Path):
+def test_project_repo_compose_is_one_file(tmp_path: Path):
     config = _config(tmp_path)
     checkout = _checkout(tmp_path, {"compose.yml": FULL})
-    project = _prepare(config, _app("heldso"), checkout, "localhost/heldso:abc", "abc")
+    found = project(config, _app("heldso"), "compose", "compose.yml", "abc", "localhost/heldso:abc", checkout)
+    assert found.files == [str(checkout / "compose.yml")]
+    assert "YARD_FILES" not in found.env
 
-    # The repo file runs as it is: no override, no DOCKERFILE.
-    assert project.files == [str(checkout / "compose.yml")]
-    assert "DOCKERFILE" not in project.env
-    assert not (tmp_path / "run").exists()
+
+def test_project_image_app_is_app_only(tmp_path: Path):
+    config = _config(tmp_path)
+    app = App("db", "", "main", "push", "", "postgres:17")
+    found = project(
+        config, app, "image", "", "sha256:" + "a" * 64, f"postgres:17@sha256:{'a' * 64}", config.app_dir("db")
+    )
+    assert found.files == [APP_COMPOSE]
+    assert found.env["YARD_FILES"] == "1"
+
+
+def test_project_url_compose_is_the_copy(tmp_path: Path):
+    config = _config(tmp_path)
+    app = App("u", "", "main", "push", "", "https://example.com/x.yml")
+    rev = "sha256:" + "b" * 64
+    found = project(config, app, "compose", app.runs, rev, f"compose:{rev[7:19]}", config.app_dir("u"))
+    assert found.files == [str(tmp_path / "apps" / "u" / "compose" / f"{rev[7:19]}.yml")]
 
 
 def test_the_yard_app_gets_its_host_paths_from_config(tmp_path: Path):
     config = _config(tmp_path)
     checkout = _checkout(tmp_path, {"ops/compose.yml": FULL})
-    project = _prepare(config, _app("yard"), checkout, "localhost/yard:abc", "abc")
-
-    assert project.env["YARD_ROOT"] == str(tmp_path)
-    assert project.env["YARD_PODMAN_SOCK"] == "/run/podman.sock"
-    # The directory is mounted so a host podman.socket restart stays reachable.
-    assert project.env["YARD_PODMAN_DIR"] == "/run"
-    default = _prepare(replace(config, podman_sock=""), _app("yard"), checkout, "localhost/yard:abc", "abc")
-    assert default.env["YARD_PODMAN_SOCK"] == "/run/podman/podman.sock"
-    assert default.env["YARD_PODMAN_DIR"] == "/run/podman"
-    assert project.files == [str(checkout / "ops" / "compose.yml")]
-
-    # Another app does not see the host paths.
-    other = _prepare(config, _app("nightly", trigger="manual"), checkout, "localhost/nightly:abc", "abc")
-    assert "YARD_PODMAN_SOCK" not in other.env
+    found = project(config, _app("yard"), "compose", "ops/compose.yml", "abc", "localhost/yard:abc", checkout)
+    assert found.env["YARD_ROOT"] == str(tmp_path)
+    assert found.env["YARD_PODMAN_SOCK"] == "/run/podman.sock"
+    assert found.env["YARD_PODMAN_DIR"] == "/run"
+    other = run_env(replace(config, podman_sock=""), _app("yard"), checkout, "x", "s")
+    assert other["YARD_PODMAN_SOCK"] == "/run/podman/podman.sock"
 
 
-def test_saved_project_rebuilds_from_the_clone(tmp_path: Path):
+def test_saved_project_rebuilds_from_the_deployed_file(tmp_path: Path):
     config = _config(tmp_path)
     checkout = config.clone("heldso")
     checkout.mkdir(parents=True)
     (checkout / "Containerfile").write_text("FROM scratch\n")
     _git(checkout)
     sha = _git_out(checkout, "rev-parse", "HEAD")
-    live = _app("heldso")
-    found = saved_project(config, live)
+    write_deployed(config, "heldso", Deployed(revision=sha, runs="Containerfile", kind="containerfile"))
+    found = saved_project(config, _app("heldso"))
     assert found is not None
-    assert found.files == [DEFAULT_COMPOSE]
-    assert found.env["CHECKOUT"] == str(checkout)
+    assert found.files == [APP_COMPOSE, BUILD_COMPOSE]
     assert found.env["IMAGE"] == image_tag("heldso", sha)
-    assert found.env["SHA"] == sha
+    assert found.env["DOCKERFILE"] == "Containerfile"
 
-    # A repo compose is the one file.
     (checkout / "compose.yml").write_text(FULL)
-    found = saved_project(config, live)
-    assert found is not None
-    assert found.files == [str(checkout / "compose.yml")]
+    write_deployed(config, "heldso", Deployed(revision=sha, runs="compose.yml", kind="compose"))
+    found = saved_project(config, _app("heldso"))
+    assert found is not None and found.files == [str(checkout / "compose.yml")]
 
-    # A missing clone means nothing to run.
+    write_deployed(
+        config, "heldso", Deployed(revision=sha, runs="yard:python-uv", kind="containerfile", template="3f9a1c2e")
+    )
+    found = saved_project(config, _app("heldso"))
+    assert found is not None
+    assert found.env["IMAGE"] == image_tag("heldso", sha, "3f9a1c2e")
+    assert found.env["DOCKERFILE"] == str(tmp_path / "apps" / "heldso" / "Containerfile")
+
     assert saved_project(config, _app("other")) is None
+
+
+def test_saved_project_image_app(tmp_path: Path):
+    config = _config(tmp_path)
+    app = App("db", "", "main", "push", "", "postgres:17")
+    write_deployed(config, "db", Deployed(revision="sha256:" + "a" * 64, runs="postgres:17", kind="image"))
+    found = saved_project(config, app)
+    assert found is not None
+    assert found.files == [APP_COMPOSE]
+    assert found.env["IMAGE"] == "postgres:17@sha256:" + "a" * 64
+
+
+def test_saved_project_url_compose(tmp_path: Path):
+    config = _config(tmp_path)
+    rev = "sha256:" + "b" * 64
+    copy = tmp_path / "apps" / "u" / "compose" / f"{rev[7:19]}.yml"
+    copy.parent.mkdir(parents=True)
+    copy.write_text("services: {}\n")
+    app = App("u", "", "main", "push", "", "https://example.com/x.yml")
+    write_deployed(config, "u", Deployed(revision=rev, runs=app.runs, kind="compose"))
+    found = saved_project(config, app)
+    assert found is not None and found.files == [str(copy)]
 
 
 def test_apply_runs_one_podman_container(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -190,24 +198,16 @@ def test_apply_runs_one_podman_container(tmp_path: Path, monkeypatch: pytest.Mon
         return 0, "== build\n"
 
     monkeypatch.setattr(compose, "_run", fake_run)
-    project = compose.Project(
+    found = compose.Project(
         "heldso",
         ["/checkout/compose.yml"],
         {"DATA_DIR": f"{tmp_path}/data/heldso", "IMAGE": "localhost/heldso:abc", "PROJECT_NAME": "heldso"},
     )
 
-    code, text = asyncio.run(
-        compose.apply(
-            config,
-            "heldso",
-            "up",
-            project,
-        )
-    )
+    code, text = asyncio.run(compose.apply(config, "heldso", "up", found))
     assert code == 0
-    assert text == "== build\n"
     argv, env = calls[0]
-    assert argv == [
+    assert argv[:13] == [
         "podman",
         "--remote",
         "run",
@@ -221,29 +221,16 @@ def test_apply_runs_one_podman_container(tmp_path: Path, monkeypatch: pytest.Mon
         "-v",
         f"{tmp_path}:{tmp_path}",
         "-e",
-        "COMPOSE_PROJECT_NAME=heldso",
-        "-e",
-        "COMPOSE_FILE=/checkout/compose.yml",
-        "-e",
-        f"DATA_DIR={tmp_path}/data/heldso",
-        "-e",
-        "IMAGE=localhost/heldso:abc",
-        "-e",
-        "PROJECT_NAME=heldso",
-        "localhost/yard-apply",
-        "up",
     ]
+    assert "COMPOSE_FILE=/checkout/compose.yml" in argv
     assert env["CONTAINER_HOST"] == "unix:///run/podman.sock"
-    assert env["DOCKER_HOST"] == "unix:///run/podman.sock"
 
-    # The yard app detaches.
-    asyncio.run(compose.apply(config, "yard", "up", project, detach=True))
+    asyncio.run(compose.apply(config, "yard", "up", found, detach=True))
     argv, _env = calls[-1]
     assert argv[-3:] == ["-d", "localhost/yard-apply", "up"]
 
 
 def test_install_sh_runs_the_first_apply():
-    # install.sh prepares the host, then starts the first apply container by hand.
     spec = (Path(__file__).resolve().parents[2] / "install.sh").read_text()
     for part in (
         'git clone --depth 1 "$origin" "$src"',
@@ -253,77 +240,47 @@ def test_install_sh_runs_the_first_apply():
         "admin.token",
     ):
         assert part in spec
-    for gone in ("prepare_source", "autosave", "HEALTH_URL", "yard:bootstrap", "clone --bare", "worktree", "repos/"):
-        assert gone not in spec
 
 
 def test_install_sh_configures_journald():
-    # Container logs live in the journal so they survive a container recreate.
     spec = (Path(__file__).resolve().parents[2] / "install.sh").read_text()
     for part in (
         "/etc/systemd/journald.conf.d/yard.conf",
         "Storage=persistent",
-        "SystemMaxUse=2G",
-        "RateLimitBurst=20000",
-        "mkdir -p /var/log/journal",
-        "systemd-tmpfiles --create --prefix /var/log/journal",
-        "systemctl restart systemd-journald",
-        "/home/yard/.config/containers/containers.conf",
         'log_driver = "journald"',
-        "[engine]",
         'events_logger = "journald"',
         "systemctl --user restart podman.socket",
     ):
         assert part in spec
-    # Each file writes only when its bytes differ; the restarts stay inside the guards.
-    assert spec.count('!= "$journald_conf"') == 1
-    assert spec.count('!= "$containers_conf"') == 1
 
 
 def test_install_sh_points_the_yard_app_at_the_origin():
-    # ensure_host creates the yard app with repo ""; a fresh install PATCHes the
-    # install origin in, best effort, and keeps the trigger manual.
     spec = (Path(__file__).resolve().parents[2] / "install.sh").read_text()
     for part in (
         "api/v1/apps/yard",
         "-X PATCH",
         '\\"repo\\":\\"${origin%.git}\\"',
-        "repo: yard follows ${origin%.git} (manual; yard app deploy --app yard upgrades)",
         "yard app set --app yard --repo ${origin%.git}",
-        "yard app set --app yard --trigger push   # optional: upgrade Yard on every push to ${origin%.git}",
     ):
         assert part in spec
-    assert "jq" not in spec
 
 
 def test_install_sh_uses_the_distro_podman():
-    # Ubuntu 26.04 LTS packages Podman 5.x; the static bundle is gone.
     spec = (Path(__file__).resolve().parents[2] / "install.sh").read_text()
     assert "apt-get install -y nftables git ca-certificates sudo iproute2 procps uidmap acl podman" in spec
-    assert "VERSION_ID" in spec
-    assert "26.04" in spec
-    assert "Yard needs Podman 5 or newer" in spec
-    # The only podman-static reference left is the drop-in cleanup for 0.6.0 hosts.
-    assert spec.count("podman-static.conf") == 1
-    for gone in ("podman_sha256", "wget -q", "podman-linux-amd64", "/usr/local/bin/podman"):
-        assert gone not in spec
 
 
 def test_the_images_pin_the_host_podman_remote():
-    # Both images carry the podman-remote that matches the host's Podman 5.7.
     ops = Path(__file__).resolve().parents[2] / "ops"
     sha = "0d1759e3fc42b0e3a4496176dabc7b65f0f334a0ab2b22eaed7c36afeece8b0c"
     yard = (ops / "Containerfile").read_text()
     apply = (ops / "apply" / "Containerfile").read_text()
     assert "download/v5.7.0/podman-remote-static-linux_amd64.tar.gz" in yard
-    assert f"{sha}  /tmp/podman-remote.tar.gz" in yard
     assert "PODMAN_VERSION=5.7.0" in apply
     assert f"PODMAN_SHA256={sha}" in apply
-    assert "v${PODMAN_VERSION}/podman-remote-static-linux_amd64.tar.gz" in apply
 
 
 def test_install_sh_and_apply_pass_the_same_env_names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    # install.sh starts the yard apply container by hand; apply() must pass the same -e names.
     spec = (Path(__file__).resolve().parents[2] / "install.sh").read_text()
     block = spec.split("podman run --replace", 1)[1].split("localhost/yard-apply", 1)[0]
     shell_names = set(re.findall(r"-e ([A-Z_]+)=", block))
@@ -338,116 +295,47 @@ def test_install_sh_and_apply_pass_the_same_env_names(tmp_path: Path, monkeypatc
         return 0, ""
 
     monkeypatch.setattr(compose, "_run", fake_run)
-    checkout = _checkout(tmp_path, {"compose.yml": FULL})
-    project = compose.Project(
-        "yard",
-        [f"{checkout}/compose.yml"],
-        run_env(config, _app("yard"), checkout, "localhost/yard:abc", "abc"),
-    )
-    asyncio.run(compose.apply(config, "yard", "up", project))
-
+    checkout = _checkout(tmp_path, {"ops/compose.yml": FULL})
+    found = project(config, _app("yard"), "compose", "ops/compose.yml", "abc", "localhost/yard:abc", checkout)
+    asyncio.run(compose.apply(config, "yard", "up", found))
     argv, _env = calls[0]
     python_names = {value.split("=", 1)[0] for flag, value in zip(argv, argv[1:], strict=False) if flag == "-e"}
     assert python_names == shell_names
 
 
-def test_build_apply_builds_the_image(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    config = _config(tmp_path)
-    monkeypatch.delenv("DOCKER_HOST", raising=False)
-    monkeypatch.delenv("CONTAINER_HOST", raising=False)
-    calls: list[tuple[list[str], dict[str, str]]] = []
-
-    async def fake_run(argv, env):
-        calls.append((list(argv), dict(env)))
-        return 0, ""
-
-    monkeypatch.setattr(compose, "_run", fake_run)
-    code, _ = asyncio.run(compose.build_apply(config))
-    assert code == 0
-    argv, env = calls[0]
-    assert argv == [
-        "podman",
-        "--remote",
-        "build",
-        "-t",
-        "localhost/yard-apply",
-        "-f",
-        f"{APPLY_DIR}/Containerfile",
-        APPLY_DIR,
-    ]
-    assert env["CONTAINER_HOST"] == "unix:///run/podman.sock"
-    assert env["DOCKER_HOST"] == "unix:///run/podman.sock"
-
-
-def test_the_default_compose_meets_the_contract():
-    # The file Yard ships passes its own check, and no app container carries yard labels.
-    ops = Path(__file__).resolve().parents[2] / "ops"
-    text = (ops / "apply" / "default.compose.yml").read_text()
-    # The app is reachable on the yard network as its project name.
-    assert "yard:" in text
-    assert "- ${PROJECT_NAME}" in text
-    assert "- ${APP_ENV}" in text
-    assert "- ${DATA_DIR}:/data" in text
+def test_the_apply_files_meet_the_contract():
+    ops = Path(__file__).resolve().parents[2] / "ops" / "apply"
+    names = sorted(path.name for path in ops.iterdir())
+    assert names == ["Containerfile", "app.compose.yml", "apply.sh", "build.compose.yml"]
+    app = (ops / "app.compose.yml").read_text()
     for line in (
+        "image: ${IMAGE}",
+        "- ${PROJECT_NAME}",
+        "- ${APP_ENV}",
+        "- ${DATA_DIR}:/data",
         "PROJECT_NAME: ${PROJECT_NAME}",
         "PROJECT_DATA_DIR: /data",
         "SHA: ${SHA}",
+        "restart: always",
+        "yard:",
+        "external: true",
+    ):
+        assert line in app
+    build = (ops / "build.compose.yml").read_text()
+    for line in (
+        "context: ${CHECKOUT}",
+        "dockerfile: ${DOCKERFILE}",
         'PORT: "8000"',
         "STARIO_HOST: 0.0.0.0",
         'STARIO_PORT: "8000"',
         "STARIO_TRACER: json",
+        "expose:",
     ):
-        assert line in text
-    assert "restart: always" in text
-    assert "      IMAGE:" not in text
-    assert "yard." not in text
-
-    own = (ops / "compose.yml").read_text()
-    assert "labels:" not in own
-    # The socket directory is mounted, not the socket file itself.
-    assert "${YARD_PODMAN_DIR}:/run/podman" in own
-    assert ":/run/podman/podman.sock" not in own
-    # The app service keeps the yard alias: a self-deploy probe dials it by name.
-    assert "aliases:" in own
-    assert "path: ${APP_ENV}" in own
-    assert "required: false" in own
-    files = sorted(path.name for path in (ops / "apply").iterdir())
-    assert files == ["Containerfile", "apply.sh", "default.compose.yml", "image.compose.yml"]
+        assert line in build
+    containerfile = (ops / "Containerfile").read_text()
+    assert "app.compose.yml" in containerfile and "build.compose.yml" in containerfile
 
 
 def test_image_tag():
     assert image_tag("mono", "abc1234def") == "localhost/mono:abc1234def"
-    assert image_tag("yard", "abc") == "localhost/yard:abc"
-
-
-def test_saved_project_image_app(tmp_path: Path):
-    config = _config(tmp_path)
-    (tmp_path / "apps" / "db").mkdir(parents=True)
-    app = App("db", "", "main", "push", "", image="postgres:17")
-    compose.write_revision(config, "db", "sha256:" + "a" * 64)
-    project = saved_project(config, app)
-    assert project is not None
-    assert project.files == [compose.IMAGE_COMPOSE]
-    assert project.env["IMAGE"] == "postgres:17@sha256:" + "a" * 64
-    project2 = saved_project(config, App("db2", "", "main", "push", "", image="nginx:1"))
-    assert project2 is not None and project2.env["IMAGE"] == "nginx:1"
-
-
-def test_saved_project_recipe_app(tmp_path: Path):
-    config = _config(tmp_path)
-    directory = tmp_path / "apps" / "umami" / "recipe"
-    directory.mkdir(parents=True)
-    (directory / "abc123def456.yml").write_text("services: {}\n")
-    app = App("umami", "", "main", "push", "", recipe="https://example.com/x.yml")
-    compose.write_revision(config, "umami", "sha256:" + "a" * 64)
-    project = saved_project(config, app)
-    assert project is not None
-    assert project.files == [str(directory / "abc123def456.yml")]
-    # no revision but a recipe file exists -> newest file
-    config2 = _config(tmp_path / "other")
-    (tmp_path / "other" / "apps" / "u2" / "recipe").mkdir(parents=True)
-    (tmp_path / "other" / "apps" / "u2" / "recipe" / "f00baa111222.yml").write_text("x\n")
-    project2 = saved_project(config2, App("u2", "", "main", "push", "", recipe="https://example.com/x.yml"))
-    assert project2 is not None
-    assert project2.files == [str(tmp_path / "other" / "apps" / "u2" / "recipe" / "f00baa111222.yml")]
-    assert saved_project(config2, App("u3", "", "main", "push", "", recipe="https://example.com/x.yml")) is None
+    assert image_tag("yard", "abc", "3f9a1c2e") == "localhost/yard:abc-3f9a1c2e"

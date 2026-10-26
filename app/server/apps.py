@@ -3,7 +3,6 @@
 import asyncio
 import hashlib
 import logging
-import re
 import shutil
 import time
 from collections.abc import Awaitable, Callable
@@ -11,23 +10,110 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.server import binds, compose, detect, git, journal, podman, sources
+from app.server.detect import Plan
 from app.server.forges import Forge
-from app.server.store import App, Config
-from app.server.yard import Yard
-from app.shared import YardError, atomic_write, clone_url, ensure_file, now
+from app.server.store import App, Config, Deployed, read_deployed, write_deployed
+from app.server.yard import Tip, Yard
+from app.shared import YardError, atomic_write, clone_url, ensure_file, now, parse_runs
 
 log = logging.getLogger("yard")
 
 
 def ensure_host(yard: Yard) -> None:
     """The yard app record. Its compose runs the app and Caddy."""
-    ensure_file(yard.config.env("yard"))
+    config = yard.config
+    ensure_file(config.env("yard"))
     try:
         yard.store.app("yard")
     except YardError as exc:
         if exc.code != "not_found":
             raise
-        yard.store.create_app("yard", "", "main", "manual")
+        yard.store.create_app("yard", "", "", "manual")
+    # A yard self-deploy ends "pending": the running process is the truth, so the
+    # boot sha is the deployed revision. Without this the check loop would
+    # redeploy Yard on every restart.
+    if config.sha:
+        deployed = read_deployed(config, "yard")
+        if deployed is None:
+            deployed = _yard_deployed(config)
+        if deployed.revision != config.sha:
+            deployed.revision = config.sha
+            write_deployed(config, "yard", deployed)
+
+
+def _yard_deployed(config: Config) -> Deployed:
+    """The deployed row for a first boot: resolved from the clone when there is one."""
+    clone = config.clone("yard")
+    try:
+        plan = detect.resolve(clone, "yard")
+    except Exception:
+        return Deployed()
+    return Deployed(runs=plan.answer, kind=plan.kind, reason=plan.reason)
+
+
+def migrate(yard: Yard) -> None:
+    """One-time record rewrite: the four old fields become `runs`. Remove in 0.9."""
+    config = yard.config
+    for app in yard.store.list_apps():
+        try:
+            _migrate_app(config, app)
+        except Exception as exc:
+            log.warning("migrate %s: %s", app.name, exc)
+
+
+def _migrate_app(config: Config, app: App) -> None:
+    record = config.app_dir(app.name) / "app"
+    old: dict[str, str] = {}
+    keep: list[str] = []
+    for line in record.read_text().splitlines():
+        key, _, value = line.partition(" ")
+        if key in ("containerfile", "compose", "image", "recipe"):
+            old[key] = value.strip()
+        else:
+            keep.append(line)
+    if not old:
+        return
+    runs = _migrate_runs(config, app, old)
+    text = "\n".join(keep)
+    if runs:
+        text += f"\nruns {runs}"
+    atomic_write(record, text + "\n")
+    _migrate_deployed(config, app, old, runs)
+    recipe = config.app_dir(app.name) / "recipe"
+    if recipe.is_dir():
+        recipe.rename(config.app_dir(app.name) / "compose")
+    (config.app_dir(app.name) / "revision").unlink(missing_ok=True)
+
+
+def _migrate_runs(config: Config, app: App, old: dict[str, str]) -> str:
+    """The old fields' runs value. `containerfile yard` pins the detected template:
+    auto would let a repo Dockerfile or compose.yml take over what Yard wrote before."""
+    if old.get("containerfile") == "yard":
+        return _migrate_template(config, app.name)
+    return old.get("containerfile") or old.get("compose") or old.get("image") or old.get("recipe") or ""
+
+
+def _migrate_template(config: Config, name: str) -> str:
+    try:
+        return detect.language(config.clone(name), name).answer
+    except YardError:
+        return ""
+
+
+def _migrate_deployed(config: Config, app: App, old: dict[str, str], runs: str) -> None:
+    if read_deployed(config, app.name) is not None:
+        return
+    revision_file = config.app_dir(app.name) / "revision"
+    old_revision = revision_file.read_text().strip() if revision_file.is_file() else ""
+    if "image" in old or "recipe" in old:
+        revision = old_revision
+        runs = old.get("image") or old.get("recipe") or ""
+        kind = "image" if "image" in old else "compose"
+    else:
+        revision = git.head(config.clone(app.name))
+        kind = "compose" if "compose" in old else "containerfile"
+    if revision or runs:
+        write_deployed(config, app.name, Deployed(revision=revision, runs=runs, kind=kind))
 
 
 def create(
@@ -36,14 +122,11 @@ def create(
     repo: str,
     ref: str = "",
     trigger: str = "",
-    containerfile: str = "",
-    compose: str = "",
-    image: str = "",
-    recipe: str = "",
+    runs: str = "",
     *,
     actor: str = "",
 ) -> App:
-    app = yard.store.create_app(name, repo, ref, trigger, containerfile, compose, image, recipe)
+    app = yard.store.create_app(name, repo, ref, trigger, runs)
     ensure_file(yard.config.env(app.name))
     journal.send(
         yard.config,
@@ -53,6 +136,7 @@ def create(
         repo=app.repo,
         ref=app.ref,
         trigger=app.trigger,
+        runs=app.runs,
         actor=actor,
     )
     return app
@@ -65,11 +149,10 @@ def update(
     repo: str | None = None,
     ref: str | None = None,
     trigger: str | None = None,
-    containerfile: str | None = None,
-    compose: str | None = None,
+    runs: str | None = None,
     actor: str = "",
 ) -> App:
-    app = yard.store.update_app(name, repo=repo, ref=ref, trigger=trigger, containerfile=containerfile, compose=compose)
+    app = yard.store.update_app(name, repo=repo, ref=ref, trigger=trigger, runs=runs)
     journal.send(
         yard.config,
         "app.update",
@@ -78,10 +161,7 @@ def update(
         repo=app.repo,
         ref=app.ref,
         trigger=app.trigger,
-        containerfile=app.containerfile,
-        compose=app.compose,
-        image=app.image,
-        recipe=app.recipe,
+        runs=app.runs,
         actor=actor,
     )
     return app
@@ -155,76 +235,191 @@ class Outcome:
     error: str = ""
     previous: str = ""
     missing_env: str = ""
+    port: int = 0
 
 
-async def deploy(
-    yard: Yard,
-    name: str,
-    *,
-    sha: str = "",
-    requested: str = "",
-    cause: str = "manual",
-    actor: str = "",
-) -> Outcome:
-    """Sync the clone and run compose up. One deploy per app at a time.
+async def deploy(yard: Yard, name: str, *, cause: str = "manual", actor: str = "") -> Outcome:
+    """One deploy path: resolve what the source says, then run compose up.
 
-    sha is a commit to deploy; the app ref otherwise. requested is the sha as
-    the user typed it, kept on the deploy.start event.
+    A repo deploys its ref tip; an image pins a digest; a URL fetches a compose
+    file. The deployed file is written only after an ok deploy.
     """
     async with yard.lock(name):
         try:
             app = yard.store.app(name)
         except YardError as exc:
             return Outcome("failed", error=str(exc))
-        if not app.repo:
-            if not (app.image or app.recipe):
-                return Outcome(
-                    "failed",
-                    error=f"app {name} has no repo",
-                    log="Set the repo: yard app set --repo https://<host>/<owner>/<name>\n",
-                )
-            if sha:
-                return Outcome("failed", error=_rollback_help(app), log=f"{_rollback_help(app)}\n")
-            if yard.skip_deploy:
-                return Outcome("skipped", log="YARD_SKIP_DEPLOY is set. Deploy did not run.\n")
-            return await _deploy_source(yard, app, cause=cause, actor=actor)
         if yard.skip_deploy:
             return Outcome("skipped", log="YARD_SKIP_DEPLOY is set. Deploy did not run.\n")
-        try:
-            forge = yard.forge(app.repo)
-        except YardError as exc:
-            return Outcome("failed", error=str(exc), log=f"{exc}\n")
-        if not forge.connected():
+        if app.repo:
+            return await _deploy_repo(yard, app, cause=cause, actor=actor)
+        kind, _value = parse_runs(app.runs)
+        if kind not in ("image", "url"):
             return Outcome(
                 "failed",
-                error=f"{forge.name} is not connected. Run yard forge setup {forge.name}.",
+                error=f"app {name} has no repo",
+                log="Set the repo: yard app set --repo https://<host>/<owner>/<name>\n",
             )
-        head = ""
-        pending: asyncio.Task[None] | None = None
-        try:
-            token = await forge.token()
-            head = await git.sync(yard.config.clone(name), clone_url(app.repo), sha or app.ref, token)
-            pending = yard.spawn(report(forge, app.repo, head, "pending", f"deploying {head[:12]}"))
-            journal.send(
-                yard.config,
-                "deploy.start",
-                f"deploy {name} {head[:12]}",
-                app=name,
-                repo=app.repo,
-                ref=app.ref,
-                sha=head,
-                image=compose.image_tag(name, head),
-                cause=cause,
-                actor=actor,
-                requested=requested,
+        return await _deploy_source(yard, app, kind, cause=cause, actor=actor)
+
+
+async def _deploy_repo(yard: Yard, app: App, *, cause: str, actor: str) -> Outcome:
+    """Sync the clone to the ref tip, resolve the plan, run the apply."""
+    try:
+        forge = yard.forge(app.repo)
+    except YardError as exc:
+        return Outcome("failed", error=str(exc), log=f"{exc}\n")
+    if not forge.connected():
+        return Outcome(
+            "failed",
+            error=f"{forge.name} is not connected. Run yard forge setup {forge.name}.",
+        )
+    head = ""
+    pending: asyncio.Task[None] | None = None
+    try:
+        token = await forge.token()
+        head = await git.sync(yard.config.clone(app.name), clone_url(app.repo), app.ref, token)
+        pending = yard.spawn(report(forge, app.repo, head, "pending", f"deploying {head[:12]}"))
+        # Stamp the tried pair before the plan can fail, or the check loop retries every round.
+        _set_tried(yard, app.name, head, _template_at(yard.config.clone(app.name), app))
+        plan = _plan(yard, app, head)
+        _set_tried(yard, app.name, head, plan.template)
+        outcome = await _apply(yard, app, plan, head, cause=cause, actor=actor)
+    except YardError as exc:
+        # A sync or plan failure never reaches apply; deploy.end alone is the record.
+        outcome = Outcome("failed", error=str(exc), log=f"{exc}\n")
+    _deploy_end(yard, app, head, outcome)
+    yard.spawn(_report_outcome(yard, app, forge, head, outcome, pending))
+    return outcome
+
+
+def _set_tried(yard: Yard, name: str, revision: str, template: str) -> Tip:
+    tip = yard.tips.setdefault(name, Tip())
+    tip.tried = (revision, template)
+    return tip
+
+
+def _plan(yard: Yard, app: App, sha: str) -> Plan:
+    """What the app runs at this commit: the record's runs, or the auto resolve."""
+    clone = yard.config.clone(app.name)
+    plan = detect.plan_for(clone, app.name, app.runs)
+    if not app.runs:
+        # The auto guard: a silent change of kind asks for a pin instead.
+        previous = read_deployed(yard.config, app.name)
+        if previous is not None and previous.runs and _key(previous.runs) != _key(plan.answer):
+            raise YardError(
+                502,
+                "detect",
+                f"auto found {plan.answer} ({plan.kind}); the last deploy ran {previous.runs} ({previous.kind})",
+                help_text=f"Pin one: yard app set --runs {plan.answer}   or   yard app set --runs {previous.runs}",
             )
-            outcome = await _apply(yard, app, head)
-        except YardError as exc:
-            # A sync failure never reaches apply; deploy.end alone is the record.
-            outcome = Outcome("failed", error=str(exc), log=f"{exc}\n")
-        _deploy_end(yard, app, head, outcome)
-        yard.spawn(_report_outcome(yard, app, forge, head, outcome, pending))
-        return outcome
+    if plan.generated:
+        atomic_write(yard.config.app_dir(app.name) / "Containerfile", plan.generated)
+    return plan
+
+
+def _key(answer: str) -> str:
+    """The auto-guard key: all templates are one answer; a path change is a new answer."""
+    return "template" if answer.startswith("yard:") else answer
+
+
+async def _deploy_source(yard: Yard, app: App, kind: str, *, cause: str, actor: str) -> Outcome:
+    """A repo-less deploy: pin an image by digest, or fetch a compose file over https."""
+    config = yard.config
+    try:
+        if kind == "image":
+            revision = await sources.digest(app.runs)
+            _set_tried(yard, app.name, revision, "")
+            image = f"{app.runs.split('@', 1)[0]}@{revision}"
+        else:
+            body = await sources.fetch_file(app.runs)
+            _set_tried(yard, app.name, "sha256:" + hashlib.sha256(body).hexdigest(), "")
+            kind = detect.classify(body.decode("utf-8", "replace"))
+            if kind != "compose":
+                raise YardError(
+                    502,
+                    "detect",
+                    "a Containerfile needs a repo to build; a URL can name a compose file",
+                )
+            if detect.BUILD_LINE.search(body.decode("utf-8", "replace")):
+                raise YardError(
+                    502,
+                    "detect",
+                    "a compose file from a URL cannot build: there is no checkout",
+                    help_text="Build the image elsewhere, or give the app a repo.",
+                )
+            revision = "sha256:" + hashlib.sha256(body).hexdigest()
+            image = f"compose:{revision[7:19]}"
+            _set_tried(yard, app.name, revision, "")
+            _write_copy(config, app.name, revision, body)
+    except YardError as exc:
+        return Outcome("failed", error=str(exc), log=f"{exc}\n")
+    _set_tried(yard, app.name, revision, "")
+    journal.send(
+        yard.config,
+        "deploy.start",
+        f"deploy {app.name} {revision[:12]}",
+        app=app.name,
+        sha=revision,
+        image=image,
+        runs=app.runs,
+        kind=kind,
+        cause=cause,
+        actor=actor,
+    )
+    previous_deployed = read_deployed(config, app.name)
+    project = compose.project(config, app, kind, app.runs, revision, image, config.app_dir(app.name))
+    project.env["SKIP_BUILD"] = "1"
+    previous = await _running_image(yard, app.name)
+    if kind == "image" and previous and previous != image:
+        project.env["PREVIOUS_IMAGE"] = previous
+    if kind == "compose" and previous_deployed is not None:
+        previous_copy = config.app_dir(app.name) / "compose" / f"{previous_deployed.revision[7:19]}.yml"
+        if previous_copy.is_file():
+            project.env["PREVIOUS_COMPOSE_FILE"] = str(previous_copy)
+    code, text = await compose.apply(config, app.name, "up", project)
+    log_text = text if text.endswith("\n") or not text else text + "\n"
+    if code == 3:
+        outcome = Outcome("reverted", image, log_text, f"unhealthy; reverted to {previous}", previous)
+    elif code:
+        outcome = Outcome("failed", image, log_text, f"apply exited {code}", previous)
+    else:
+        outcome = Outcome("ok", image, log_text, previous=previous)
+    _deploy_end(yard, app, revision, outcome)
+    if outcome.status == "ok":
+        write_deployed(config, app.name, Deployed(revision=revision, runs=app.runs, kind=kind))
+        if kind == "compose":
+            _prune_copies(config, app.name, revision[7:19])
+        outcome.port = await _exposed_port(yard, app.name)
+    return outcome
+
+
+def _write_copy(config: Config, name: str, revision: str, body: bytes) -> Path:
+    directory = config.app_dir(name) / "compose"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{revision[7:19]}.yml"
+    atomic_write(path, body.decode("utf-8", "replace"))
+    return path
+
+
+def _prune_copies(config: Config, name: str, keep: str) -> None:
+    """Keep the current URL copy and the newest one before it, for the revert."""
+    directory = config.app_dir(name) / "compose"
+    others = sorted(
+        (p for p in directory.glob("*.yml") if p.stem != keep),
+        key=lambda p: p.stat().st_mtime_ns,
+        reverse=True,
+    )
+    for path in others[1:]:
+        path.unlink()
+
+
+async def _exposed_port(yard: Yard, name: str) -> int:
+    """The one tcp port the running app container exposes; 0 when it is not exactly one."""
+    try:
+        return podman.parse_port(await yard.podman.run("inspect", compose.app_container(name), "--format", "json"))
+    except Exception:
+        return 0
 
 
 async def report(forge: Forge, repo: str, sha: str, state: str, description: str, target_url: str = "") -> None:
@@ -298,16 +493,31 @@ def _deploy_end(yard: Yard, app: App, sha: str, outcome: Outcome) -> None:
     )
 
 
-async def _apply(yard: Yard, app: App, sha: str) -> Outcome:
+async def _apply(yard: Yard, app: App, plan: Plan, sha: str, *, cause: str, actor: str) -> Outcome:
     """The compose check, then one apply container for the rest."""
-    image = compose.image_tag(app.name, sha)
-
-    # What the app runs: the record decides, or the first deploy resolves and saves it.
+    image = compose.image_tag(app.name, sha, plan.template)
+    config = yard.config
+    checkout = config.clone(app.name)
+    dockerfile = ""
+    if plan.kind == "containerfile":
+        dockerfile = str(config.app_dir(app.name) / "Containerfile") if plan.answer.startswith("yard:") else plan.answer
     try:
-        app, runs = _runs(yard, app, sha)
-        project = compose.prepare(yard.config, app, yard.config.clone(app.name), image, sha)
+        project = compose.project(config, app, plan.kind, plan.answer, sha, image, checkout, dockerfile)
     except Exception as exc:
         return Outcome("failed", image, f"{exc}\n", str(exc))
+
+    journal.send(
+        config,
+        "deploy.start",
+        f"deploy {app.name} {sha[:12]}",
+        app=app.name,
+        sha=sha,
+        image=image,
+        runs=plan.answer,
+        kind=plan.kind,
+        cause=cause,
+        actor=actor,
+    )
 
     # A deploy of a sha whose image is still local skips the build.
     if await _image_exists(yard, image):
@@ -320,23 +530,31 @@ async def _apply(yard: Yard, app: App, sha: str) -> Outcome:
 
     # One apply container runs compose up. The deploy container is the record of this run.
     code, text = await compose.apply(
-        yard.config,
+        config,
         app.name,
         "up",
         project,
         detach=app.name == "yard",
     )
-    log = text if text.endswith("\n") or not text else text + "\n"
-    log = runs + log
-    log, missing_env = _env_hint(yard, app, log)
+    log_text = text if text.endswith("\n") or not text else text + "\n"
+    line = f"== runs {plan.answer} ({plan.kind}" + (f"; {plan.reason}" if plan.reason else "") + ")\n"
+    log_text = line + log_text
+    log_text, missing_env = _env_hint(yard, app, log_text)
     if app.name == "yard":
         # Upgrading yard replaces this process, so that apply run is detached.
-        return Outcome("pending", image, log, previous=previous, missing_env=missing_env)
+        return Outcome("pending", image, log_text, previous=previous, missing_env=missing_env)
     if code == 3:
-        return Outcome("reverted", image, log, f"unhealthy; reverted to {previous}", previous, missing_env)
+        return Outcome("reverted", image, log_text, f"unhealthy; reverted to {previous}", previous, missing_env)
     if code:
-        return Outcome("failed", image, log, f"apply exited {code}", previous, missing_env)
-    return Outcome("ok", image, log, previous=previous, missing_env=missing_env)
+        return Outcome("failed", image, log_text, f"apply exited {code}", previous, missing_env)
+    write_deployed(
+        config,
+        app.name,
+        Deployed(revision=sha, runs=plan.answer, kind=plan.kind, reason=plan.reason, template=plan.template),
+    )
+    return Outcome(
+        "ok", image, log_text, previous=previous, missing_env=missing_env, port=await _exposed_port(yard, app.name)
+    )
 
 
 def _env_hint(yard: Yard, app: App, log: str) -> tuple[str, str]:
@@ -362,51 +580,61 @@ def _env_hint(yard: Yard, app: App, log: str) -> tuple[str, str]:
 
 
 def app_file(config: Config, app: App, which: str) -> str:
-    deploy = f"Yard decides on the first deploy: yard app deploy --app {app.name}"
+    """The file a `yard app cat` prints, from the deployed answer."""
+    deploy = "The app answers after the first deploy: yard app deploy --app " + app.name
+    deployed = read_deployed(config, app.name)
     if which == "compose":
-        if app.compose:
-            return _clone_file(config.clone(app.name), app.compose, app.name)
-        if app.image:
-            path = Path(compose.APPLY_DIR) / "image.compose.yml"
-            if path.is_file():
-                return path.read_text()
-            raise YardError(404, "no_file", "Yard's image compose file is missing on this host", help_text=deploy)
-        if app.recipe:
-            path = _recipe_file(config, app.name)
-            if path is not None:
-                return path.read_text()
-            raise YardError(404, "no_file", f"{app.name}'s recipe is not fetched yet", help_text=deploy)
-        if app.containerfile:
-            path = Path(compose.APPLY_DIR) / "default.compose.yml"
-            if path.is_file():
-                return path.read_text()
-            raise YardError(404, "no_file", "Yard's compose file is missing on this host", help_text=deploy)
-        raise YardError(404, "no_file", f"{app.name} has no compose file yet", help_text=deploy)
+        if deployed is None:
+            raise YardError(404, "no_file", f"{app.name} has no compose file yet", help_text=deploy)
+        if deployed.kind == "compose":
+            if deployed.runs.startswith("https://"):
+                path = config.app_dir(app.name) / "compose" / f"{deployed.revision[7:19]}.yml"
+                if path.is_file():
+                    return path.read_text()
+                raise YardError(404, "no_file", f"{app.name}'s compose copy is missing", help_text=deploy)
+            return _clone_file(config.clone(app.name), deployed.runs, app.name)
+        return _yard_files(deployed.kind)
     if which == "containerfile":
-        if app.image or app.recipe:
-            kind = "an image" if app.image else "a recipe"
-            raise YardError(404, "no_file", f"{app.name} runs {kind}; there is no Containerfile")
-        if app.containerfile == "yard":
-            path = config.app_dir(app.name) / "Containerfile"
-            if path.is_file():
-                return path.read_text()
+        if deployed is None:
+            raise YardError(404, "no_file", f"{app.name} has no Containerfile yet", help_text=deploy)
+        if deployed.kind == "containerfile":
+            if deployed.runs.startswith("yard:"):
+                path = config.app_dir(app.name) / "Containerfile"
+                if path.is_file():
+                    return path.read_text()
+                raise YardError(
+                    404,
+                    "no_file",
+                    f"{app.name}'s Containerfile is missing",
+                    help_text="Deploy again: yard app deploy --app " + app.name,
+                )
+            return _clone_file(config.clone(app.name), deployed.runs, app.name)
+        if deployed.kind == "image":
             raise YardError(
                 404,
                 "no_file",
-                f"{app.name}'s Containerfile is missing",
-                help_text="Run yard app detect to write it again.",
-            )
-        if app.containerfile:
-            return _clone_file(config.clone(app.name), app.containerfile, app.name)
-        if app.compose:
-            raise YardError(
-                404,
-                "no_file",
-                f"{app.name} runs its own compose file; that file names its build",
+                f"{app.name} runs an image; there is no Containerfile",
                 help_text="yard app cat compose",
             )
-        raise YardError(404, "no_file", f"{app.name} has no Containerfile yet", help_text=deploy)
+        raise YardError(
+            404,
+            "no_file",
+            f"{app.name} runs its own compose file; that file names its build",
+            help_text="yard app cat compose",
+        )
     raise YardError(404, "no_file", f"no file {which}", help_text="The files are compose and containerfile.")
+
+
+def _yard_files(kind: str) -> str:
+    """Yard's own compose files, each preceded by its name."""
+    names = ["app.compose.yml"] + (["build.compose.yml"] if kind == "containerfile" else [])
+    parts = []
+    for name in names:
+        path = Path(compose.APPLY_DIR) / name
+        if not path.is_file():
+            raise YardError(502, "no_file", f"Yard's {name} is missing on this host")
+        parts.append(f"# {name}\n{path.read_text()}")
+    return "\n".join(parts)
 
 
 def _clone_file(clone: Path, rel: str, name: str) -> str:
@@ -422,44 +650,6 @@ def _clone_file(clone: Path, rel: str, name: str) -> str:
             help_text=f"The clone is the deployed commit: yard app deploy --app {name}",
         )
     return path.read_text()
-
-
-def _runs(yard: Yard, app: App, sha: str) -> tuple[App, str]:
-    """What the app runs. Set fields are checked against the clone; an unset record is resolved and saved."""
-    clone = yard.config.clone(app.name)
-    if app.compose:
-        if not (clone / app.compose).is_file():
-            raise YardError(
-                502,
-                "compose",
-                f"compose is set to {app.compose}; it is not in {sha[:12]}",
-                help_text="Add the file, run yard app set --compose PATH, or run yard app detect.",
-            )
-        return app, ""
-    if app.containerfile:
-        if app.containerfile == "yard":
-            stored = yard.config.app_dir(app.name) / "Containerfile"
-            if not stored.is_file():
-                # "yard" means Yard writes one: detect the language, keep the repo files out of it.
-                resolved = detect.language(clone, app.name)
-                atomic_write(stored, resolved.generated)
-                return app, f"== runs containerfile yard ({resolved.kind}: {resolved.reason})\n"
-        elif not (clone / app.containerfile).is_file():
-            raise YardError(
-                502,
-                "containerfile",
-                f"containerfile is set to {app.containerfile}; it is not in {sha[:12]}",
-                help_text="Add the file, run yard app set --containerfile PATH, or run yard app detect.",
-            )
-        return app, ""
-    resolved = detect.resolve(clone, app.name)
-    if resolved.generated:
-        atomic_write(yard.config.app_dir(app.name) / "Containerfile", resolved.generated)
-    app = update(yard, app.name, **{resolved.field: resolved.value})
-    line = f"== runs {resolved.field} {resolved.value}"
-    if resolved.generated:
-        line += f" ({resolved.kind}: {resolved.reason})"
-    return app, line + "\n"
 
 
 async def _image_exists(yard: Yard, image: str) -> bool:
@@ -485,151 +675,89 @@ _DEBOUNCE = 10.0
 
 
 async def check_all(yard: Yard) -> None:
-    """Poll every push app once per forge. A remote tip newer than the clone HEAD deploys."""
+    """Poll every push app: repo tips once per forge, image and URL apps per app."""
     for forge in yard.forges.values():
         await _check_forge(yard, forge)
-    recipes: dict[str, bytes] = {}
+    fetched: dict[str, bytes] = {}
     for app in yard.store.list_apps():
-        if app.image or app.recipe:
-            await _check_source(yard, app, recipes)
+        if not app.repo:
+            await _check(yard, app, fetched=fetched, cause="check", actor="check")
 
 
-async def _check_source(yard: Yard, app: App, recipes: dict[str, bytes]) -> None:
-    """The newest revision of an image tag or recipe URL. A failed fetch never deploys."""
+async def _check(
+    yard: Yard,
+    app: App,
+    *,
+    forge: Forge | None = None,
+    token: str = "",
+    fetched: dict[str, bytes] | None = None,
+    cause: str,
+    actor: str,
+) -> None:
+    """The newest (revision, template) for one app. A moved pair deploys once."""
     try:
-        if app.image:
-            revision = await sources.digest(app.image)
+        if app.repo:
+            clone = yard.config.clone(app.name)
+            tip = await git.remote_tip(clone, clone_url(app.repo), app.ref, token)
+            template = _template_at(clone, app)
+            current = (tip, template)
+        elif parse_runs(app.runs)[0] == "image":
+            current = (await sources.digest(app.runs), "")
         else:
-            body = recipes.get(app.recipe)
+            assert fetched is not None
+            body = fetched.get(app.runs)
             if body is None:
-                body = await sources.fetch_recipe(app.recipe)
-                recipes[app.recipe] = body
-            revision = "sha256:" + hashlib.sha256(body).hexdigest()
+                body = await sources.fetch_file(app.runs)
+                fetched[app.runs] = body
+            current = ("sha256:" + hashlib.sha256(body).hexdigest(), "")
     except Exception as exc:
-        message = exc.message if isinstance(exc, YardError) else str(exc)
-        yard.source_errors[app.name] = message
-        log.warning("%s source: %s", app.name, message)
+        tip = yard.tips.setdefault(app.name, Tip())
+        tip.error = exc.message if isinstance(exc, YardError) else str(exc)
+        log.warning("%s source: %s", app.name, tip.error)
         return
-    yard.source_errors.pop(app.name, None)
-    yard.tips[app.name] = revision
+    tip = yard.tips.setdefault(app.name, Tip())
+    tip.error = ""
+    tip.revision, tip.template = current
     if app.trigger != "push":
         return
-    deployed = compose.read_revision(yard.config, app.name)
-    if revision != deployed and revision != yard.tried.get(app.name):
-        journal.send(
-            yard.config,
-            "check.moved",
-            f"{app.name} revision moved",
-            app=app.name,
-            head=deployed,
-            tip=revision,
-        )
-        await deploy(yard, app.name, cause="check", actor="check")
-
-
-def _rollback_help(app: App) -> str:
-    if app.image:
-        return f"an image app rolls back by tag: yard app set --app {app.name} --image REF:OLDER"
-    return "a recipe app rolls back by URL: point --recipe at an older commit's raw URL"
-
-
-async def _deploy_source(yard: Yard, app: App, *, cause: str, actor: str) -> Outcome:
-    """A repo-less deploy: pin an image by digest, or fetch a recipe compose file."""
-    try:
-        if app.image:
-            revision = await sources.digest(app.image)
-            image = f"{app.image.split('@', 1)[0]}@{revision}"
-            project = _source_project(yard.config, app, compose.IMAGE_COMPOSE, image, revision)
-            project.env["SKIP_BUILD"] = "1"
-        else:
-            body = await sources.fetch_recipe(app.recipe)
-            revision = "sha256:" + hashlib.sha256(body).hexdigest()
-            image = f"recipe:{revision[7:19]}"
-            recipe_file = _write_recipe(yard.config, app.name, revision, body)
-            project = _source_project(yard.config, app, str(recipe_file), image, revision)
-            project.env["SKIP_BUILD"] = "1"
-            previous_recipe = _recipe_file(yard.config, app.name)
-            if previous_recipe is not None:
-                project.env["PREVIOUS_COMPOSE_FILE"] = str(previous_recipe)
-    except YardError as exc:
-        return Outcome("failed", error=str(exc), log=f"{exc}\n")
-    yard.tried[app.name] = revision
+    deployed = read_deployed(yard.config, app.name) or Deployed()
+    old = (deployed.revision, deployed.template)
+    if current == old or current == tip.tried:
+        return
+    moved = _moved(app, deployed, current)
     journal.send(
         yard.config,
-        "deploy.start",
-        f"deploy {app.name} {revision[:12]}",
+        "check.moved",
+        f"{app.name} {moved} moved",
         app=app.name,
-        sha=revision,
-        image=image,
-        cause=cause,
-        actor=actor,
-        requested="",
+        head=deployed.revision,
+        tip=current[0],
+        template=current[1],
     )
-    previous = await _running_image(yard, app.name)
-    if previous and app.image and previous != image:
-        project.env["PREVIOUS_IMAGE"] = previous
-    code, text = await compose.apply(yard.config, app.name, "up", project)
-    log = text if text.endswith("\n") or not text else text + "\n"
-    if code == 3:
-        outcome = Outcome("reverted", image, log, f"unhealthy; reverted to {previous}", previous)
-    elif code:
-        outcome = Outcome("failed", image, log, f"apply exited {code}", previous)
-    else:
-        outcome = Outcome("ok", image, log, previous=previous)
-    _deploy_end(yard, app, revision, outcome)
-    if outcome.status == "ok":
-        compose.write_revision(yard.config, app.name, revision)
-        if app.recipe:
-            _prune_recipes(yard.config, app.name, revision[7:19])
-    return outcome
+    await deploy(yard, app.name, cause=cause, actor=actor)
 
 
-def _source_project(config: Config, app: App, file: str, image: str, revision: str) -> compose.Project:
-    env = compose.run_env(config, app, config.app_dir(app.name), image, revision)
-    compose.ensure_env(config.env(app.name))
-    return compose.Project(app.name, [file], env)
+def _template_at(clone: Path, app: App) -> str:
+    """The template stamp a deploy of the clone would write; "" for non-template answers."""
+    if app.runs and not app.runs.startswith("yard:"):
+        return ""
+    try:
+        return detect.plan_for(clone, app.name, app.runs).template
+    except YardError:
+        return ""
 
 
-_RECIPE_MAX = 256 * 1024
-_RECIPE_PORT = re.compile(r"^#\s*port:\s*(\d{1,5})\s*$", re.M)
-
-
-def recipe_port(body: bytes) -> int:
-    """A recipe may declare `# port: 3000`; --public binds it."""
-    found = _RECIPE_PORT.search(body.decode("utf-8", "replace"))
-    return int(found.group(1)) if found else 0
-
-
-def _recipe_dir(config: Config, name: str) -> Path:
-    directory = config.app_dir(name) / "recipe"
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory
-
-
-def _recipe_file(config: Config, name: str) -> Path | None:
-    """The compose file of the last ok recipe deploy, for the revert path."""
-    revision = compose.read_revision(config, name)
-    if not revision.startswith("sha256:"):
-        return None
-    path = config.app_dir(name) / "recipe" / f"{revision[7:19]}.yml"
-    return path if path.is_file() else None
-
-
-def _write_recipe(config: Config, name: str, revision: str, body: bytes) -> Path:
-    path = _recipe_dir(config, name) / f"{revision[7:19]}.yml"
-    atomic_write(path, body.decode("utf-8", "replace"))
-    return path
-
-
-def _prune_recipes(config: Config, name: str, keep: str) -> None:
-    """Keep the current recipe file and the newest one before it."""
-    others = sorted(
-        (p for p in _recipe_dir(config, name).glob("*.yml") if p.stem != keep),
-        key=lambda p: p.stat().st_mtime_ns,
-        reverse=True,
-    )
-    for path in others[1:]:
-        path.unlink()
+def _moved(app: App, deployed: Deployed, current: tuple[str, str]) -> str:
+    """What the check saw move: commit, template, image, or file."""
+    parts = []
+    if current[0] != deployed.revision:
+        if not app.repo:
+            parts.append("file" if parse_runs(app.runs)[0] == "url" else "image")
+        else:
+            parts.append("commit")
+    if current[1] != deployed.template:
+        parts.append("template")
+    return " and ".join(parts) or "revision"
 
 
 async def _check_forge(yard: Yard, forge: Forge) -> None:
@@ -644,7 +772,7 @@ async def _check_forge(yard: Yard, forge: Forge) -> None:
     prefix = f"https://{forge.host}/"
     for app in yard.store.list_apps():
         if app.trigger == "push" and app.repo.lower().startswith(prefix):
-            await _check_app(yard, app, forge, token, cause="check", actor="check")
+            await _check(yard, app, forge=forge, token=token, cause="check", actor="check")
     forge.last_check = now()
 
 
@@ -712,29 +840,7 @@ async def _check_repo(yard: Yard, repo: str) -> None:
         return
     for app in yard.store.list_apps():
         if app.repo.lower() == repo.lower() and app.trigger == "push":
-            await _check_app(yard, app, forge, token, cause="push", actor=f"webhook:{forge.name}")
-
-
-async def _check_app(yard: Yard, app: App, forge: Forge, token: str, *, cause: str, actor: str) -> None:
-    try:
-        clone = yard.config.clone(app.name)
-        tip = await git.remote_tip(clone, clone_url(app.repo), app.ref, token)
-        yard.tips[app.name] = tip
-        head = git.head(clone)
-        if tip and tip != head:
-            journal.send(
-                yard.config,
-                "check.moved",
-                f"{app.name} tip moved",
-                app=app.name,
-                repo=app.repo,
-                ref=app.ref,
-                head=head,
-                tip=tip,
-            )
-            await deploy(yard, app.name, cause=cause, actor=actor)
-    except Exception as exc:
-        log.warning("check %s: %s", app.name, exc)
+            await _check(yard, app, forge=forge, token=token, cause="push", actor=f"webhook:{forge.name}")
 
 
 async def loop(yard: Yard) -> None:

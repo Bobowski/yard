@@ -3,7 +3,7 @@ import hmac
 import json
 import stat
 
-from app.server import apps, binds, caddy, journal, sources
+from app.server import apps, binds, caddy
 from app.server.caddy import Caddy
 from app.server.forges import GitHub, Origin
 from app.server.podman import Podman
@@ -714,108 +714,6 @@ def _yard_forges(root):
     return (Origin(root / "apps" / "yard" / "data" / "origin"), GitHub(root / "apps" / "yard" / "data" / "github"))
 
 
-async def test_app_deploy_sha_validation(yard, monkeypatch):
-    client, token, _root = yard
-    await client.post(
-        "/api/v1/apps",
-        json={"name": "heldso", "repo": "https://origin.cursor.com/org/app"},
-        headers=auth(token),
-    )
-    calls: list[tuple[str, str]] = []
-    lookups: list[list[str]] = []
-
-    async def fake_deploy(_yard, name, *, sha="", requested="", cause="", actor=""):
-        calls.append((sha, requested))
-        return apps.Outcome("skipped")
-
-    async def fake_entries(config, matches, **kw):
-        lookups.append(matches)
-        return []
-
-    monkeypatch.setattr(apps, "deploy", fake_deploy)
-    monkeypatch.setattr(journal, "read_entries", fake_entries)
-
-    res = await client.post("/api/v1/apps/heldso/deploy", json={"sha": "nota-sha"}, headers=auth(token))
-    assert res.status_code == 400
-    assert res.json()["error"]["code"] == "bad_sha"
-    assert lookups == []
-
-    res = await client.post("/api/v1/apps/heldso/deploy", json={"sha": "deadbeef"}, headers=auth(token))
-    assert res.status_code == 404
-    assert res.json()["error"]["code"] == "unknown_sha"
-    assert "full 40-character SHA" in res.text
-    assert lookups == [["SYSLOG_IDENTIFIER=yard", "YARD_APP=heldso", "YARD_EVENT=deploy.start"]]
-
-    # A full sha goes straight to the deploy; no journal read.
-    res = await client.post("/api/v1/apps/heldso/deploy", json={"sha": "d" * 40}, headers=auth(token))
-    assert res.status_code == 200
-    assert calls == [("d" * 40, "d" * 40)]
-    assert len(lookups) == 1
-
-
-async def test_app_deploy_a_prefix_resolves_from_the_journal(yard, monkeypatch):
-    client, token, _root = yard
-    await client.post(
-        "/api/v1/apps",
-        json={"name": "heldso", "repo": "https://origin.cursor.com/org/app"},
-        headers=auth(token),
-    )
-    full = "deadbeefcafe" + "1" * 28
-    entries = [{"YARD_SHA": full}, {"YARD_SHA": "cafef00d" + "2" * 32}, {"YARD_SHA": full}]
-
-    async def fake_entries(config, matches, **kw):
-        return entries
-
-    monkeypatch.setattr(journal, "read_entries", fake_entries)
-    got: dict[str, str] = {}
-
-    async def fake_deploy(_yard, name, *, sha="", requested="", cause="", actor=""):
-        got["sha"], got["requested"] = sha, requested
-        return apps.Outcome("skipped")
-
-    monkeypatch.setattr(apps, "deploy", fake_deploy)
-    res = await client.post("/api/v1/apps/heldso/deploy", json={"sha": "deadbee"}, headers=auth(token))
-    assert res.status_code == 200
-    assert got == {"sha": full, "requested": "deadbee"}
-
-
-async def test_app_deploy_an_ambiguous_prefix(yard, monkeypatch):
-    client, token, _root = yard
-    await client.post(
-        "/api/v1/apps",
-        json={"name": "heldso", "repo": "https://origin.cursor.com/org/app"},
-        headers=auth(token),
-    )
-    entries = [{"YARD_SHA": "deadbeef" + "1" * 32}, {"YARD_SHA": "deadbeef" + "2" * 32}]
-
-    async def fake_entries(config, matches, **kw):
-        return entries
-
-    monkeypatch.setattr(journal, "read_entries", fake_entries)
-    res = await client.post("/api/v1/apps/heldso/deploy", json={"sha": "deadbeef"}, headers=auth(token))
-    assert res.status_code == 400
-    error = res.json()["error"]
-    assert error["code"] == "ambiguous_sha"
-    assert "deadbeef" in str(error["context"]["matches"])
-
-
-async def test_app_deploy_when_the_journal_is_down(yard, monkeypatch):
-    client, token, _root = yard
-    await client.post(
-        "/api/v1/apps",
-        json={"name": "heldso", "repo": "https://origin.cursor.com/org/app"},
-        headers=auth(token),
-    )
-
-    async def broken(config, matches, **kw):
-        raise YardError(502, "journal", "journalctl is not on PATH")
-
-    monkeypatch.setattr(journal, "read_entries", broken)
-    res = await client.post("/api/v1/apps/heldso/deploy", json={"sha": "deadbeef"}, headers=auth(token))
-    assert res.status_code == 502
-    assert "full 40-character SHA" in res.text
-
-
 async def test_events_log_actors_and_never_secrets(yard, capsys):
     """No journal socket under tests: events land on stdout as JSON."""
     client, token, _root = yard
@@ -840,163 +738,110 @@ async def test_events_log_actors_and_never_secrets(yard, capsys):
     assert env["keys"] == "PASSWORD" and env["actor"] == "admin"
 
 
-async def test_app_build_fields(yard):
+async def test_app_unknown_fields_are_400(yard):
     client, token, _root = yard
     res = await client.post(
         "/api/v1/apps",
         json={"name": "heldso", "repo": "https://github.com/org/heldso", "containerfile": "Dockerfile"},
         headers=auth(token),
     )
-    assert res.status_code == 200
-    assert res.json()["app"]["containerfile"] == "Dockerfile"
-    assert res.json()["app"]["compose"] == ""
+    assert res.status_code == 400
+    assert res.json()["error"]["code"] == "unknown_field"
+    assert "containerfile" in res.text
 
-    res = await client.patch(
-        "/api/v1/apps/heldso",
-        json={"containerfile": "x", "compose": "y"},
+    res = await client.post(
+        "/api/v1/apps",
+        json={"name": "heldso", "repo": "https://github.com/org/heldso", "runs": "ops/stack.yml"},
         headers=auth(token),
     )
-    assert res.status_code == 400
-    assert "not both" in res.text
-
-    res = await client.patch("/api/v1/apps/heldso", json={"compose": "compose.yml"}, headers=auth(token))
     assert res.status_code == 200
-    assert res.json()["app"]["compose"] == "compose.yml"
-    assert res.json()["app"]["containerfile"] == ""
+    assert res.json()["app"]["runs"] == "ops/stack.yml"
+    assert res.json()["app"]["deployed"] is None
 
-    res = await client.patch("/api/v1/apps/heldso", json={"compose": "yard"}, headers=auth(token))
+    res = await client.patch("/api/v1/apps/heldso", json={"compose": "x"}, headers=auth(token))
     assert res.status_code == 400
-    assert "bad_compose" in res.text
-
-    res = await client.patch("/api/v1/apps/heldso", json={"containerfile": "", "compose": ""}, headers=auth(token))
-    assert res.status_code == 200
-    assert res.json()["app"]["compose"] == ""
+    assert res.json()["error"]["code"] == "unknown_field"
 
 
 async def test_app_files_route(yard, tmp_path):
     client, token, _root = yard
     await client.post(
         "/api/v1/apps",
-        json={"name": "heldso", "repo": "https://github.com/org/heldso", "compose": "compose.yml"},
+        json={"name": "heldso", "repo": "https://github.com/org/heldso", "runs": "compose.yml"},
         headers=auth(token),
     )
     res = await client.get("/api/v1/apps/heldso/files/compose", headers=auth(token))
     assert res.status_code == 404
-    assert "not in heldso's clone" in res.text
+
+    from app.server.store import Deployed, write_deployed
 
     clone = tmp_path / "apps" / "heldso" / "repo"
     clone.mkdir(parents=True)
     (clone / "compose.yml").write_text("services: {}\n")
+    write_deployed(_config(tmp_path), "heldso", Deployed(revision="abc", runs="compose.yml", kind="compose"))
     res = await client.get("/api/v1/apps/heldso/files/compose", headers=auth(token))
     assert res.status_code == 200
     assert res.text == "services: {}\n"
 
     res = await client.get("/api/v1/apps/heldso/files/containerfile", headers=auth(token))
     assert res.status_code == 404
-    assert "runs its own compose file" in res.text
+    assert "compose file" in res.text
 
-    res = await client.get("/api/v1/apps/heldso/files/bogus", headers=auth(token))
-    assert res.status_code == 404
 
-    await client.patch("/api/v1/apps/heldso", json={"containerfile": "yard"}, headers=auth(token))
-    res = await client.get("/api/v1/apps/heldso/files/containerfile", headers=auth(token))
-    assert res.status_code == 404
-    (tmp_path / "apps" / "heldso" / "Containerfile").write_text("FROM scratch\n")
-    res = await client.get("/api/v1/apps/heldso/files/containerfile", headers=auth(token))
-    assert res.status_code == 200
-    assert res.text == "FROM scratch\n"
-    res = await client.get("/api/v1/apps/heldso/files/compose", headers=auth(token))
-    assert res.status_code == 200
-    assert "services:" in res.text
+def _config(tmp_path):
+    from app.server.store import Config
 
+    return Config(
+        root=tmp_path,
+        podman_sock="",
+        podman_bin="",
+        skip_deploy=True,
+        boot=False,
+        remote=False,
+        journal_dir=tmp_path / "j",
+        journalctl_bin="",
+        journal_socket=tmp_path / "s.sock",
+    )
+
+
+async def test_app_files_the_yard_files(yard, tmp_path):
+    client, token, _root = yard
     await client.post(
         "/api/v1/apps",
-        json={"name": "other", "repo": "https://github.com/org/other"},
+        json={"name": "db", "runs": "postgres:17"},
         headers=auth(token),
     )
-    res = await client.get("/api/v1/apps/other/files/compose", headers=auth(token))
+    res = await client.get("/api/v1/apps/db/files/containerfile", headers=auth(token))
     assert res.status_code == 404
-    assert "yard app deploy" in res.text
-
-
-async def test_image_and_recipe_apps(yard, monkeypatch, tmp_path):
-
-    client, token, _root = yard
-
-    async def fake_fetch(url):
-        return b"# port: 3000\nservices:\n  app:\n    image: x\n    networks:\n      - yard\n"
-
-    monkeypatch.setattr(sources, "fetch_recipe", fake_fetch)
-    res = await client.post(
-        "/api/v1/apps",
-        json={"name": "db", "image": "postgres:17"},
-        headers=auth(token),
-    )
-    assert res.status_code == 200
-    assert res.json()["app"]["image"] == "postgres:17"
-    assert res.json()["app"]["repo"] == ""
-
-    res = await client.post(
-        "/api/v1/apps",
-        json={"name": "umami", "recipe": "umami"},
-        headers=auth(token),
-    )
-    assert res.status_code == 200
-    assert res.json()["app"]["recipe"].endswith("/umami.yml")
-    assert res.json()["port"] == 3000
-
-    res = await client.post("/api/v1/apps", json={"name": "x", "image": "postgres"}, headers=auth(token))
-    assert res.status_code == 400
-    assert "bad_image" in res.text
-
-    res = await client.post(
-        "/api/v1/apps",
-        json={"name": "y", "repo": "https://github.com/org/y", "image": "postgres:17"},
-        headers=auth(token),
-    )
-    assert res.status_code == 400
-    assert "has no repo" in res.text
-
-
-async def test_deploy_sha_on_image_app(yard):
-    client, token, _root = yard
-    await client.post("/api/v1/apps", json={"name": "db", "image": "postgres:17"}, headers=auth(token))
-    res = await client.post(
-        "/api/v1/apps/db/deploy",
-        json={"sha": "abc1234"},
-        headers=auth(token),
-    )
-    assert res.status_code == 400
-    assert "rolls back by tag" in res.text
-
-
-async def test_cat_source_apps(yard, tmp_path, monkeypatch):
-    client, token, _root = yard
-    await client.post("/api/v1/apps", json={"name": "db", "image": "postgres:17"}, headers=auth(token))
+    write_dep(tmp_path, "db", "image")
     res = await client.get("/api/v1/apps/db/files/containerfile", headers=auth(token))
     assert res.status_code == 404
     assert "runs an image" in res.text
     res = await client.get("/api/v1/apps/db/files/compose", headers=auth(token))
     assert res.status_code == 200
-    assert "image: ${IMAGE}" in res.text
+    assert "# app.compose.yml" in res.text and "image: ${IMAGE}" in res.text
 
-    async def fake_fetch(url):
-        return b"services: {}\n"
 
-    monkeypatch.setattr(sources, "fetch_recipe", fake_fetch)
-    await client.post(
-        "/api/v1/apps", json={"name": "umami", "recipe": "https://example.com/x.yml"}, headers=auth(token)
-    )
-    res = await client.get("/api/v1/apps/umami/files/compose", headers=auth(token))
-    assert res.status_code == 404
-    assert "not fetched yet" in res.text
-    recipe_dir = tmp_path / "apps" / "umami" / "recipe"
-    recipe_dir.mkdir(parents=True)
-    (tmp_path / "apps" / "umami" / "revision").write_text("sha256:" + "a" * 64 + "\n")
-    (recipe_dir / ("a" * 12 + ".yml")).write_text("services: {}\n")
-    res = await client.get("/api/v1/apps/umami/files/compose", headers=auth(token))
-    assert res.status_code == 200
-    assert res.text == "services: {}\n"
+def write_dep(tmp_path, name, kind):
+    from app.server.store import Deployed, write_deployed
+
+    write_deployed(_config(tmp_path), name, Deployed(revision="sha256:" + "a" * 64, runs="postgres:17", kind=kind))
+
+
+async def test_deploy_body_with_sha_is_400(yard):
+    client, token, _root = yard
+    await client.post("/api/v1/apps", json={"name": "db", "runs": "postgres:17"}, headers=auth(token))
+    res = await client.post("/api/v1/apps/db/deploy", json={"sha": "abc1234"}, headers=auth(token))
+    assert res.status_code == 400
+    assert "deploys what the source says" in res.text
+
+
+async def test_patch_repo_on_an_image_app_is_400(yard):
+    client, token, _root = yard
+    await client.post("/api/v1/apps", json={"name": "db", "runs": "postgres:17"}, headers=auth(token))
+    res = await client.patch("/api/v1/apps/db", json={"repo": "https://github.com/org/db"}, headers=auth(token))
+    assert res.status_code == 400
+    assert "runs a file from it" in res.text
 
 
 async def test_page_record_is_the_record():
@@ -1006,7 +851,7 @@ async def test_page_record_is_the_record():
     from app.server.store import App
 
     page = Page(
-        app=App("heldso", "https://github.com/org/heldso", "main", "push", "t", containerfile="Dockerfile"),
+        app=App("heldso", "https://github.com/org/heldso", "main", "push", "t", "ops/Dockerfile"),
         image="localhost/heldso:abc1234",
         sha="abc1234",
         env_file="/env",
@@ -1016,7 +861,7 @@ async def test_page_record_is_the_record():
         log="",
     )
     data = page_json(page)
-    assert data["app"]["image"] == ""
-    assert data["app"]["containerfile"] == "Dockerfile"
+    assert data["app"]["runs"] == "ops/Dockerfile"
+    assert data["app"]["deployed"] is None
     assert data["image"] == "localhost/heldso:abc1234"
     assert data["sha"] == "abc1234"

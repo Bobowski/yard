@@ -9,15 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.shared import (
+    TEMPLATES,
     YardError,
     atomic_write,
     check_app_name,
-    check_compose,
-    check_containerfile,
     check_env,
-    check_image,
     check_name,
-    check_recipe,
     check_ref,
     check_repo,
     check_trigger,
@@ -25,6 +22,7 @@ from app.shared import (
     format_env,
     now,
     parse_env,
+    parse_runs,
 )
 
 
@@ -101,12 +99,19 @@ class App:
     ref: str
     trigger: str
     created: str
-    # What the app runs. At most one is set; neither means the deploy decides.
-    containerfile: str = ""
-    compose: str = ""
-    # Repo-less apps run a pulled image or a fetched recipe instead.
-    image: str = ""
-    recipe: str = ""
+    # What the app runs: auto (""), yard:<template>, a repo path, an image, or an https URL.
+    runs: str = ""
+
+
+@dataclass(slots=True)
+class Deployed:
+    """What the last ok deploy ran, kept in apps/<name>/deployed."""
+
+    revision: str = ""
+    runs: str = ""
+    kind: str = ""
+    reason: str = ""
+    template: str = ""
 
 
 @dataclass(slots=True)
@@ -160,20 +165,27 @@ class Store:
         repo: str,
         ref: str = "",
         trigger: str = "",
-        containerfile: str = "",
-        compose: str = "",
-        image: str = "",
-        recipe: str = "",
+        runs: str = "",
     ) -> App:
         check_app_name(name)
         if repo:
             repo = check_repo(repo)
-        ref = ref or "main"
-        check_ref(ref)
+        ref = ref or ("main" if repo else "")
+        if ref:
+            check_ref(ref)
+        if ref and not repo:
+            raise YardError(
+                400,
+                "bad_ref",
+                f"ref is a branch of the repo, and {name} has no repo",
+                context={"ref": ref, "name": name},
+                help_text="Create an app with a repo to follow a branch.",
+            )
         if self._record(name).is_file():
             raise YardError(409, "exists", "already exists", help_text="Pick another name.")
         app = App(name, repo, ref, check_trigger(trigger), now())
-        self._build_fields(app, containerfile, compose, image, recipe)
+        if runs:
+            app.runs = self._check_runs(app, runs)
         self._write(app)
         return app
 
@@ -184,45 +196,32 @@ class Store:
         repo: str | None = None,
         ref: str | None = None,
         trigger: str | None = None,
-        containerfile: str | None = None,
-        compose: str | None = None,
-        image: str | None = None,
-        recipe: str | None = None,
+        runs: str | None = None,
     ) -> App:
         app = self.app(name)
         if repo is not None:
             app.repo = check_repo(repo)
         if ref is not None:
+            if not app.repo:
+                raise YardError(
+                    400,
+                    "bad_ref",
+                    f"ref is a branch of the repo, and {name} has no repo",
+                    context={"ref": ref, "name": name},
+                    help_text="An app with no repo has no branch.",
+                )
             ref = ref or "main"
             check_ref(ref)
             app.ref = ref
+        if app.repo and not app.ref:
+            app.ref = "main"
         if trigger is not None:
             app.trigger = check_trigger(trigger)
-        fields = {"containerfile": containerfile, "compose": compose, "image": image, "recipe": recipe}
-        given = {key: value for key, value in fields.items() if value is not None}
-        if given:
-            wanted = {key: value for key, value in given.items() if value}
-            if len(wanted) > 1:
-                names = sorted(wanted)
-                raise YardError(
-                    400,
-                    "bad_request",
-                    f"set --{names[0]} or --{names[1]}, not both",
-                    context={key: wanted[key] for key in names},
-                )
-            if wanted:
-                # One non-empty field clears the other three.
-                self._build_fields(
-                    app,
-                    wanted.get("containerfile", ""),
-                    wanted.get("compose", ""),
-                    wanted.get("image", ""),
-                    wanted.get("recipe", ""),
-                )
-            else:
-                # "" clears only its own field.
-                for key in given:
-                    setattr(app, key, "")
+        if runs is not None:
+            app.runs = self._check_runs(app, runs) if runs else ""
+        else:
+            # A repo change without a runs change must still satisfy the pair rule.
+            self._check_pair(app, parse_runs(app.runs)[0], app.runs)
         self._write(app)
         return self.app(name)
 
@@ -317,42 +316,46 @@ class Store:
                 return token
         return None
 
-    def _build_fields(self, app: App, containerfile: str, compose: str, image: str, recipe: str) -> None:
-        """What the app runs: one of the four. A repo app builds; a repo-less app pulls."""
-        if image and app.repo:
+    def _check_runs(self, app: App, runs: str) -> str:
+        """Normalize a runs value and check it against the repo."""
+        kind, value = parse_runs(runs)
+        if kind == "template" and value.removeprefix("yard:") not in TEMPLATES:
             raise YardError(
                 400,
-                "bad_request",
-                "an image app has no repo",
-                context={"image": image},
-                help_text="Create a new app: yard app new --app NAME --image REF",
+                "bad_runs",
+                f"unknown template {value}",
+                context={"runs": runs},
+                help_text=f"The templates are {', '.join(f'yard:{t}' for t in TEMPLATES)}.",
             )
-        if recipe and app.repo:
+        self._check_pair(app, kind, value)
+        return value
+
+    def _check_pair(self, app: App, kind: str, value: str) -> None:
+        """A repo app runs a file in it; a repo-less app pulls an image or fetches a URL."""
+        if kind in ("path", "template") and not app.repo:
             raise YardError(
                 400,
-                "bad_request",
-                "a recipe app has no repo",
-                context={"recipe": recipe},
-                help_text="Create a new app: yard app new --app NAME --recipe NAME",
+                "bad_runs",
+                f"{value} is a path in a repo, and {app.name} has no repo",
+                context={"runs": value, "name": app.name},
+                help_text=(f"An image needs a tag, like {value}:1.0. A compose file can come from an https URL."),
             )
-        if (containerfile or compose) and not app.repo:
+        if kind in ("image", "url") and app.repo:
             raise YardError(
                 400,
-                "bad_request",
-                f"app {app.name} has no repo",
-                context={"name": app.name},
-                help_text="Set the repo first: yard app set --repo https://<host>/<owner>/<name>",
+                "bad_runs",
+                "an app with a repo runs a file from it",
+                context={"runs": value, "name": app.name},
+                help_text="Use a path, auto, or yard:<template>. To run an image, create an app with no repo.",
             )
-        app.containerfile = check_containerfile(containerfile) if containerfile else ""
-        app.compose = check_compose(compose) if compose else ""
-        app.image = check_image(image) if image else ""
-        app.recipe = check_recipe(recipe) if recipe else ""
 
     def _write(self, app: App) -> None:
-        text = f"repo {app.repo}\nref {app.ref}\ntrigger {app.trigger}\ncreated {app.created}\n"
-        for field in ("containerfile", "compose", "image", "recipe"):
-            if getattr(app, field):
-                text += f"{field} {getattr(app, field)}\n"
+        text = f"repo {app.repo}\n"
+        if app.ref:
+            text += f"ref {app.ref}\n"
+        text += f"trigger {app.trigger}\ncreated {app.created}\n"
+        if app.runs:
+            text += f"runs {app.runs}\n"
         atomic_write(self._record(app.name), text)
 
     def _env(self, name: str) -> Path:
@@ -386,10 +389,7 @@ def _read_app(name: str, text: str) -> App:
         "ref": "main",
         "trigger": "push",
         "created": "",
-        "containerfile": "",
-        "compose": "",
-        "image": "",
-        "recipe": "",
+        "runs": "",
     }
     for line in text.splitlines():
         key, _, value = line.partition(" ")
@@ -398,14 +398,43 @@ def _read_app(name: str, text: str) -> App:
     return App(
         name,
         fields["repo"],
-        fields["ref"] or "main",
+        fields["ref"] or ("main" if fields["repo"] else ""),
         fields["trigger"] or "push",
         fields["created"],
-        fields["containerfile"],
-        fields["compose"],
-        fields["image"],
-        fields["recipe"],
+        fields["runs"],
     )
+
+
+def _deployed_file(config: Config, name: str) -> Path:
+    return config.app_dir(name) / "deployed"
+
+
+def read_deployed(config: Config, name: str) -> Deployed | None:
+    """The deployed file, or None when the app never deployed ok."""
+    path = _deployed_file(config, name)
+    if not path.is_file():
+        return None
+    fields = {"revision": "", "runs": "", "kind": "", "reason": "", "template": ""}
+    for line in path.read_text().splitlines():
+        key, _, value = line.partition(" ")
+        if key in fields:
+            fields[key] = value.strip()
+    return Deployed(**fields)
+
+
+def write_deployed(config: Config, name: str, deployed: Deployed) -> None:
+    text = "".join(
+        f"{key} {value}\n"
+        for key, value in (
+            ("revision", deployed.revision),
+            ("runs", deployed.runs),
+            ("kind", deployed.kind),
+            ("reason", deployed.reason),
+            ("template", deployed.template),
+        )
+        if value
+    )
+    atomic_write(_deployed_file(config, name), text)
 
 
 def ensure_admin(store: Store) -> str:

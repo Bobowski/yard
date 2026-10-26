@@ -27,6 +27,10 @@ fix:
 test:
     uv run pytest -q
 
+# refresh the pinned template base digests in detect/bases.json
+bump-bases:
+    uv run scripts/bump_bases.py
+
 # refresh AGENTS.md, the skills, and the Cloud Agent files from the latest stario-create
 sync:
     uvx stario-create@latest sync

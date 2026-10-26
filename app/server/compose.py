@@ -6,9 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from app.server import git
-from app.server.store import App
-from app.shared import YardError, atomic_write, ensure_file, short_sha
+from app.server.store import App, read_deployed
+from app.shared import YardError, ensure_file, short_sha
 
 if TYPE_CHECKING:
     from app.server.store import Config
@@ -16,24 +15,15 @@ if TYPE_CHECKING:
 APPLY_DIR = "/usr/local/share/yard/apply"
 if not Path(APPLY_DIR).is_dir():
     APPLY_DIR = str(Path(__file__).resolve().parents[2] / "ops" / "apply")
-DEFAULT_COMPOSE = "/usr/local/share/yard/default.compose.yml"
-IMAGE_COMPOSE = "/usr/local/share/yard/image.compose.yml"
+APP_COMPOSE = f"{APPLY_DIR}/app.compose.yml"
+BUILD_COMPOSE = f"{APPLY_DIR}/build.compose.yml"
 COMPOSE_NAMES = ("compose.yml", "compose.yaml", "ops/compose.yml", "ops/compose.yaml")
 DOCKERFILES = ("Containerfile", "Dockerfile", "ops/Containerfile", "ops/Dockerfile")
 
 
-def read_revision(config: Config, name: str) -> str:
-    """The revision the last ok deploy ran: a manifest digest or a recipe file sha256."""
-    file = config.app_dir(name) / "revision"
-    return file.read_text().strip() if file.is_file() else ""
-
-
-def write_revision(config: Config, name: str, revision: str) -> None:
-    atomic_write(config.app_dir(name) / "revision", revision + "\n")
-
-
-def image_tag(name: str, sha: str) -> str:
-    return f"localhost/{name}:{short_sha(sha)}"
+def image_tag(name: str, sha: str, template: str = "") -> str:
+    tag = f"localhost/{name}:{short_sha(sha)}"
+    return f"{tag}-{template}" if template else tag
 
 
 @dataclass(slots=True)
@@ -43,18 +33,9 @@ class Project:
     env: dict[str, str]
 
 
-def find_compose(checkout: Path) -> Path | None:
-    return next((checkout / name for name in COMPOSE_NAMES if (checkout / name).is_file()), None)
-
-
-def compose_files(app: App, checkout: Path) -> list[str]:
-    """The compose file a deploy or purge runs. The record wins; unset falls back to the repo scan."""
-    if app.compose:
-        return [str(checkout / app.compose)]
-    if app.containerfile:
-        return [DEFAULT_COMPOSE]
-    found = find_compose(checkout)
-    return [str(found)] if found else [DEFAULT_COMPOSE]
+def app_container(name: str) -> str:
+    """Compose names the one app container `<project>-app-1`."""
+    return f"{name}-app-1"
 
 
 def run_env(config: Config, app: App, checkout: Path, image: str, sha: str) -> dict[str, str]:
@@ -69,14 +50,6 @@ def run_env(config: Config, app: App, checkout: Path, image: str, sha: str) -> d
         "DATA_DIR": str(data),
         "APP_ENV": str(config.env(app.name)),
     }
-
-    if app.compose:
-        pass  # The repo's compose file names its own build.
-    elif app.containerfile == "yard":
-        # Absolute, so apply.sh uses the stored file instead of a repo path.
-        env["DOCKERFILE"] = str(config.app_dir(app.name) / "Containerfile")
-    elif app.containerfile:
-        env["DOCKERFILE"] = app.containerfile
     if app.name == "yard":
         # ops/compose.yml binds these host paths.
         sock = config.podman_sock or "/run/podman/podman.sock"
@@ -86,64 +59,61 @@ def run_env(config: Config, app: App, checkout: Path, image: str, sha: str) -> d
     return env
 
 
-def ensure_env(path: Path) -> None:
-    """The app env file, empty when new. Compose refuses a missing env_file."""
-    ensure_file(path)
+def project(
+    config: Config,
+    app: App,
+    kind: str,
+    runs: str,
+    revision: str,
+    image: str,
+    checkout: Path,
+    dockerfile: str = "",
+) -> Project:
+    """The project a deploy or purge runs.
 
-
-def app_container(name: str) -> str:
-    """Compose names the one app container `<project>-app-1`."""
-    return f"{name}-app-1"
-
-
-def prepare(config: Config, app: App, checkout: Path, image: str, sha: str) -> Project:
-    """The project a deploy runs. The apply container checks the compose file."""
-    env = run_env(config, app, checkout, image, sha)
-    ensure_env(config.env(app.name))
-    files = compose_files(app, checkout)
+    kind "containerfile" composes Yard's app+build files; "image" composes app
+    only; "compose" runs the file itself: the clone path or the fetched copy.
+    """
+    env = run_env(config, app, checkout, image, revision)
+    ensure_file(config.env(app.name))
+    if kind == "containerfile":
+        files = [APP_COMPOSE, BUILD_COMPOSE]
+        env["DOCKERFILE"] = dockerfile
+        env["YARD_FILES"] = "1"
+    elif kind == "image":
+        files = [APP_COMPOSE]
+        env["YARD_FILES"] = "1"
+    elif runs.startswith("https://"):
+        files = [str(_compose_copy(config, app.name, revision))]
+    else:
+        files = [str(checkout / runs)]
     return Project(app.name, files, env)
 
 
-def recipe_file(config: Config, name: str) -> Path | None:
-    """The compose file of the last ok recipe deploy, or the newest one on disk."""
-    revision = read_revision(config, name)
-    if revision.startswith("sha256:"):
-        path = config.app_dir(name) / "recipe" / f"{revision[7:19]}.yml"
-        if path.is_file():
-            return path
-    directory = config.app_dir(name) / "recipe"
-    files = (
-        sorted(directory.glob("*.yml"), key=lambda p: p.stat().st_mtime_ns, reverse=True) if directory.is_dir() else []
-    )
-    return files[0] if files else None
+def _compose_copy(config: Config, name: str, revision: str) -> Path:
+    return config.app_dir(name) / "compose" / f"{revision[7:19]}.yml"
 
 
 def saved_project(config: Config, app: App) -> Project | None:
-    """Rebuild the project for a purge: the clone for repo apps, the deployed source for others."""
-    if app.image:
-        revision = read_revision(config, app.name)
-        image = f"{app.image.split('@', 1)[0]}@{revision}" if revision else app.image
-        env = run_env(config, app, config.app_dir(app.name), image, revision)
-        ensure_env(config.env(app.name))
-        return Project(app.name, [IMAGE_COMPOSE], env)
-    if app.recipe:
-        file = recipe_file(config, app.name)
-        if file is None:
+    """Rebuild the project for a purge from the deployed file; None when there is none."""
+    deployed = read_deployed(config, app.name)
+    if deployed is None or not deployed.revision:
+        return None
+    if deployed.kind == "image":
+        image = f"{deployed.runs.split('@', 1)[0]}@{deployed.revision}"
+        return project(config, app, "image", "", deployed.revision, image, config.app_dir(app.name))
+    if deployed.kind == "compose" and deployed.runs.startswith("https://"):
+        copy = _compose_copy(config, app.name, deployed.revision)
+        if not copy.is_file():
             return None
-        env = run_env(config, app, config.app_dir(app.name), "recipe:" + read_revision(config, app.name)[7:19], "")
-        ensure_env(config.env(app.name))
-        return Project(app.name, [str(file)], env)
+        image = f"compose:{deployed.revision[7:19]}"
+        return project(config, app, "compose", deployed.runs, deployed.revision, image, config.app_dir(app.name))
     checkout = config.clone(app.name)
     if not (checkout / ".git").exists():
         return None
-    sha = git.head(checkout)
-    if not sha:
-        return None
-    image = image_tag(app.name, sha)
-    files = compose_files(app, checkout)
-    env = run_env(config, app, checkout, image, sha)
-    ensure_env(config.env(app.name))
-    return Project(app.name, files, env)
+    image = image_tag(app.name, deployed.revision, deployed.template)
+    dockerfile = str(config.app_dir(app.name) / "Containerfile") if deployed.runs.startswith("yard:") else deployed.runs
+    return project(config, app, deployed.kind, deployed.runs, deployed.revision, image, checkout, dockerfile)
 
 
 async def apply(

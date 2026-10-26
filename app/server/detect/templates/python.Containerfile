@@ -1,4 +1,4 @@
-FROM python:{{python}}-slim-trixie AS builder
+FROM {{python}} AS builder
 
 {{builder}}
 
@@ -10,7 +10,7 @@ COPY . /workspace
 
 {{project}}
 
-FROM python:{{python}}-slim-trixie
+FROM {{python}}
 
 ENV PYTHONUNBUFFERED=1 \
     PORT=8000

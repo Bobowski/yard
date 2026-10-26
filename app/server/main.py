@@ -46,6 +46,7 @@ async def boot(yard: Yard, app: App) -> None:
     for forge in yard.forges.values():
         forge.dir.mkdir(parents=True, exist_ok=True)
     try:
+        apps.migrate(yard)
         apps.ensure_host(yard)
     except YardError as exc:
         log.warning("host app: %s", exc)

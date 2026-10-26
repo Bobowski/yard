@@ -9,11 +9,11 @@ from stario import Context, Handler, Middleware, Route, Writer, json
 from stario.http.middleware import catch_errors
 from stario.json import JsonValue
 
-from app.server import apps, binds, doctor, journal, sources, status
+from app.server import apps, binds, doctor, journal, status
 from app.server.forges import Forge, GitHub, Origin
-from app.server.store import App, Config, Store
+from app.server.store import App, Config, Deployed, Store, read_deployed
 from app.server.yard import Yard
-from app.shared import YardError, check_recipe, now
+from app.shared import YardError, now
 
 HEALTH = Route("GET /health")
 HOOK_ORIGIN = Route("POST /hooks/origin")
@@ -56,30 +56,35 @@ async def json_object(c: Context) -> dict:
     return body
 
 
-def app_fields(body: dict) -> dict[str, str]:
-    """The fields an app PATCH or POST takes: repo, ref, trigger."""
+def app_fields(body: dict, allowed: set[str]) -> dict[str, str]:
+    """The fields an app PATCH or POST takes. An unknown key is a 400."""
     fields: dict[str, str] = {}
-    for key in ("repo", "ref", "trigger", "containerfile", "compose", "image", "recipe"):
-        if key not in body:
+    for key, value in body.items():
+        if key not in allowed:
+            raise YardError(
+                400,
+                "unknown_field",
+                f"unknown field {key}",
+                context={"field": key},
+                help_text="This Yard takes name, repo, ref, trigger, runs. Upgrade the CLI: uv tool upgrade staryard",
+            )
+        if key == "name":
             continue
-        value = body[key]
         if not isinstance(value, str):
             raise YardError(400, "bad_json", "bad json", help_text=f"{key} is a string.")
         fields[key] = value
     return fields
 
 
-def app_json(app: App) -> dict[str, Any]:
+def app_json(app: App, deployed: Deployed | None = None) -> dict[str, Any]:
     return {
         "name": app.name,
         "repo": app.repo,
         "ref": app.ref,
         "trigger": app.trigger,
         "created": app.created,
-        "containerfile": app.containerfile,
-        "compose": app.compose,
-        "image": app.image,
-        "recipe": app.recipe,
+        "runs": app.runs,
+        "deployed": asdict(deployed) if deployed else None,
     }
 
 
@@ -87,9 +92,9 @@ def bind_json(bind: binds.Bind) -> dict[str, str]:
     return {"host": bind.host, "dial": bind.dial, "id": bind.id, "try": bind.window, "state": bind.state}
 
 
-def page_json(page: status.Page) -> dict[str, Any]:
+def page_json(page: status.Page, deployed: Deployed | None = None) -> dict[str, Any]:
     return {
-        "app": app_json(page.app),
+        "app": app_json(page.app, deployed),
         "image": page.image,
         "sha": page.sha,
         "env_file": page.env_file,
@@ -97,6 +102,7 @@ def page_json(page: status.Page) -> dict[str, Any]:
         "binds": page.binds,
         "deploys": page.deploys,
         "log": page.log,
+        "template_moved": page.template_moved,
     }
 
 
@@ -362,9 +368,9 @@ def forge_put(forges: dict[str, Forge], config: Config) -> Handler:
     return handler
 
 
-def apps_list(store: Store) -> Handler:
+def apps_list(yard: Yard) -> Handler:
     async def handler(_c: Context, w: Writer) -> None:
-        w.json([app_json(app) for app in store.list_apps()])
+        w.json([app_json(app, read_deployed(yard.config, app.name)) for app in yard.store.list_apps()])
 
     return handler
 
@@ -372,7 +378,7 @@ def apps_list(store: Store) -> Handler:
 def apps_create(yard: Yard) -> Handler:
     async def handler(c: Context, w: Writer) -> None:
         data = await json_object(c)
-        fields = app_fields(data)
+        fields = app_fields(data, {"name", "repo", "ref", "trigger", "runs"})
         name = data.get("name", "")
         repo = fields.pop("repo", "")
         if not isinstance(name, str) or not isinstance(repo, str):
@@ -391,26 +397,17 @@ def apps_create(yard: Yard) -> Handler:
                 help_text="An app name uses lowercase letters, digits, and -",
                 example="staging",
             )
-        source = fields.get("image") or fields.get("recipe") or ""
-        if not repo.strip() and not source:
+        if not repo.strip() and not fields.get("runs", "").strip():
             raise YardError(
                 400,
                 "bad_json",
                 "repo is required",
                 context={"field": "repo"},
-                help_text="The repo as a full https URL; for a repo-less app pass --image or --recipe.",
+                help_text="The repo as a full https URL; for a repo-less app pass an image or a URL in runs.",
                 example="https://github.com/org/heldso",
             )
-        port = 0
-        if isinstance(fields.get("recipe"), str) and fields["recipe"]:
-            # The create fails when the recipe cannot be fetched; the port answer binds it.
-            body = await sources.fetch_recipe(check_recipe(fields["recipe"]))
-            port = apps.recipe_port(body) or 8000
         app = apps.create(yard, name, repo, actor=_actor(c), **cast(dict[str, Any], fields))
-        reply: dict[str, JsonValue] = {"app": cast(JsonValue, app_json(app))}
-        if port:
-            reply["port"] = port
-        w.json(reply)
+        w.json(cast(JsonValue, {"app": cast(JsonValue, app_json(app))}))
 
     return handler
 
@@ -418,7 +415,7 @@ def apps_create(yard: Yard) -> Handler:
 def app_page(yard: Yard) -> Handler:
     async def handler(c: Context, w: Writer) -> None:
         page = await status.app_report(yard, c.match.params["name"])
-        w.json(cast(JsonValue, page_json(page)))
+        w.json(cast(JsonValue, page_json(page, read_deployed(yard.config, page.app.name))))
 
     return handler
 
@@ -426,16 +423,16 @@ def app_page(yard: Yard) -> Handler:
 def app_patch(yard: Yard) -> Handler:
     async def handler(c: Context, w: Writer) -> None:
         name = c.match.params["name"]
-        fields = app_fields(await json_object(c))
+        fields = app_fields(await json_object(c), {"repo", "ref", "trigger", "runs"})
         if not fields:
             raise YardError(
                 400,
                 "bad_json",
                 "nothing to change",
-                help_text="Set one of repo, ref, or trigger.",
+                help_text="Set one of repo, ref, trigger, or runs.",
             )
         app = apps.update(yard, name, actor=_actor(c), **cast(dict[str, Any], fields))
-        w.json(cast(JsonValue, {"app": app_json(app)}))
+        w.json(cast(JsonValue, {"app": app_json(app, read_deployed(yard.config, name))}))
 
     return handler
 
@@ -461,37 +458,19 @@ def app_deploy(yard: Yard) -> Handler:
         name = c.match.params["name"]
         yard.store.app(name)
         data = await json_object(c)
-        sha = data.get("sha", "")
-        if not isinstance(sha, str):
-            raise YardError(400, "bad_json", "bad json", help_text="sha is a string.")
-        requested = sha = sha.strip()
-        record = yard.store.app(name)
-        if sha and record.image:
+        if "sha" in data:
             raise YardError(
                 400,
                 "bad_request",
-                f"an image app rolls back by tag: yard app set --app {name} --image REF:OLDER",
+                "Yard deploys what the source says now",
+                help_text=(
+                    "To roll back, change the source: git revert and push,"
+                    " or yard app set --runs IMAGE:OLDER-TAG, or an older URL."
+                ),
             )
-        if sha and record.recipe:
-            raise YardError(
-                400,
-                "bad_request",
-                "a recipe app rolls back by URL: point --recipe at an older commit's raw URL",
-            )
-        if sha and not re.fullmatch(r"[0-9a-f]{7,40}", sha):
-            raise YardError(
-                400,
-                "bad_sha",
-                f"{sha} is not a sha",
-                help_text="7 to 40 lowercase hex characters.",
-            )
-        if sha and len(sha) < 40:
-            sha = await _resolve_sha(yard.config, name, sha)
         outcome = await apps.deploy(
             yard,
             name,
-            sha=sha,
-            requested=requested,
             cause="manual",
             actor=_actor(c),
         )
@@ -507,7 +486,7 @@ def app_deploy(yard: Yard) -> Handler:
             cast(
                 JsonValue,
                 {
-                    "app": app_json(yard.store.app(name)),
+                    "app": app_json(yard.store.app(name), read_deployed(yard.config, name)),
                     "deploy": asdict(outcome),
                 },
             ),
@@ -523,40 +502,6 @@ def app_file(yard: Yard) -> Handler:
         w.text(apps.app_file(yard.config, app, c.match.params["which"]))
 
     return handler
-
-
-async def _resolve_sha(config: Config, name: str, prefix: str) -> str:
-    """A short sha names one deployed commit, found in the deploy journal."""
-    try:
-        entries = await journal.read_entries(
-            config,
-            ["SYSLOG_IDENTIFIER=yard", f"YARD_APP={name}", "YARD_EVENT=deploy.start"],
-            lines=5000,
-        )
-    except YardError as exc:
-        raise YardError(
-            exc.status,
-            exc.code,
-            exc.message,
-            help_text="pass the full 40-character SHA",
-        ) from exc
-    matches = sorted(
-        {str(entry.get("YARD_SHA")) for entry in entries if str(entry.get("YARD_SHA") or "").startswith(prefix)}
-    )
-    if not matches:
-        raise YardError(
-            404,
-            "unknown_sha",
-            f"{prefix} was never deployed here; pass the full 40-character SHA",
-        )
-    if len(matches) > 1:
-        raise YardError(
-            400,
-            "ambiguous_sha",
-            f"{prefix} names {len(matches)} deployed shas",
-            context={"matches": ",".join(matches)},
-        )
-    return matches[0]
 
 
 _LOG_CONTAINER = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}\Z")
@@ -1002,7 +947,7 @@ def register(app: StarioApp, yard: Yard) -> None:
     app.add(DOCTOR, doctor_run(yard), middleware=auth)
     app.add(FORGES, forges_list(yard.forges, yard.config), middleware=auth)
     app.add(FORGE_PUT, forge_put(yard.forges, yard.config), middleware=auth)
-    app.add(APPS, apps_list(yard.store), middleware=auth)
+    app.add(APPS, apps_list(yard), middleware=auth)
     app.add(APP_CREATE, apps_create(yard), middleware=auth)
     app.add(APP, app_page(yard), middleware=auth)
     app.add(APP_PATCH, app_patch(yard), middleware=auth)

@@ -201,6 +201,21 @@ def parse_states(raw: str) -> dict[str, tuple[bool, str]]:
     return found
 
 
+def parse_port(raw: str) -> int:
+    """podman inspect --format json: the one exposed tcp port, or 0."""
+    rows = _rows(raw)
+    if not rows:
+        return 0
+    config = rows[0].get("Config")
+    ports = config.get("ExposedPorts") if isinstance(config, dict) else None
+    found = []
+    for key in ports or {}:
+        number, _, proto = str(key).partition("/")
+        if proto == "tcp" and number.isdigit():
+            found.append(int(number))
+    return found[0] if len(found) == 1 else 0
+
+
 # Podman --format json prints snake_case keys; the table header spellings are a fallback.
 def parse_stats(raw: str) -> dict[str, Sample]:
     found: dict[str, Sample] = {}

@@ -51,6 +51,7 @@ from app.shared import (
     format_bytes,
     format_env,
     parse_env,
+    parse_runs,
 )
 
 _no_color = False
@@ -239,12 +240,12 @@ def _remote_repo(remote: str) -> str:
     return f"https://{host}/{found[0]}/{found[1]}"
 
 
-def _source_name(image: str, recipe: str) -> str:
-    """The app name for a repo-less app: the image's last repo segment, or the recipe name."""
-    if image:
-        return image.split("@", 1)[0].rsplit(":", 1)[0].rsplit("/", 1)[-1]
-    tail = recipe.rsplit("/", 1)[-1]
-    return tail.removesuffix(".yml")
+def _source_name(kind: str, runs: str) -> str:
+    """The app name for a repo-less app: the image's last repo segment, or the URL file's stem."""
+    if kind == "image":
+        return runs.split("@", 1)[0].rsplit(":", 1)[0].rsplit("/", 1)[-1]
+    tail = runs.rsplit("/", 1)[-1]
+    return tail.removesuffix(".yml").removesuffix(".yaml")
 
 
 def _default_name(repo: str, ref: str) -> str:
@@ -372,23 +373,30 @@ def _cmd_app_ls(args: argparse.Namespace) -> None:
 
 
 def _cmd_app_new(args: argparse.Namespace) -> None:
-    image = args.image.strip()
-    recipe = args.recipe.strip()
     repo, ref = args.repo.strip(), args.ref.strip()
-    if not (image or recipe):
-        if not repo or not ref:
-            found_repo, found_ref = _checkout_pair()
-            repo = repo or found_repo
-            if not ref:
-                # The checkout branch counts only when the repo is the checkout's.
-                ref = found_ref if found_repo and repo.lower() == found_repo.lower() else ""
+    try:
+        kind, runs = parse_runs(args.runs)
+        repo_less = kind in ("image", "url")
+        if repo_less and repo:
+            _die(f"{runs} needs no repo; an app with a repo runs a file from it")
+        if not repo_less:
+            if not repo or not ref:
+                found_repo, found_ref = _checkout_pair()
+                repo = repo or found_repo
+                if not ref:
+                    # The checkout branch counts only when the repo is the checkout's.
+                    ref = found_ref if found_repo and repo.lower() == found_repo.lower() else ""
+            if kind == "path":
+                top = _git_out("rev-parse", "--show-toplevel")
+                if top and not (Path(top) / runs).is_file():
+                    _die(f"{runs} is not a file in this checkout. An image needs a tag: {runs}:TAG")
+    except YardError as exc:
+        _fail(exc)
     ref = ref or "main"
     name = args.app.strip()
     try:
-        if image or recipe:
-            if repo:
-                _die("an image or recipe app has no repo")
-            name = name or _source_name(image, recipe)
+        if repo_less:
+            name = name or _source_name(kind, runs)
         else:
             if not repo:
                 _die("no repo; pass --repo https://<host>/<owner>/<name> or run inside a forge checkout")
@@ -403,16 +411,14 @@ def _cmd_app_new(args: argparse.Namespace) -> None:
         _fail(exc)
 
     session = _load(args)
-    body: dict[str, object] = {"name": name, "repo": repo, "ref": ref}
+    body: dict[str, object] = {"name": name, "repo": repo}
+    if not repo_less:
+        body["ref"] = ref
     if args.trigger:
         body["trigger"] = args.trigger
-    for key in ("containerfile", "compose", "image", "recipe"):
-        if getattr(args, key):
-            body[key] = getattr(args, key)
+    if runs:
+        body["runs"] = runs
     raw = _api(session, "POST", "/api/v1/apps", body)
-    if host:
-        port = args.port or int(_object(raw).get("port") or 0) or 8000
-        _api(session, "PUT", f"/api/v1/binds/{quote(host, safe='')}", {"dial": f"{name}-app-1:{port}", "try": window})
     wrap = _object(raw)
     app = wrap.get("app") if isinstance(wrap, dict) else None
     if args.no_deploy:
@@ -423,6 +429,7 @@ def _cmd_app_new(args: argparse.Namespace) -> None:
             print(format_record(json.dumps(app)), end="")
         else:
             print(raw)
+        _maybe_bind(session, host, name, args.port or (0 if repo_less else 8000), window)
         print("Not deployed yet. Set its settings first if it needs any, then deploy:")
         print(f"  yard env set KEY=VALUE --app {name}")
         print(f"  yard app deploy --app {name}")
@@ -435,6 +442,9 @@ def _cmd_app_new(args: argparse.Namespace) -> None:
         print(f"Deploying {name} now…")
     code, text = _api_try(session, "POST", f"/api/v1/apps/{quote(name)}/deploy", {}, DEPLOY_TIMEOUT)
     if code >= 300:
+        if host:
+            # A repo app still binds so Caddy is ready after the fix.
+            _maybe_bind(session, host, name, args.port or (0 if repo_less else 8000), window)
         _die(f"{name} was created, but the first deploy failed.\n" + (text if _json else explain(text)))
     if _json:
         print(text)
@@ -445,18 +455,35 @@ def _cmd_app_new(args: argparse.Namespace) -> None:
         _print_deploy_note(note, name)
     else:
         print(text)
+    port = args.port or int((note or {}).get("port") or 0) or (0 if repo_less else 8000)
+    _maybe_bind(session, host, name, port, window)
+
+
+def _maybe_bind(session, host: str, name: str, port: int, window: str) -> None:
+    """Bind the public host, or print the command when the port is not known."""
+    if not host:
+        return
+    if port:
+        _api(
+            session,
+            "PUT",
+            f"/api/v1/binds/{quote(host, safe='')}",
+            {"dial": f"{name}-app-1:{port}", "try": window},
+        )
+    else:
+        print(f"Bind it: yard bind set {host} {name}-app-1:PORT")
 
 
 def _cmd_app_set(args: argparse.Namespace) -> None:
     session = _load(args)
     name = _app_name(session, args)
     patch: dict[str, str] = {}
-    for key in ("repo", "ref", "trigger", "containerfile", "compose", "image", "recipe"):
+    for key in ("repo", "ref", "trigger", "runs"):
         value = str(getattr(args, key, "") or "").strip()
         if value:
             patch[key] = value
     if not patch:
-        _die("yard app set needs --repo, --ref, --trigger, --containerfile, --compose, --image, or --recipe")
+        _die("yard app set needs --repo, --ref, --trigger, or --runs")
     page = _object(_api(session, "GET", "/api/v1/apps/" + quote(name), None))
     current = page.get("app") if isinstance(page, dict) else None
     current = current if isinstance(current, dict) else {}
@@ -468,49 +495,17 @@ def _cmd_app_set(args: argparse.Namespace) -> None:
     found = wrap.get("app") if isinstance(wrap, dict) else None
     app = found if isinstance(found, dict) else {}
     moved = any(key in patch and patch[key] != str(current.get(key) or "") for key in ("repo", "ref"))
-    sourced = any(key in patch and patch[key] != str(current.get(key) or "") for key in ("image", "recipe"))
-    built = any(key in patch and patch[key] != str(current.get(key) or "") for key in ("containerfile", "compose"))
-    if (moved or sourced) and str(app.get("trigger") or "") == "push":
+    changed = "runs" in patch and patch["runs"] != str(current.get("runs") or "")
+    if (moved or changed) and str(app.get("trigger") or "") == "push":
         print(f"The next check deploys it within 5 minutes. Deploy now: yard app deploy --app {name}")
     elif moved:
         print(f"Saved. {name} still runs the old repo and ref until the next deploy.")
         print(f"Deploy now: yard app deploy --app {name}")
-    elif sourced:
-        print(f"Saved. {name} still runs the old version until the next deploy.")
-        print(f"Deploy now: yard app deploy --app {name}")
-    elif built:
-        print(f"Saved. {name} still builds the old way until the next deploy.")
+    elif changed:
+        print(f"Saved. {name} still runs the old way until the next deploy.")
         print(f"Deploy now: yard app deploy --app {name}")
     else:
         print("Saved.")
-
-
-def _cmd_app_detect(args: argparse.Namespace) -> None:
-    session = _load(args)
-    name = _app_name(session, args)
-    page = _object(_api(session, "GET", f"/api/v1/apps/{quote(name)}", None))
-    record = page.get("app") if isinstance(page, dict) else {}
-    record = record if isinstance(record, dict) else {}
-    if str(record.get("image") or ""):
-        print(f"{name} runs an image ({record['image']}); there is nothing to detect.")
-        return
-    if str(record.get("recipe") or ""):
-        print(f"{name} runs a recipe ({record['recipe']}); there is nothing to detect.")
-        return
-    was = ""
-    if str(record.get("containerfile") or ""):
-        was = f"containerfile {record['containerfile']}"
-    elif str(record.get("compose") or ""):
-        was = f"compose {record['compose']}"
-    raw = _api(session, "PATCH", f"/api/v1/apps/{quote(name)}", {"containerfile": "", "compose": ""})
-    if _json:
-        print(raw)
-        return
-    if was:
-        print(f"{name}: the next deploy decides what to run again (was: {was}).")
-    else:
-        print(f"{name}: the next deploy decides what to run.")
-    print(f"Deploy now: yard app deploy --app {name}")
 
 
 def _cmd_app_cat(args: argparse.Namespace) -> None:
@@ -596,9 +591,7 @@ def _cmd_events(args: argparse.Namespace) -> None:
 def _cmd_app_deploy(args: argparse.Namespace) -> None:
     session = _load(args)
     name = _app_name(session, args)
-    sha = str(args.sha or "").strip()
-    body = {"sha": sha} if sha else {}
-    raw = _api(session, "POST", f"/api/v1/apps/{quote(name)}/deploy", body, DEPLOY_TIMEOUT)
+    raw = _api(session, "POST", f"/api/v1/apps/{quote(name)}/deploy", {}, DEPLOY_TIMEOUT)
     if _json:
         print(raw)
         return
@@ -608,12 +601,6 @@ def _cmd_app_deploy(args: argparse.Namespace) -> None:
         print(raw)
         return
     _print_deploy_note(note, name)
-    record = wrap.get("app") if isinstance(wrap, dict) else None
-    if sha and isinstance(record, dict) and record.get("trigger") == "push":
-        print(
-            "The trigger is push: the next check deploys the tip again."
-            " Run yard app set --trigger manual to keep this revision."
-        )
 
 
 def _cmd_app_rm(args: argparse.Namespace) -> None:
@@ -1376,36 +1363,26 @@ def _app_parser(subs: argparse._SubParsersAction, common: argparse.ArgumentParse
     new.add_argument("--public", metavar="HOST", default="", help="a name on the public internet")
     new.add_argument("--try", dest="window", default=None, help="how long caddy waits for the upstream")
     new.add_argument("--no-deploy", action="store_true", help="create the app without a first deploy")
-    newbuild = new.add_mutually_exclusive_group()
-    newbuild.add_argument(
-        "--containerfile", default="", help="a Containerfile in the repo, or yard for one Yard writes"
+    new.add_argument(
+        "--runs", default="", help="auto, a path in the repo, yard:<template>, an image name:tag, or an https URL"
     )
-    newbuild.add_argument("--compose", default="", help="a compose file in the repo")
-    newbuild.add_argument("--image", default="", help="run a pulled image: [registry/]name:tag")
-    newbuild.add_argument("--recipe", default="", help="run a recipe by name or https URL")
-    new.add_argument("--port", type=int, default=0, help="the port --public binds (default: the recipe's, else 8000)")
+    new.add_argument("--port", type=int, default=0, help="the port --public binds (default: the app's, else 8000)")
     _add_app_flag(new, "the app name; the repo and branch give a default")
     new.set_defaults(func=_cmd_app_new)
 
-    set_ = subs.add_parser("set", help="change the repo, ref, or trigger", parents=[common])
+    set_ = subs.add_parser("set", help="change the repo, ref, trigger, or runs", parents=[common])
     set_.add_argument("--repo", default="", help="the repo https URL")
     set_.add_argument("--ref", default="", help="the branch to follow")
     set_.add_argument("--trigger", default="", help="push or manual")
-    build = set_.add_mutually_exclusive_group()
-    build.add_argument("--containerfile", default="", help="a Containerfile in the repo, or yard for one Yard writes")
-    build.add_argument("--compose", default="", help="a compose file in the repo")
-    build.add_argument("--image", default="", help="run a pulled image: [registry/]name:tag")
-    build.add_argument("--recipe", default="", help="run a recipe by name or https URL")
+    set_.add_argument(
+        "--runs", default="", help="auto, a path in the repo, yard:<template>, an image name:tag, or an https URL"
+    )
     _add_app_flag(set_)
     set_.set_defaults(func=_cmd_app_set)
 
     stat = subs.add_parser("status", help="one app's page", parents=[common])
     _add_app_flag(stat)
     stat.set_defaults(func=_cmd_app_status)
-
-    detect = subs.add_parser("detect", help="let the next deploy decide what to run again", parents=[common])
-    _add_app_flag(detect)
-    detect.set_defaults(func=_cmd_app_detect)
 
     cat = subs.add_parser("cat", help="print the compose or Containerfile the app runs", parents=[common])
     cat.add_argument("which", choices=["compose", "containerfile"], help="which file to print")
@@ -1419,8 +1396,7 @@ def _app_parser(subs: argparse._SubParsersAction, common: argparse.ArgumentParse
     _add_app_flag(logs)
     logs.set_defaults(func=_cmd_app_logs)
 
-    deploy = subs.add_parser("deploy", help="deploy the ref, or one commit with --sha", parents=[common])
-    deploy.add_argument("--sha", default="", help="a commit to deploy; a prefix resolves to one deployed sha")
+    deploy = subs.add_parser("deploy", help="deploy what the source says now", parents=[common])
     _add_app_flag(deploy)
     deploy.set_defaults(func=_cmd_app_deploy)
 

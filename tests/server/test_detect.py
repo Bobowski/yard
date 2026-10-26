@@ -1,10 +1,11 @@
-"""detect.resolve: which file runs the app, and the Containerfile Yard writes."""
+"""detect.resolve and plan_for: which file runs the app, and the Containerfile Yard writes."""
 
 from pathlib import Path
 
 import pytest
 
 from app.server import detect
+from app.server.detect.base import BASES
 from app.shared import YardError
 
 PYPROJECT = '[project]\nname = "heldso"\ndependencies = ["stario>=5"]\n'
@@ -20,14 +21,14 @@ def test_repo_compose_wins(tmp_path: Path):
     _write(tmp_path, "compose.yml")
     _write(tmp_path, "Dockerfile")
     resolved = detect.resolve(tmp_path, "heldso")
-    assert (resolved.field, resolved.value, resolved.reason) == ("compose", "compose.yml", "found compose.yml")
+    assert (resolved.kind, resolved.answer, resolved.reason) == ("compose", "compose.yml", "found compose.yml")
 
 
 def test_repo_containerfile_beats_language(tmp_path: Path):
     _write(tmp_path, "ops/Containerfile")
     _write(tmp_path, "package.json", "{}")
     resolved = detect.resolve(tmp_path, "heldso")
-    assert (resolved.field, resolved.value) == ("containerfile", "ops/Containerfile")
+    assert (resolved.kind, resolved.answer) == ("containerfile", "ops/Containerfile")
 
 
 def test_stario(tmp_path: Path):
@@ -35,12 +36,49 @@ def test_stario(tmp_path: Path):
     _write(tmp_path, "uv.lock", "lock")
     _write(tmp_path, "app/main.py")
     resolved = detect.resolve(tmp_path, "heldso")
-    assert (resolved.field, resolved.value, resolved.kind) == ("containerfile", "yard", "stario")
-    assert resolved.reason == "pyproject.toml declares stario"
-    assert resolved.generated.startswith("# Written by Yard for a stario app (pyproject.toml declares stario).")
-    assert "yard app cat containerfile --app heldso" in resolved.generated
-    assert "\nFROM python:3.14-slim-trixie AS builder\n" in "\n" + resolved.generated
-    assert "HEALTHCHECK" not in resolved.generated
+    assert (resolved.kind, resolved.answer) == ("containerfile", "yard:python-uv")
+    assert resolved.reason == "stario: pyproject.toml declares stario"
+    assert resolved.generated.startswith(
+        "# Written by Yard for yard:python-uv (stario: pyproject.toml declares stario)."
+    )
+    assert len(resolved.template) == 8
+    assert "STARIO_HOST" not in resolved.generated
+
+
+def test_every_from_is_pinned(tmp_path: Path):
+    """Every FROM and COPY --from in a rendered template carries @sha256:."""
+    _write(tmp_path, "pyproject.toml", PYPROJECT)
+    _write(tmp_path, "uv.lock", "lock")
+    _write(tmp_path, "app/main.py")
+    for line in detect.resolve(tmp_path, "heldso").generated.splitlines():
+        if line.startswith("FROM ") or line.startswith("COPY --from=gh"):
+            assert "@sha256:" in line, line
+
+
+def test_every_base_is_used(tmp_path: Path):
+    """Every bases.json entry appears in at least one rendered template."""
+    used = set()
+    renders = [
+        {"go.mod": "module x\n\ngo 1.26\n", "main.go": "package main\n"},
+        {"go.mod": "module x\n\ngo 1.27\n", "main.go": "package main\n"},
+        {"package.json": '{"scripts":{"start":"x"},"engines":{"node":"22"}}'},
+        {"package.json": '{"scripts":{"start":"x"}}'},
+        {"pyproject.toml": '[project]\nrequires-python=">=3.12"\n', "uv.lock": "l", "app/main.py": ""},
+        {"pyproject.toml": '[project]\nrequires-python=">=3.13"\n', "uv.lock": "l", "app/main.py": ""},
+        {"pyproject.toml": '[project]\nrequires-python=">=3.14"\n', "uv.lock": "l", "app/main.py": ""},
+    ]
+    for files in renders:
+        for rel, text in files.items():
+            _write(tmp_path, rel, text)
+        plan = detect.resolve(tmp_path, "heldso")
+        for line in plan.generated.splitlines():
+            if "@sha256:" in line:
+                for ref, digest in BASES.items():
+                    if f"{ref}@{digest}" in line:
+                        used.add(ref)
+        for rel in files:
+            (tmp_path / rel).unlink()
+    assert used == set(BASES)
 
 
 def test_stario_needs_uv_lock(tmp_path: Path):
@@ -49,25 +87,12 @@ def test_stario_needs_uv_lock(tmp_path: Path):
         detect.resolve(tmp_path, "heldso")
 
 
-def test_stario_marker(tmp_path: Path):
-    _write(
-        tmp_path,
-        "pyproject.toml",
-        '[project]\nrequires-python = ">=3.15"\n\n[tool.stario-create]\n',
-    )
-    _write(tmp_path, "uv.lock", "lock")
-    _write(tmp_path, "app/main.py")
-    resolved = detect.resolve(tmp_path, "heldso")
-    assert resolved.kind == "stario"
-    assert "\nFROM python:3.15-slim-trixie AS builder\n" in "\n" + resolved.generated
-
-
 def test_python_requirements(tmp_path: Path):
     _write(tmp_path, "requirements.txt", "flask\n")
     _write(tmp_path, "app.py")
     resolved = detect.resolve(tmp_path, "heldso")
-    assert resolved.kind == "python"
-    assert resolved.reason == "requirements.txt"
+    assert resolved.answer == "yard:python-pip"
+    assert resolved.reason == "python: requirements.txt"
     assert "pip install --no-cache-dir -r requirements.txt" in resolved.generated
     assert 'CMD ["python", "app.py"]' in resolved.generated
 
@@ -78,9 +103,11 @@ def test_python_uv_and_entrypoint_order(tmp_path: Path):
     _write(tmp_path, "app/main.py")
     _write(tmp_path, "main.py")
     resolved = detect.resolve(tmp_path, "heldso")
-    assert resolved.kind == "python"
+    assert resolved.answer == "yard:python-uv"
+    assert resolved.reason == "python: uv.lock"
     assert "uv sync --locked --no-dev" in resolved.generated
     assert 'CMD ["python", "-m", "app.main"]' in resolved.generated
+    assert f"python:3.13-slim-trixie@{BASES['python:3.13-slim-trixie']}" in resolved.generated
 
 
 def test_python_pyproject_without_lock_or_requirements(tmp_path: Path):
@@ -97,13 +124,20 @@ def test_python_no_entrypoint(tmp_path: Path):
 
 
 def test_go_root_main(tmp_path: Path):
+    _write(tmp_path, "go.mod", "module example.com/heldso\n\ngo 1.26\n")
+    _write(tmp_path, "main.go", "package main\n")
+    resolved = detect.resolve(tmp_path, "heldso")
+    assert resolved.answer == "yard:go"
+    assert f"golang:1.26@{BASES['golang:1.26']}" in resolved.generated
+    assert "go build -trimpath -o /out/app ." in resolved.generated
+    assert "gcr.io/distroless/static-debian12" in resolved.generated
+
+
+def test_go_minimum_takes_the_smallest_cover(tmp_path: Path):
     _write(tmp_path, "go.mod", "module example.com/heldso\n\ngo 1.24\n")
     _write(tmp_path, "main.go", "package main\n")
     resolved = detect.resolve(tmp_path, "heldso")
-    assert resolved.kind == "go"
-    assert "\nFROM golang:1.24 AS builder\n" in "\n" + resolved.generated
-    assert "go build -trimpath -o /out/app ." in resolved.generated
-    assert "gcr.io/distroless/static-debian12" in resolved.generated
+    assert "golang:1.26@" in resolved.generated
 
 
 def test_go_one_cmd(tmp_path: Path):
@@ -121,12 +155,20 @@ def test_go_two_cmds_fails(tmp_path: Path):
         detect.resolve(tmp_path, "heldso")
 
 
+def test_go_too_new_fails(tmp_path: Path):
+    _write(tmp_path, "go.mod", "module example.com/heldso\n\ngo 1.99\n")
+    _write(tmp_path, "main.go", "package main\n")
+    with pytest.raises(YardError, match="cover 1.26, 1.27; this repo asks 1.99"):
+        detect.resolve(tmp_path, "heldso")
+
+
 def test_node(tmp_path: Path):
     _write(tmp_path, "package.json", '{"scripts": {"start": "node server.js"}, "engines": {"node": ">=20"}}')
     _write(tmp_path, "package-lock.json", "{}")
     resolved = detect.resolve(tmp_path, "heldso")
-    assert resolved.kind == "node"
-    assert "\nFROM node:20-slim\n" in "\n" + resolved.generated
+    assert resolved.answer == "yard:node-npm"
+    assert resolved.reason == "node: package.json start script"
+    assert f"node:22-slim@{BASES['node:22-slim']}" in resolved.generated
     assert "RUN npm ci" in resolved.generated
     assert 'CMD ["npm", "start"]' in resolved.generated
 
@@ -136,7 +178,7 @@ def test_node_build_script(tmp_path: Path):
     resolved = detect.resolve(tmp_path, "heldso")
     assert "RUN npm install" in resolved.generated
     assert "RUN npm run build" in resolved.generated
-    assert "\nFROM node:24-slim\n" in "\n" + resolved.generated
+    assert "node:24-slim@" in resolved.generated
 
 
 def test_node_no_start(tmp_path: Path):
@@ -168,7 +210,15 @@ def test_python_version_sources(tmp_path: Path):
     _write(tmp_path, ".python-version", "3.12\n")
     _write(tmp_path, "requirements.txt", "x\n")
     _write(tmp_path, "main.py")
-    assert "python:3.12-slim-trixie" in detect.resolve(tmp_path, "n").generated
+    assert "python:3.12-slim-trixie@" in detect.resolve(tmp_path, "n").generated
+
+
+def test_python_exact_pin_outside_the_set_fails(tmp_path: Path):
+    _write(tmp_path, ".python-version", "3.11\n")
+    _write(tmp_path, "requirements.txt", "x\n")
+    _write(tmp_path, "main.py")
+    with pytest.raises(YardError, match="cover 3.12, 3.13, 3.14; this repo asks 3.11"):
+        detect.resolve(tmp_path, "n")
 
 
 def test_python_single_script_entrypoint(tmp_path: Path):
@@ -179,13 +229,6 @@ def test_python_single_script_entrypoint(tmp_path: Path):
     )
     _write(tmp_path, "uv.lock", "lock")
     assert 'CMD ["serve"]' in detect.resolve(tmp_path, "n").generated
-
-
-def test_python_script_without_build_system_fails(tmp_path: Path):
-    _write(tmp_path, "pyproject.toml", '[project]\nname="x"\n[project.scripts]\nserve = "x:main"\n')
-    _write(tmp_path, "uv.lock", "lock")
-    with pytest.raises(Exception, match="app/main.py"):
-        detect.resolve(tmp_path, "n")
 
 
 def test_stario_dep_matching(tmp_path: Path):
@@ -199,10 +242,10 @@ def test_stario_dep_matching(tmp_path: Path):
     _write(tmp_path, "uv.lock", "l")
     _write(tmp_path, "app/main.py")
     plan = stario.detect(Repo(tmp_path), "n")
-    assert plan is not None and plan.kind == "stario"
+    assert plan is not None and plan.answer == "yard:python-uv"
     _write(tmp_path, "pyproject.toml", '[project]\nrequires-python=">=3.14"\ndependencies=["Stario[x]==5"]\n')
     plan = stario.detect(Repo(tmp_path), "n")
-    assert plan is not None and plan.kind == "stario"
+    assert plan is not None and plan.answer == "yard:python-uv"
     _write(tmp_path, "pyproject.toml", '[project]\nrequires-python=">=3.14"\ndependencies=["stariox==1"]\n')
     assert stario.detect(Repo(tmp_path), "n") is None
 
@@ -212,7 +255,38 @@ def test_invalid_pyproject_is_empty(tmp_path: Path):
     _write(tmp_path, "uv.lock", "l")
     _write(tmp_path, "main.py")
     resolved = detect.resolve(tmp_path, "n")
-    assert resolved.kind == "python" and "python:3.14" in resolved.generated
+    assert resolved.answer == "yard:python-uv" and "python:3.14" in resolved.generated
+
+
+def test_classify():
+    assert detect.classify("services:\n  app:\n") == "compose"
+    assert detect.classify("services: # hi\n  app:\n") == "compose"
+    assert detect.classify("FROM scratch\n") == "containerfile"
+    assert detect.classify("# hi\n\narg X\nFROM scratch\n") == "containerfile"
+    assert detect.classify("services:\nFROM x\n") == "compose"  # services: wins; no first FROM
+    with pytest.raises(YardError):
+        detect.classify("nothing\n")
+
+
+def test_plan_for_template(tmp_path: Path):
+    _write(tmp_path, "pyproject.toml", PYPROJECT)
+    _write(tmp_path, "uv.lock", "lock")
+    _write(tmp_path, "app/main.py")
+    plan = detect.plan_for(tmp_path, "heldso", "yard:python-uv")
+    assert plan.answer == "yard:python-uv" and plan.template
+    with pytest.raises(YardError, match="yard:go does not fit this repo"):
+        detect.plan_for(tmp_path, "heldso", "yard:go")
+
+
+def test_plan_for_path_classifies(tmp_path: Path):
+    _write(tmp_path, "ops/stack.yml", "services:\n  app:\n")
+    plan = detect.plan_for(tmp_path, "heldso", "ops/stack.yml")
+    assert (plan.kind, plan.answer) == ("compose", "ops/stack.yml")
+    _write(tmp_path, "ops/Box", "FROM scratch\n")
+    plan = detect.plan_for(tmp_path, "heldso", "ops/Box")
+    assert plan.kind == "containerfile"
+    with pytest.raises(YardError, match="not a file"):
+        detect.plan_for(tmp_path, "heldso", "ops/missing.yml")
 
 
 def _settings(tmp_path: Path, body: str, rel: str = "app/config.py"):
