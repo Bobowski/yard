@@ -136,3 +136,15 @@ def test_deployed_round_trip(tmp_path: Path):
     found = read_deployed(yard.config, "heldso")
     assert found == dep
     assert "template 3f9a1c2e" in (tmp_path / "apps" / "heldso" / "deployed").read_text()
+
+
+def test_repo_less_app_has_no_ref(tmp_path: Path):
+    store = Store.open(tmp_path)
+    app = store.create_app("db", "", runs="postgres:17")
+    assert app.ref == ""
+    assert "ref" not in (tmp_path / "apps" / "db" / "app").read_text()
+    with pytest.raises(YardError, match="has no repo"):
+        store.update_app("db", ref="main")
+    # Setting a repo fills ref with main.
+    app = store.update_app("db", runs="x.yml", repo="https://github.com/org/db")
+    assert app.ref == "main"

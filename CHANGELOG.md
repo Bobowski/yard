@@ -9,7 +9,7 @@ Breaking: the app record's four fields are one `runs`.
 - `yard app detect` and `deploy --sha` are gone. Roll back by changing the source: git revert, an older tag, or an older URL.
 - The `yard:` templates are `python-uv`, `python-pip`, `go`, and `node-npm`, pinned to index digests (`detect/bases.json`; `just bump-bases` refreshes). The rendered Containerfile's hash joins the deployed revision, so a template change redeploys once. One deploy path and one check loop cover every kind.
 - `POST`/`PATCH /api/v1/apps` reject unknown fields with `unknown_field`. `app_json` carries `runs` and a `deployed` object; the files route reads the deployed answer.
-- `app new --public` on an image or URL app binds after the first deploy, on the port the container exposes.
+- `app new --public` binds after the first deploy, on the port the container exposes (`--port` overrides; a repo app falls back to 8000).
 - New template `yard:http-nu` runs cross.stream (xs) apps: a repo with `serve.nu` gets a static http-nu binary (sha256-checked per arch), a persistent xs store in `/data/store`, and the Datastar bundle served. The env hint reads `$env.KEY`.
 
 ## 0.6.2

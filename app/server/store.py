@@ -170,8 +170,17 @@ class Store:
         check_app_name(name)
         if repo:
             repo = check_repo(repo)
-        ref = ref or "main"
-        check_ref(ref)
+        ref = ref or ("main" if repo else "")
+        if ref:
+            check_ref(ref)
+        if ref and not repo:
+            raise YardError(
+                400,
+                "bad_ref",
+                f"ref is a branch of the repo, and {name} has no repo",
+                context={"ref": ref, "name": name},
+                help_text="Create an app with a repo to follow a branch.",
+            )
         if self._record(name).is_file():
             raise YardError(409, "exists", "already exists", help_text="Pick another name.")
         app = App(name, repo, ref, check_trigger(trigger), now())
@@ -193,9 +202,19 @@ class Store:
         if repo is not None:
             app.repo = check_repo(repo)
         if ref is not None:
+            if not app.repo:
+                raise YardError(
+                    400,
+                    "bad_ref",
+                    f"ref is a branch of the repo, and {name} has no repo",
+                    context={"ref": ref, "name": name},
+                    help_text="An app with no repo has no branch.",
+                )
             ref = ref or "main"
             check_ref(ref)
             app.ref = ref
+        if app.repo and not app.ref:
+            app.ref = "main"
         if trigger is not None:
             app.trigger = check_trigger(trigger)
         if runs is not None:
@@ -331,7 +350,10 @@ class Store:
             )
 
     def _write(self, app: App) -> None:
-        text = f"repo {app.repo}\nref {app.ref}\ntrigger {app.trigger}\ncreated {app.created}\n"
+        text = f"repo {app.repo}\n"
+        if app.ref:
+            text += f"ref {app.ref}\n"
+        text += f"trigger {app.trigger}\ncreated {app.created}\n"
         if app.runs:
             text += f"runs {app.runs}\n"
         atomic_write(self._record(app.name), text)
@@ -376,7 +398,7 @@ def _read_app(name: str, text: str) -> App:
     return App(
         name,
         fields["repo"],
-        fields["ref"] or "main",
+        fields["ref"] or ("main" if fields["repo"] else ""),
         fields["trigger"] or "push",
         fields["created"],
         fields["runs"],

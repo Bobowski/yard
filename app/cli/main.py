@@ -411,17 +411,14 @@ def _cmd_app_new(args: argparse.Namespace) -> None:
         _fail(exc)
 
     session = _load(args)
-    body: dict[str, object] = {"name": name, "repo": repo, "ref": ref}
+    body: dict[str, object] = {"name": name, "repo": repo}
+    if not repo_less:
+        body["ref"] = ref
     if args.trigger:
         body["trigger"] = args.trigger
     if runs:
         body["runs"] = runs
     raw = _api(session, "POST", "/api/v1/apps", body)
-    # A repo app binds before its first deploy; a repo-less one binds after,
-    # once the deployed port is known.
-    if host and not repo_less:
-        port = args.port or 8000
-        _api(session, "PUT", f"/api/v1/binds/{quote(host, safe='')}", {"dial": f"{name}-app-1:{port}", "try": window})
     wrap = _object(raw)
     app = wrap.get("app") if isinstance(wrap, dict) else None
     if args.no_deploy:
@@ -432,16 +429,7 @@ def _cmd_app_new(args: argparse.Namespace) -> None:
             print(format_record(json.dumps(app)), end="")
         else:
             print(raw)
-        if host and repo_less:
-            if args.port:
-                _api(
-                    session,
-                    "PUT",
-                    f"/api/v1/binds/{quote(host, safe='')}",
-                    {"dial": f"{name}-app-1:{args.port}", "try": window},
-                )
-            else:
-                print(f"Bind it: yard bind set {host} {name}-app-1:PORT")
+        _maybe_bind(session, host, name, args.port or (0 if repo_less else 8000), window)
         print("Not deployed yet. Set its settings first if it needs any, then deploy:")
         print(f"  yard env set KEY=VALUE --app {name}")
         print(f"  yard app deploy --app {name}")
@@ -454,6 +442,9 @@ def _cmd_app_new(args: argparse.Namespace) -> None:
         print(f"Deploying {name} now…")
     code, text = _api_try(session, "POST", f"/api/v1/apps/{quote(name)}/deploy", {}, DEPLOY_TIMEOUT)
     if code >= 300:
+        if host:
+            # A repo app still binds so Caddy is ready after the fix.
+            _maybe_bind(session, host, name, args.port or (0 if repo_less else 8000), window)
         _die(f"{name} was created, but the first deploy failed.\n" + (text if _json else explain(text)))
     if _json:
         print(text)
@@ -464,17 +455,23 @@ def _cmd_app_new(args: argparse.Namespace) -> None:
         _print_deploy_note(note, name)
     else:
         print(text)
-    if host and repo_less and isinstance(note, dict):
-        port = args.port or int(note.get("port") or 0)
-        if port:
-            _api(
-                session,
-                "PUT",
-                f"/api/v1/binds/{quote(host, safe='')}",
-                {"dial": f"{name}-app-1:{port}", "try": window},
-            )
-        else:
-            print(f"Bind it: yard bind set {host} {name}-app-1:PORT")
+    port = args.port or int((note or {}).get("port") or 0) or (0 if repo_less else 8000)
+    _maybe_bind(session, host, name, port, window)
+
+
+def _maybe_bind(session, host: str, name: str, port: int, window: str) -> None:
+    """Bind the public host, or print the command when the port is not known."""
+    if not host:
+        return
+    if port:
+        _api(
+            session,
+            "PUT",
+            f"/api/v1/binds/{quote(host, safe='')}",
+            {"dial": f"{name}-app-1:{port}", "try": window},
+        )
+    else:
+        print(f"Bind it: yard bind set {host} {name}-app-1:PORT")
 
 
 def _cmd_app_set(args: argparse.Namespace) -> None:

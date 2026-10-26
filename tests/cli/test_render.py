@@ -204,7 +204,7 @@ def test_format_resource_tables():
             {"name": "docs", "repo": "org/app", "ref": "dev", "trigger": "manual"},
         ]
     )
-    assert apps.split("\n")[0].split() == ["app", "repo", "ref", "trigger"]
+    assert apps.split("\n")[0].split() == ["app", "source", "ref", "trigger"]
     assert "org/app" in apps
     assert "manual" in apps
 

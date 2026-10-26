@@ -281,7 +281,7 @@ def format_apps(rows: list, *, color: bool = False) -> str:
         source = str(row.get("repo") or row.get("runs") or "auto")
         ref = str(row.get("ref") or "") if row.get("repo") else ""
         body.append([str(row.get("name") or ""), source, ref, str(row.get("trigger") or "")])
-    return _render(["app", "repo", "ref", "trigger"], body, color=color)
+    return _render(["app", "source", "ref", "trigger"], body, color=color)
 
 
 def format_events(rows: list, *, color: bool = False) -> str:
