@@ -403,9 +403,9 @@ def _runs_text(record: dict) -> str:
     if not isinstance(deployed, dict):
         return f"{shown} (not deployed yet)"
     answer = str(deployed.get("runs") or "")
-    if str(deployed.get("template") or ""):
-        answer += f" @{deployed['template']}"
     text = shown if answer in ("", "auto", shown) else f"{shown} → {answer}"
+    if str(deployed.get("template") or ""):
+        text += f" @{deployed['template']}"
     inner = str(deployed.get("kind") or "")
     revision = str(deployed.get("revision") or "")
     if revision.startswith("sha256:"):
