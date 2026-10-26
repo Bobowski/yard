@@ -45,6 +45,7 @@ from app.shared import (
     atomic_write,
     check_app_name,
     check_domain,
+    check_env,
     check_repo,
     check_window,
     explain,
@@ -58,7 +59,6 @@ _no_color = False
 _json = False
 
 TIMEOUT = 30
-DEPLOY_TIMEOUT = 1800
 
 FORGE_HINT = "No forge is connected. Run yard forge setup origin or yard forge setup github."
 
@@ -410,6 +410,7 @@ def _cmd_app_new(args: argparse.Namespace) -> None:
     except YardError as exc:
         _fail(exc)
 
+    env = _new_app_env(args)
     session = _load(args)
     body: dict[str, object] = {"name": name, "repo": repo}
     if not repo_less:
@@ -419,6 +420,8 @@ def _cmd_app_new(args: argparse.Namespace) -> None:
     if runs:
         body["runs"] = runs
     raw = _api(session, "POST", "/api/v1/apps", body)
+    if env:
+        _api(session, "PUT", f"/api/v1/apps/{quote(name)}/env", env)
     wrap = _object(raw)
     app = wrap.get("app") if isinstance(wrap, dict) else None
     if args.no_deploy:
@@ -430,9 +433,7 @@ def _cmd_app_new(args: argparse.Namespace) -> None:
         else:
             print(raw)
         _maybe_bind(session, host, name, args.port or (0 if repo_less else 8000), window)
-        print("Not deployed yet. Set its settings first if it needs any, then deploy:")
-        print(f"  yard env set KEY=VALUE --app {name}")
-        print(f"  yard app deploy --app {name}")
+        print(f"Not deployed yet. Deploy it: yard app deploy --app {name}")
         return
     if not _json:
         if isinstance(app, dict):
@@ -440,23 +441,39 @@ def _cmd_app_new(args: argparse.Namespace) -> None:
         else:
             print(raw)
         print(f"Deploying {name} now…")
-    code, text = _api_try(session, "POST", f"/api/v1/apps/{quote(name)}/deploy", {}, DEPLOY_TIMEOUT)
+    code, text = _api_try(session, "POST", f"/api/v1/apps/{quote(name)}/deploy", {})
     if code >= 300:
         if host:
             # A repo app still binds so Caddy is ready after the fix.
             _maybe_bind(session, host, name, args.port or (0 if repo_less else 8000), window)
         _die(f"{name} was created, but the first deploy failed.\n" + (text if _json else explain(text)))
+    note = _follow_deploy(session, name)
     if _json:
-        print(text)
         return
-    wrap2 = _object(text)
-    note = wrap2.get("deploy") if isinstance(wrap2, dict) else None
-    if isinstance(note, dict):
+    if note:
         _print_deploy_note(note, name)
-    else:
-        print(text)
     port = args.port or int((note or {}).get("port") or 0) or (0 if repo_less else 8000)
     _maybe_bind(session, host, name, port, window)
+
+
+def _new_app_env(args: argparse.Namespace) -> dict[str, str]:
+    """The env for `app new`: --env-file, then -e pairs, then --edit-env on top."""
+    env: dict[str, str] = {}
+    try:
+        if args.env_file:
+            env.update(parse_env(Path(args.env_file).read_text()))
+        for pair in args.env or []:
+            env.update(parse_env(pair))
+        if args.edit_env:
+            if not sys.stdin.isatty():
+                _die("--edit-env needs a terminal. Use -e KEY=VALUE or --env-file PATH instead.")
+            env = parse_env(_edit_text(format_env(env)))
+    except OSError as exc:
+        _die(f"cannot read {args.env_file}: {exc.strerror or exc}")
+    except YardError as exc:
+        _fail(exc)
+    check_env(env)
+    return env
 
 
 def _maybe_bind(session, host: str, name: str, port: int, window: str) -> None:
@@ -541,6 +558,22 @@ def _cmd_logs(args: argparse.Namespace) -> None:
 def _cmd_app_logs(args: argparse.Namespace) -> None:
     session = _load(args)
     name = _app_name(session, args)
+    if args.deploy and not args.container:
+        code, text = _api_try(session, "GET", f"/api/v1/apps/{quote(name)}/deploy", None)
+        if code == 200:
+            if args.follow:
+                _follow_deploy(session, name)
+            elif _json:
+                print(text)
+            else:
+                wrap = _object(text)
+                job = wrap.get("deploy") if isinstance(wrap, dict) else None
+                for line in (job or {}).get("lines") or []:
+                    print(line)
+            return
+        if code != 404:
+            _die(text if _json else explain(text))
+        # No job since Yard started: the journald container still holds the last deploy.
     container = args.container or (f"deploy-{name}" if args.deploy else f"{name}-app-1")
     _logs(session, container, args)
 
@@ -588,19 +621,55 @@ def _cmd_events(args: argparse.Namespace) -> None:
     print(format_events(rows, color=_color_on()), end="")
 
 
+def _follow_deploy(session: Client, name: str) -> dict:
+    """Print the deploy log live; return the final deploy object."""
+    path = f"/api/v1/apps/{quote(name)}/deploy?follow=1"
+    request = _request(session, "GET", path, None)
+    try:
+        response = urllib.request.urlopen(request)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode().strip()
+        _die(raw if _json else explain(raw))
+    except TimeoutError:
+        _die(_unreachable(session, "no answer", "GET", path))
+    except urllib.error.URLError as exc:
+        _die(_unreachable(session, str(exc.reason), "GET", path))
+    final: dict = {}
+    with response:
+        try:
+            for raw in response:
+                if _json:
+                    sys.stdout.buffer.write(raw)
+                    sys.stdout.buffer.flush()
+                row = _object(raw.decode())
+                if not isinstance(row, dict):
+                    continue
+                if "line" in row:
+                    if not _json:
+                        print(row["line"])
+                elif isinstance(row.get("deploy"), dict):
+                    final = row["deploy"]
+        except KeyboardInterrupt:
+            print(f"The deploy continues on the host. Follow it: yard app logs --deploy -f --app {name}")
+            sys.exit(130)
+    return final
+
+
 def _cmd_app_deploy(args: argparse.Namespace) -> None:
     session = _load(args)
     name = _app_name(session, args)
-    raw = _api(session, "POST", f"/api/v1/apps/{quote(name)}/deploy", {}, DEPLOY_TIMEOUT)
+    _api(session, "POST", f"/api/v1/apps/{quote(name)}/deploy", {})
+    if not _json:
+        print(f"Deploying {name} now…")
+    note = _follow_deploy(session, name)
     if _json:
-        print(raw)
         return
-    wrap = _object(raw)
-    note = wrap.get("deploy") if isinstance(wrap, dict) else None
-    if not isinstance(note, dict):
-        print(raw)
+    if note.get("status") == "pending":
+        print("Yard restarts itself. Check: yard app status --app yard")
         return
     _print_deploy_note(note, name)
+    if note.get("status") == "failed":
+        sys.exit(1)
 
 
 def _cmd_app_rm(args: argparse.Namespace) -> None:
@@ -1363,6 +1432,9 @@ def _app_parser(subs: argparse._SubParsersAction, common: argparse.ArgumentParse
     new.add_argument("--public", metavar="HOST", default="", help="a name on the public internet")
     new.add_argument("--try", dest="window", default=None, help="how long caddy waits for the upstream")
     new.add_argument("--no-deploy", action="store_true", help="create the app without a first deploy")
+    new.add_argument("-e", "--env", action="append", default=[], metavar="KEY=VALUE", help="a setting the app reads")
+    new.add_argument("--env-file", metavar="PATH", default="", help="a dotenv file of settings")
+    new.add_argument("--edit-env", action="store_true", help="edit the settings in $EDITOR first")
     new.add_argument(
         "--runs", default="", help="auto, a path in the repo, yard:<template>, an image name:tag, or an https URL"
     )

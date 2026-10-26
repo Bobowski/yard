@@ -3,17 +3,18 @@
 import asyncio
 import hashlib
 import logging
+import secrets
 import shutil
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from app.server import binds, compose, detect, git, journal, podman, sources
 from app.server.detect import Plan
 from app.server.forges import Forge
 from app.server.store import App, Config, Deployed, read_deployed, write_deployed
-from app.server.yard import Tip, Yard
+from app.server.yard import Job, Tip, Yard
 from app.shared import YardError, atomic_write, clone_url, ensure_file, now, parse_runs
 
 log = logging.getLogger("yard")
@@ -238,32 +239,78 @@ class Outcome:
     port: int = 0
 
 
+def start_deploy(yard: Yard, name: str, *, cause: str = "manual", actor: str = "") -> Job:
+    """The running job for the app, or a new deploy spawned in the background."""
+    running = yard.deploys.get(name)
+    if running is not None and running.status == "running":
+        return running
+    job = _new_job(yard, name, cause, actor)
+    yard.spawn(_finish(yard, job))
+    return job
+
+
+def _new_job(yard: Yard, name: str, cause: str, actor: str) -> Job:
+    job = Job(
+        id=secrets.token_hex(4),
+        app=name,
+        cause=cause,
+        actor=actor,
+        started=now(),
+    )
+    yard.deploys[name] = job
+    return job
+
+
 async def deploy(yard: Yard, name: str, *, cause: str = "manual", actor: str = "") -> Outcome:
     """One deploy path: resolve what the source says, then run compose up.
 
     A repo deploys its ref tip; an image pins a digest; a URL fetches a compose
     file. The deployed file is written only after an ok deploy.
     """
+    return await _finish(yard, _new_job(yard, name, cause, actor))
+
+
+async def _finish(yard: Yard, job: Job) -> Outcome:
+    try:
+        outcome = await _deploy_body(yard, job)
+    except Exception as exc:
+        outcome = Outcome("failed", error=str(exc), log=f"{exc}\n")
+        job.push(f"!! {exc}")
+    job.status = outcome.status
+    job.ended = now()
+    job.outcome = asdict(outcome)
+    job.changed.set()
+    return outcome
+
+
+async def _deploy_body(yard: Yard, job: Job) -> Outcome:
+    name = job.app
     async with yard.lock(name):
         try:
             app = yard.store.app(name)
         except YardError as exc:
+            job.push(f"!! {exc}")
             return Outcome("failed", error=str(exc))
         if yard.skip_deploy:
-            return Outcome("skipped", log="YARD_SKIP_DEPLOY is set. Deploy did not run.\n")
+            line = "YARD_SKIP_DEPLOY is set. Deploy did not run."
+            job.push(line)
+            return Outcome("skipped", log=line + "\n")
         if app.repo:
-            return await _deploy_repo(yard, app, cause=cause, actor=actor)
+            job.push(f"== sync {app.repo} {app.ref}")
+            return await _deploy_repo(yard, app, job, cause=job.cause, actor=job.actor)
         kind, _value = parse_runs(app.runs)
         if kind not in ("image", "url"):
+            job.push(f"!! app {name} has no repo")
             return Outcome(
                 "failed",
                 error=f"app {name} has no repo",
                 log="Set the repo: yard app set --repo https://<host>/<owner>/<name>\n",
             )
-        return await _deploy_source(yard, app, kind, cause=cause, actor=actor)
+        job.push(f"== pull {app.runs}" if kind == "image" else f"== fetch {app.runs}")
+        return await _deploy_source(yard, app, kind, job, cause=job.cause, actor=job.actor)
 
 
-async def _deploy_repo(yard: Yard, app: App, *, cause: str, actor: str) -> Outcome:
+async def _deploy_repo(yard: Yard, app: App, job: Job, *, cause: str, actor: str) -> Outcome:
     """Sync the clone to the ref tip, resolve the plan, run the apply."""
     try:
         forge = yard.forge(app.repo)
@@ -284,9 +331,10 @@ async def _deploy_repo(yard: Yard, app: App, *, cause: str, actor: str) -> Outco
         _set_tried(yard, app.name, head, _template_at(yard.config.clone(app.name), app))
         plan = _plan(yard, app, head)
         _set_tried(yard, app.name, head, plan.template)
-        outcome = await _apply(yard, app, plan, head, cause=cause, actor=actor)
+        outcome = await _apply(yard, app, plan, head, job, cause=cause, actor=actor)
     except YardError as exc:
         # A sync or plan failure never reaches apply; deploy.end alone is the record.
+        job.push(f"!! {exc}")
         outcome = Outcome("failed", error=str(exc), log=f"{exc}\n")
     _deploy_end(yard, app, head, outcome)
     yard.spawn(_report_outcome(yard, app, forge, head, outcome, pending))
@@ -323,7 +371,7 @@ def _key(answer: str) -> str:
     return "template" if answer.startswith("yard:") else answer
 
 
-async def _deploy_source(yard: Yard, app: App, kind: str, *, cause: str, actor: str) -> Outcome:
+async def _deploy_source(yard: Yard, app: App, kind: str, job: Job, *, cause: str, actor: str) -> Outcome:
     """A repo-less deploy: pin an image by digest, or fetch a compose file over https."""
     config = yard.config
     try:
@@ -353,6 +401,7 @@ async def _deploy_source(yard: Yard, app: App, kind: str, *, cause: str, actor: 
             _set_tried(yard, app.name, revision, "")
             _write_copy(config, app.name, revision, body)
     except YardError as exc:
+        job.push(f"!! {exc}")
         return Outcome("failed", error=str(exc), log=f"{exc}\n")
     _set_tried(yard, app.name, revision, "")
     journal.send(
@@ -377,7 +426,7 @@ async def _deploy_source(yard: Yard, app: App, kind: str, *, cause: str, actor: 
         previous_copy = config.app_dir(app.name) / "compose" / f"{previous_deployed.revision[7:19]}.yml"
         if previous_copy.is_file():
             project.env["PREVIOUS_COMPOSE_FILE"] = str(previous_copy)
-    code, text = await compose.apply(config, app.name, "up", project)
+    code, text = await compose.apply(config, app.name, "up", project, on_line=job.push)
     log_text = text if text.endswith("\n") or not text else text + "\n"
     if code == 3:
         outcome = Outcome("reverted", image, log_text, f"unhealthy; reverted to {previous}", previous)
@@ -493,7 +542,7 @@ def _deploy_end(yard: Yard, app: App, sha: str, outcome: Outcome) -> None:
     )
 
 
-async def _apply(yard: Yard, app: App, plan: Plan, sha: str, *, cause: str, actor: str) -> Outcome:
+async def _apply(yard: Yard, app: App, plan: Plan, sha: str, job: Job, *, cause: str, actor: str) -> Outcome:
     """The compose check, then one apply container for the rest."""
     image = compose.image_tag(app.name, sha, plan.template)
     config = yard.config
@@ -504,6 +553,7 @@ async def _apply(yard: Yard, app: App, plan: Plan, sha: str, *, cause: str, acto
     try:
         project = compose.project(config, app, plan.kind, plan.answer, sha, image, checkout, dockerfile)
     except Exception as exc:
+        job.push(f"!! {exc}")
         return Outcome("failed", image, f"{exc}\n", str(exc))
 
     journal.send(
@@ -535,11 +585,13 @@ async def _apply(yard: Yard, app: App, plan: Plan, sha: str, *, cause: str, acto
         "up",
         project,
         detach=app.name == "yard",
+        on_line=job.push,
     )
     log_text = text if text.endswith("\n") or not text else text + "\n"
-    line = f"== runs {plan.answer} ({plan.kind}" + (f"; {plan.reason}" if plan.reason else "") + ")\n"
-    log_text = line + log_text
-    log_text, missing_env = _env_hint(yard, app, log_text)
+    line = f"== runs {plan.answer} ({plan.kind}" + (f"; {plan.reason}" if plan.reason else "") + ")"
+    job.push(line)
+    log_text = line + "\n" + log_text
+    log_text, missing_env = _env_hint(yard, app, log_text, job)
     if app.name == "yard":
         # Upgrading yard replaces this process, so that apply run is detached.
         return Outcome("pending", image, log_text, previous=previous, missing_env=missing_env)
@@ -557,7 +609,7 @@ async def _apply(yard: Yard, app: App, plan: Plan, sha: str, *, cause: str, acto
     )
 
 
-def _env_hint(yard: Yard, app: App, log: str) -> tuple[str, str]:
+def _env_hint(yard: Yard, app: App, log: str, job: Job | None = None) -> tuple[str, str]:
     """A deploy-log hint when the app's code reads env keys that its env file does not set."""
     try:
         env = yard.store.read_env(app.name)
@@ -569,13 +621,17 @@ def _env_hint(yard: Yard, app: App, log: str) -> tuple[str, str]:
     width = max(len(s.key) for s in missing)
     rows = "".join(f"  {s.key:<{width}}  {s.where}\n" for s in missing)
     keys = " ".join(f"{s.key}=\u2026" for s in missing)
-    log += (
+    hint = (
         f"hint: {app.name} reads settings that its env does not set:\n"
         f"{rows}"
         f"Set them: yard env set --app {app.name} {keys}\n"
         f"Or edit the env: yard env edit --app {app.name}\n"
         f"Then deploy: yard app deploy --app {app.name}\n"
     )
+    if job is not None:
+        for text in hint.splitlines():
+            job.push(text)
+    log += hint
     return log, ",".join(s.key for s in missing)
 
 

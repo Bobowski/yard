@@ -358,3 +358,23 @@ def test_the_runs_line_renders_all_kinds():
 
     fresh = {"runs": ""}
     assert "runs  auto (not deployed yet)" in format_record(json.dumps(fresh))
+
+
+def test_status_bind_column_is_compact():
+    row = {
+        "container": "heldso-app-1",
+        "state": "running",
+        "started": "2026-10-05T10:00:00Z",
+        "health": "healthy",
+        "binds": [
+            {"host": "heldso.example.com", "dial": "heldso-app-1:8000"},
+            {"host": "www.heldso.example.com", "dial": "heldso-app-1"},
+            {"host": "api.heldso.example.com", "dial": "heldso-app-1:3000"},
+            {"host": "other.example.com", "dial": "other-app-1:9000"},
+        ],
+    }
+    text = format_status({"rows": [row]}, NOW)
+    bind = text.splitlines()[1]
+    assert "heldso.example.com, www.heldso.example.com" in bind
+    assert "api.heldso.example.com → :3000" in bind
+    assert "other.example.com → other-app-1:9000" in bind

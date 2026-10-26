@@ -49,8 +49,11 @@ class _Apply:
         self.code = code
         self.text = text
 
-    async def __call__(self, config, app, command, project, *, detach=False) -> tuple[int, str]:
+    async def __call__(self, config, app, command, project, *, detach=False, on_line=None) -> tuple[int, str]:
         self.calls.append({"command": command, "app": app, "project": project, "detach": detach})
+        if on_line is not None:
+            for line in self.text.splitlines():
+                on_line(line)
         return self.code, self.text
 
 
@@ -1169,3 +1172,42 @@ async def test_check_url_containerfile_is_not_retried(tmp_path: Path, monkeypatc
     assert tried[0].startswith("sha256:")
     await apps.check_all(yard)
     assert yard.tips["umami"].tried == tried  # no new deploy attempt
+
+
+async def test_a_deploy_writes_a_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard, _recorder = _deploy_yard(tmp_path, monkeypatch)
+    outcome = await apps.deploy(yard, "heldso")
+    job = yard.deploys["heldso"]
+    assert outcome.status == "ok"
+    assert job.status == "ok" and job.ended and job.outcome is not None
+    assert job.outcome["status"] == "ok"
+    assert job.lines[0] == "== sync https://origin.cursor.com/org/app main"
+    assert any(line.startswith("== runs ") for line in job.lines)
+    assert job.lines[-1].startswith(("== ", "hint:", "  ", "Set ", "Or ", "Then "))
+    assert job.id and job.cause == "manual"
+
+
+async def test_start_deploy_returns_the_running_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard, _recorder = _deploy_yard(tmp_path, monkeypatch)
+    gate = asyncio.Event()
+
+    async def slow(*a, **kw):
+        gate.set()
+        await asyncio.sleep(0.05)
+        return (0, "== done\n")
+
+    monkeypatch.setattr(compose, "apply", slow)
+    job = apps.start_deploy(yard, "heldso")
+    assert job.status == "running"
+    await gate.wait()
+    assert apps.start_deploy(yard, "heldso").id == job.id
+    await asyncio.sleep(0.1)
+    assert job.status == "ok"
+
+
+async def test_apply_lines_reach_the_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard, _recorder = _deploy_yard(tmp_path, monkeypatch)
+    await apps.deploy(yard, "heldso")
+    lines = yard.deploys["heldso"].lines
+    assert "== build localhost/heldso:abc" in lines
+    assert lines.index("== build localhost/heldso:abc") < lines.index("== started localhost/heldso:abc")

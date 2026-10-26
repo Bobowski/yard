@@ -2,6 +2,7 @@ import asyncio
 import os
 import re
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -193,7 +194,7 @@ def test_apply_runs_one_podman_container(tmp_path: Path, monkeypatch: pytest.Mon
     monkeypatch.delenv("CONTAINER_HOST", raising=False)
     calls: list[tuple[list[str], dict[str, str]]] = []
 
-    async def fake_run(argv, env):
+    async def fake_run(argv, env, on_line=None):
         calls.append((list(argv), dict(env)))
         return 0, "== build\n"
 
@@ -290,7 +291,7 @@ def test_install_sh_and_apply_pass_the_same_env_names(tmp_path: Path, monkeypatc
     monkeypatch.delenv("CONTAINER_HOST", raising=False)
     calls: list[tuple[list[str], dict[str, str]]] = []
 
-    async def fake_run(argv, env):
+    async def fake_run(argv, env, on_line=None):
         calls.append((list(argv), dict(env)))
         return 0, ""
 
@@ -339,3 +340,11 @@ def test_the_apply_files_meet_the_contract():
 def test_image_tag():
     assert image_tag("mono", "abc1234def") == "localhost/mono:abc1234def"
     assert image_tag("yard", "abc", "3f9a1c2e") == "localhost/yard:abc-3f9a1c2e"
+
+
+async def test_run_calls_on_line_in_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    lines = []
+    script = tmp_path / "fake.py"
+    script.write_text("import sys\nprint('one')\nprint('two')\nsys.exit(0)\n")
+    code, text = await compose._run([sys.executable, str(script)], {}, lines.append)
+    assert code == 0 and lines == ["one", "two"] and "one" in text

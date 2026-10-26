@@ -1,5 +1,6 @@
 """The public HTTP API. The forge webhooks sit beside it and skip auth. Only this file writes JSON shapes."""
 
+import asyncio
 import re
 from dataclasses import asdict
 from typing import Any, cast
@@ -12,7 +13,7 @@ from stario.json import JsonValue
 from app.server import apps, binds, doctor, journal, status
 from app.server.forges import Forge, GitHub, Origin
 from app.server.store import App, Config, Deployed, Store, read_deployed
-from app.server.yard import Yard
+from app.server.yard import Job, Yard
 from app.shared import YardError, now
 
 HEALTH = Route("GET /health")
@@ -30,6 +31,7 @@ APP = Route("GET /api/v1/apps/{name}")
 APP_PATCH = Route("PATCH /api/v1/apps/{name}")
 APP_DELETE = Route("DELETE /api/v1/apps/{name}")
 APP_DEPLOY = Route("POST /api/v1/apps/{name}/deploy")
+APP_DEPLOY_GET = Route("GET /api/v1/apps/{name}/deploy")
 APP_FILE = Route("GET /api/v1/apps/{name}/files/{which}")
 ENV = Route("GET /api/v1/apps/{name}/env")
 ENV_PATCH = Route("PATCH /api/v1/apps/{name}/env")
@@ -92,9 +94,10 @@ def bind_json(bind: binds.Bind) -> dict[str, str]:
     return {"host": bind.host, "dial": bind.dial, "id": bind.id, "try": bind.window, "state": bind.state}
 
 
-def page_json(page: status.Page, deployed: Deployed | None = None) -> dict[str, Any]:
+def page_json(page: status.Page, deployed: Deployed | None = None, job: Job | None = None) -> dict[str, Any]:
     return {
         "app": app_json(page.app, deployed),
+        "job": _job_json(job) if job else None,
         "image": page.image,
         "sha": page.sha,
         "env_file": page.env_file,
@@ -415,7 +418,8 @@ def apps_create(yard: Yard) -> Handler:
 def app_page(yard: Yard) -> Handler:
     async def handler(c: Context, w: Writer) -> None:
         page = await status.app_report(yard, c.match.params["name"])
-        w.json(cast(JsonValue, page_json(page, read_deployed(yard.config, page.app.name))))
+        deployed = read_deployed(yard.config, page.app.name)
+        w.json(cast(JsonValue, page_json(page, deployed, yard.deploys.get(page.app.name))))
 
     return handler
 
@@ -468,29 +472,72 @@ def app_deploy(yard: Yard) -> Handler:
                     " or yard app set --runs IMAGE:OLDER-TAG, or an older URL."
                 ),
             )
-        outcome = await apps.deploy(
-            yard,
-            name,
-            cause="manual",
-            actor=_actor(c),
-        )
-        if outcome.status == "failed":
+        for key in data:
             raise YardError(
-                500,
-                "deploy_failed",
-                outcome.log.strip() or outcome.error or "deploy failed",
-                context={"app": name},
-                help_text=f"Read the full log: yard app logs --deploy --app {name}",
+                400,
+                "unknown_field",
+                f"unknown field {key}",
+                help_text="A deploy request takes an empty body.",
             )
-        w.json(
-            cast(
-                JsonValue,
-                {
-                    "app": app_json(yard.store.app(name), read_deployed(yard.config, name)),
-                    "deploy": asdict(outcome),
-                },
-            ),
-        )
+        job = apps.start_deploy(yard, name, cause="manual", actor=_actor(c))
+        w.json(cast(JsonValue, {"deploy": _job_json(job)}), status=202)
+
+    return handler
+
+
+def _job_json(job: Job) -> dict[str, Any]:
+    outcome = job.outcome or {}
+    return {
+        "id": job.id,
+        "app": job.app,
+        "status": job.status,
+        "cause": job.cause,
+        "actor": job.actor,
+        "started": job.started,
+        "ended": job.ended,
+        "image": outcome.get("image", ""),
+        "error": outcome.get("error", ""),
+        "previous": outcome.get("previous", ""),
+        "missing_env": outcome.get("missing_env", ""),
+        "port": outcome.get("port", 0),
+    }
+
+
+def app_deploy_get(yard: Yard) -> Handler:
+    async def handler(c: Context, w: Writer) -> None:
+        name = c.match.params["name"]
+        yard.store.app(name)
+        job = yard.deploys.get(name)
+        if job is None:
+            raise YardError(
+                404,
+                "not_found",
+                "no deploy since Yard started",
+                context={"app": name},
+                help_text=f"yard app logs --deploy --app {name}",
+            )
+        if c.req.query.get("follow") != "1":
+            body = _job_json(job)
+            body["lines"] = job.lines
+            w.json(cast(JsonValue, {"deploy": body}))
+            return
+        w.headers.set("content-type", "application/x-ndjson")
+        w.write_headers(200)
+        seen = 0
+        while not c.disconnected:
+            for line in job.lines[seen:]:
+                w.write(json.dumps({"line": line}).encode() + b"\n")
+            seen = len(job.lines)
+            if job.status != "running" and seen == len(job.lines):
+                break
+            await w.drain()
+            try:
+                await asyncio.wait_for(job.changed.wait(), 15)
+            except TimeoutError:
+                pass
+        w.write(json.dumps({"deploy": _job_json(job)}).encode() + b"\n")
+        await w.drain()
+        w.end()
 
     return handler
 
@@ -953,6 +1000,7 @@ def register(app: StarioApp, yard: Yard) -> None:
     app.add(APP_PATCH, app_patch(yard), middleware=auth)
     app.add(APP_DELETE, app_delete(yard), middleware=auth)
     app.add(APP_DEPLOY, app_deploy(yard), middleware=auth)
+    app.add(APP_DEPLOY_GET, app_deploy_get(yard), middleware=auth)
     app.add(APP_FILE, app_file(yard), middleware=auth)
     app.add(ENV, env_show(yard.store), middleware=auth)
     app.add(ENV_PATCH, env_patch(yard.store, yard.config), middleware=auth)

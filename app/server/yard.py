@@ -2,7 +2,7 @@
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
@@ -14,6 +14,28 @@ from app.shared import YardError
 
 if TYPE_CHECKING:
     from stario import App as StarioApp
+
+
+@dataclass(slots=True)
+class Job:
+    """One deploy, memory only. `lines` is the live log; `changed` wakes followers."""
+
+    id: str
+    app: str
+    cause: str
+    actor: str
+    started: str
+    status: str = "running"
+    ended: str = ""
+    outcome: dict | None = None
+    lines: list[str] = field(default_factory=list)
+    changed: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def push(self, line: str) -> None:
+        self.lines.append(line)
+        del self.lines[:-5000]
+        self.changed.set()
+        self.changed.clear()
 
 
 @dataclass(slots=True)
@@ -43,6 +65,7 @@ class Yard:
         }
         self.skip_deploy = config.skip_deploy
         self.tips: dict[str, Tip] = {}
+        self.deploys: dict[str, Job] = {}
         self.locks: dict[str, asyncio.Lock] = {}
         self.checked: dict[str, float] = {}
         self.queued: dict[str, Callable[[], Awaitable[None]]] = {}
