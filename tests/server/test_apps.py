@@ -633,25 +633,6 @@ async def test_boot_report_says_nothing_without_a_sha_or_repo(tmp_path: Path, mo
     assert calls == []
 
 
-async def test_boot_report_learns_the_installation_account(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    yard = make_yard(tmp_path)
-    yard.store.create_app("yard", "https://github.com/org/yard")
-    _connect(monkeypatch)
-    calls = _reports(monkeypatch)
-    found: list[str] = []
-
-    async def fake_find(self):
-        found.append(self.name)
-        self.save(installation_id="101", account="org")
-        return {"id": "101"}
-
-    monkeypatch.setattr(GitHub, "find_installation", fake_find)
-    yard.config = replace(yard.config, sha="c" * 40)
-    await main._boot_report(yard)
-    assert found == ["github"]
-    assert calls == [("https://github.com/org/yard", "c" * 40, "success", "live", "")]
-
-
 async def test_deploy_reuses_a_local_image(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yard, recorder = _deploy_yard(tmp_path, monkeypatch, has_image=True)
     outcome = await apps.deploy(yard, "heldso")

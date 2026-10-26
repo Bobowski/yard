@@ -131,10 +131,6 @@ ensure_dir "$root/apps/yard/caddy/data"
 ensure_dir "$root/apps/yard/caddy/run"
 install -d -o yard -g yard -m 700 "$root/apps/yard"
 
-if systemctl list-unit-files caddy.service >/dev/null 2>&1; then
-  systemctl disable --now caddy.service >/dev/null 2>&1 || true
-fi
-
 install -d /etc/yard
 cat > /etc/yard/proxy.nft <<EOF
 table inet yard {
@@ -239,30 +235,6 @@ release_port() {
   if [ -z "$holders" ]; then
     return 0
   fi
-  if printf '%s\n' "$holders" | grep -q yardd; then
-    pid="$(printf '%s\n' "$holders" | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -n 1)"
-    owner="$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
-    if [ -z "$owner" ]; then
-      die "Port ${public_port} is held by yardd, and the owner could not be read." \
-        "The Yard container publishes 127.0.0.1:${public_port}." \
-        "Hint: ss -ltnp sport = :${public_port}" \
-        "Context: ${holders}"
-    fi
-    systemctl --user --machine "${owner}@" disable --now yardd.service || die "Could not stop yardd for user ${owner}." \
-      "That service holds 127.0.0.1:${public_port}, so the Yard container cannot bind it." \
-      "Hint: systemctl --user --machine ${owner}@ disable --now yardd.service" \
-      "Context: ${holders}"
-    try=0
-    while ss -H -ltn "sport = :${public_port}" 2>/dev/null | grep -q .; do
-      try=$((try + 1))
-      [ "$try" -le 15 ] || die "Port ${public_port} is still in use after yardd stopped." \
-        "The Yard container publishes 127.0.0.1:${public_port}." \
-        "Hint: ss -ltnp sport = :${public_port}" \
-        "Context: yardd was stopped for user ${owner}."
-      sleep 1
-    done
-    return 0
-  fi
   if run_yard podman container exists yard-app-1 >/dev/null 2>&1; then
     return 0
   fi
@@ -312,17 +284,6 @@ if [ "$(cat /home/yard/.config/containers/containers.conf 2>/dev/null)" != "$con
   run_yard systemctl --user restart podman.socket
 fi
 
-# The 0.6.0 script pinned podman.service to a static build with this drop-in.
-# Remove it where a host still carries it; the packaged unit runs /usr/bin/podman.
-dropin_file="/home/yard/.config/systemd/user/podman.service.d/podman-static.conf"
-if [ -f "$dropin_file" ]; then
-  rm -f "$dropin_file"
-  rmdir /home/yard/.config/systemd/user/podman.service.d 2>/dev/null || true
-  run_yard systemctl --user daemon-reload
-  run_yard systemctl --user stop podman.service >/dev/null 2>&1 || true
-  run_yard systemctl --user restart podman.socket
-fi
-
 run_yard systemctl --user enable --now podman.socket
 run_yard systemctl --user enable podman-restart.service || die "Could not enable podman-restart.service." \
   "Containers marked for restart would not come back after a reboot." \
@@ -352,12 +313,6 @@ if ! run_yard podman network exists yard >/dev/null 2>&1; then
 fi
 
 release_port
-
-if [ -f /etc/systemd/system/yard-tailscale.service ]; then
-  systemctl disable --now yard-tailscale.service >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/yard-tailscale.service
-  systemctl daemon-reload
-fi
 
 # The Yard clone and the image build stay in shell; Python does the first deploy.
 # An existing clone is left as it is; the running Yard owns it from then on.

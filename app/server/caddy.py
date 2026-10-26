@@ -1,7 +1,6 @@
 """The Caddy admin API on its unix socket: one JSON request per bind change."""
 
 import asyncio
-import copy
 import http.client
 import re
 import socket as socketlib
@@ -11,10 +10,7 @@ from stario import json
 
 from app.shared import APP_PORT, YardError
 
-HTTP_PATH = "/config/apps/http"
 ROUTES_PATH = "/config/apps/http/servers/yard/routes"
-LISTEN_PORT = 443
-PROTOCOLS = ["h1", "h2", "h3"]
 _DIAL_HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 _TIMEOUT = 10
 
@@ -63,23 +59,6 @@ def _round_trip(socket: Path, method: str, path: str, body: bytes | None) -> tup
 
 def route_id(host: str) -> str:
     return f"yard-{host}"
-
-
-def converge_http(http: dict[str, object]) -> dict[str, object]:
-    """The http app on a copy: listen :443 with h1/h2/h3. Everything else stays."""
-    converged = copy.deepcopy(http)
-    converged["https_port"] = LISTEN_PORT
-    servers = converged.get("servers")
-    if not isinstance(servers, dict):
-        servers = {}
-        converged["servers"] = servers
-    yard = servers.get("yard")
-    if not isinstance(yard, dict):
-        yard = {}
-        servers["yard"] = yard
-    yard["listen"] = [f":{LISTEN_PORT}"]
-    yard["protocols"] = list(PROTOCOLS)
-    return converged
 
 
 def normalize_dial(text: str) -> str:
@@ -145,22 +124,6 @@ def read_routes(raw: bytes | str) -> list[dict[str, str]]:
             }
         )
     return found
-
-
-def find_route(raw: bytes | str, host: str) -> tuple[int, str] | None:
-    """The index of this host in the routes array, and its stored id."""
-    text = raw.decode() if isinstance(raw, bytes) else raw
-    try:
-        rows = json.loads(text or "[]")
-    except ValueError:
-        return None
-    if not isinstance(rows, list):
-        return None
-    for index, row in enumerate(rows):
-        if isinstance(row, dict) and _match_host(row) == host:
-            ident = row.get("@id")
-            return index, ident if isinstance(ident, str) else ""
-    return None
 
 
 def _match_host(row: dict[str, object]) -> str:

@@ -9,17 +9,12 @@ from typing import cast
 import pytest
 
 from app.server.caddy import (
-    HTTP_PATH,
     Caddy,
-    converge_http,
-    find_route,
     normalize_dial,
     proxy_route,
     read_routes,
 )
-from app.server.main import _caddy_server
 from app.shared import YardError, check_window
-from tests.server.conftest import make_yard
 
 OPS = Path(__file__).resolve().parents[2] / "ops"
 
@@ -28,7 +23,6 @@ class _Admin(socketserver.UnixStreamServer):
     """A fake Caddy admin API on a unix socket. `routes` is the live array."""
 
     routes: list = []
-    http: dict = {}
     calls: list = []
 
 
@@ -50,8 +44,6 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/config/apps/http/servers/yard/routes":
             self._reply(200, json.dumps(self._admin.routes).encode())
-        elif self.path == HTTP_PATH:
-            self._reply(200, json.dumps(self._admin.http).encode())
         elif self.path == "/config/":
             self._reply(200, b"{}")
         else:
@@ -77,12 +69,11 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
 
-def _serve(routes: list, http: dict | None = None):
+def _serve(routes: list):
     # AF_UNIX paths cap at ~104 characters. pytest's tmp_path is deeper than that.
     sock = Path(tempfile.mkdtemp(prefix="yd-")) / "s.sock"
     server = _Admin(str(sock), _Handler)
     server.routes = routes
-    server.http = http if http is not None else {}
     server.calls = []
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -193,65 +184,13 @@ def test_proxy_route_keeps_one_id():
     assert proxy["upstreams"] == [{"dial": "heldso:8000"}]
 
 
-def test_find_route_uses_the_array_index():
+def test_read_routes_marks_a_route_without_an_id():
     raw = json.dumps(
         [
             {"match": [{"host": ["other.example.com"]}]},
             {"@id": "yard-heldso.example.com", "match": [{"host": ["heldso.example.com"]}], "handle": []},
         ]
     )
-    assert find_route(raw, "heldso.example.com") == (1, "yard-heldso.example.com")
-    assert find_route(raw, "other.example.com") == (0, "")
-    assert find_route(raw, "missing.example.com") is None
-    assert read_routes(raw)[0]["id"] == ""
-
-
-OLD_HTTP: dict[str, object] = {
-    "https_port": 8443,
-    "servers": {
-        "yard": {
-            "automatic_https": {"disable_redirects": True},
-            "listen": [":8443"],
-            "protocols": ["h1", "h2"],
-            "routes": [proxy_route("heldso.example.com", "heldso:8000")],
-        }
-    },
-}
-
-
-def test_converge_http_rewrites_only_the_listener():
-    original = json.loads(json.dumps(OLD_HTTP))
-    converged = converge_http(OLD_HTTP)
-    assert OLD_HTTP == original
-    assert converged["https_port"] == 443
-    yard = cast(dict, cast(dict, converged["servers"])["yard"])
-    assert yard["listen"] == [":443"]
-    assert yard["protocols"] == ["h1", "h2", "h3"]
-    assert yard["routes"] == original["servers"]["yard"]["routes"]
-    assert yard["automatic_https"] == {"disable_redirects": True}
-    assert converge_http(converged) == converged
-    assert cast(dict, cast(dict, converge_http({})["servers"])["yard"])["listen"] == [":443"]
-
-
-async def test_caddy_server_converges_an_old_autosave(tmp_path: Path):
-    client, server = _serve([], http=OLD_HTTP)
-    yard = make_yard(tmp_path)
-    yard.caddy = client
-    socket = yard.config.caddy_socket
-    socket.parent.mkdir(parents=True)
-    socket.touch()
-    await _caddy_server(yard)
-    assert server.calls == [("PATCH", HTTP_PATH, converge_http(OLD_HTTP))]
-    server.shutdown()
-
-
-async def test_caddy_server_skips_a_converged_config(tmp_path: Path):
-    client, server = _serve([], http=converge_http(OLD_HTTP))
-    yard = make_yard(tmp_path)
-    yard.caddy = client
-    socket = yard.config.caddy_socket
-    socket.parent.mkdir(parents=True)
-    socket.touch()
-    await _caddy_server(yard)
-    assert server.calls == []
-    server.shutdown()
+    rows = read_routes(raw)
+    assert rows[0]["id"] == ""
+    assert rows[1]["id"] == "yard-heldso.example.com"

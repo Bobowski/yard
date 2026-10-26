@@ -38,15 +38,6 @@ async def run(yard: Yard) -> list[Check]:
 
     if not config.boot:
         # A laptop run has no host network; the proxy checks do not apply.
-        checks += [
-            _check("caddy", (True, "skipped: no host")),
-            _check("caddy admin", (True, "skipped: no host")),
-            _check("caddy routes", (True, "skipped: no host")),
-            _check("podman journald", (True, "skipped: no host")),
-            _check("journal", (True, "skipped: no host")),
-            _check("container logs", (True, "skipped: no host")),
-            _check("yard events", (True, "skipped: no host")),
-        ]
         hosts: list[str] = []
         yard_hosts: set[str] = set()
     else:

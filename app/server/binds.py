@@ -44,11 +44,8 @@ async def put_bind(yard: Yard, host: str, dial: str, window: str, *, actor: str 
     if found is None:
         await yard.caddy.request("POST", caddy.ROUTES_PATH, body)
     else:
-        # A stored id is one object. An older route has no id, so the write uses its index.
         # PATCH replaces. PUT would insert into the array or strictly create under /id.
-        index, ident = found
-        path = f"/id/{quote(ident, safe='')}" if ident else f"{caddy.ROUTES_PATH}/{index}"
-        await yard.caddy.request("PATCH", path, body)
+        await yard.caddy.request("PATCH", f"/id/{quote(found, safe='')}", body)
     bind = Bind(host, target, caddy.route_id(host), span)
     bind.state = _state(target.split(":", 1)[0], await _containers(yard))
     journal.send(yard.config, "bind.put", f"bind {host}", host=host, dial=target, actor=actor)
@@ -68,16 +65,18 @@ async def delete_bind(yard: Yard, host: str, *, actor: str = "") -> str:
             help_text="Run yard bind ls to see the binds.",
             example=f"yard bind rm {host}",
         )
-    index, ident = found
-    path = f"/id/{quote(ident, safe='')}" if ident else f"{caddy.ROUTES_PATH}/{index}"
-    await yard.caddy.request("DELETE", path)
+    await yard.caddy.request("DELETE", f"/id/{quote(found, safe='')}")
     journal.send(yard.config, "bind.delete", f"unbind {host}", host=host, actor=actor)
     return host
 
 
-async def _find(yard: Yard, host: str) -> tuple[int, str] | None:
+async def _find(yard: Yard, host: str) -> str | None:
     _code, raw = await yard.caddy.request("GET", caddy.ROUTES_PATH)
-    return caddy.find_route(raw, host)
+    # A route with no id counts as not found; an id-bearing one wins the scan.
+    for row in caddy.read_routes(raw):
+        if row["host"] == host and row["id"]:
+            return str(row["id"])
+    return None
 
 
 async def _containers(yard: Yard) -> dict[str, podman.Container]:

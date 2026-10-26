@@ -630,9 +630,9 @@ def _event_row(entry: dict) -> dict | None:
                 labels = None
         if isinstance(labels, dict):
             app = str(labels.get("com.docker.compose.project") or "")
-        if not app and container.startswith(("deploy-", "up-")):
+        if not app and container.startswith("deploy-"):
             # The apply container is not on a compose project.
-            app = container.split("-", 1)[1].removesuffix("-job")
+            app = container.split("-", 1)[1]
         row: dict[str, Any] = {
             "time": when,
             "source": "podman",

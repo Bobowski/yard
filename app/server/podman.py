@@ -269,13 +269,11 @@ def parse_ps(raw: str) -> dict[str, Container]:
         if not health:
             health = _health_text(str(row.get("Status") or ""))
 
-        # The deploy container is deploy-<name>. A leftover up-<name> from an
-        # older host is the same thing, and a -job name is still an apply container.
+        # The deploy container is deploy-<name>.
         name = names[0]
-        if name.startswith(("deploy-", "up-")):
-            rest = name.split("-", 1)[1]
+        if name.startswith("deploy-"):
             role = "deploy"
-            app = rest.removesuffix("-job")
+            app = name.split("-", 1)[1]
             service = ""
         else:
             role = "app"

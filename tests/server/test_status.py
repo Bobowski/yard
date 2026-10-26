@@ -81,11 +81,6 @@ def test_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             "Names": ["deploy-heldso"],
             "State": "exited",
         },
-        {
-            # A leftover up- container from an older host is not an app row either.
-            "Names": ["up-gone"],
-            "State": "exited",
-        },
         {"Names": ["caddy"], "State": "running"},
     ]
     stats = '[{"Name":"heldso-app-1","CPUPerc":"1.5%","MemUsage":"20MB / 1GB"}]'
@@ -127,10 +122,9 @@ def test_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     assert rows["heldso-app-1"]["started"] == "2024-03-09T16:00:00Z"
     assert rows["heldso-worker"]["state"] == "exited"
 
-    # Apply containers are skipped, leftover -job and up- names included.
+    # Apply containers are skipped.
     assert "deploy-nightly-job" not in rows
     assert "deploy-heldso" not in rows
-    assert "up-gone" not in rows
     nightly = [row for row in report["rows"] if row["app"] == "nightly"]
     assert len(nightly) == 1
     assert nightly[0]["state"] == "absent"
