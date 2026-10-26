@@ -196,6 +196,7 @@ async def _run(
             env=env or None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            limit=16 * 1024 * 1024,
         )
     except FileNotFoundError as exc:
         raise YardError(
@@ -204,14 +205,12 @@ async def _run(
             f"{argv[0]} is not on PATH: {exc}",
             help_text="The yard image ships docker-compose and podman.",
         ) from exc
-    if on_line is not None:
-        text = ""
-        assert proc.stdout is not None
-        while chunk := await proc.stdout.readline():
-            decoded = chunk.decode(errors="replace")
-            text += decoded
+    text = ""
+    assert proc.stdout is not None
+    while chunk := await proc.stdout.readline():
+        decoded = chunk.decode(errors="replace")
+        text += decoded
+        if on_line is not None:
             on_line(decoded.rstrip("\n"))
-        await proc.wait()
-        return proc.returncode or 0, text
-    out, _ = await proc.communicate()
-    return proc.returncode or 0, (out or b"").decode(errors="replace")
+    await proc.wait()
+    return proc.returncode or 0, text

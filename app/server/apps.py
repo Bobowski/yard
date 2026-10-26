@@ -52,71 +52,6 @@ def _yard_deployed(config: Config) -> Deployed:
     return Deployed(runs=plan.answer, kind=plan.kind, reason=plan.reason)
 
 
-def migrate(yard: Yard) -> None:
-    """One-time record rewrite: the four old fields become `runs`. Remove in 0.9."""
-    config = yard.config
-    for app in yard.store.list_apps():
-        try:
-            _migrate_app(config, app)
-        except Exception as exc:
-            log.warning("migrate %s: %s", app.name, exc)
-
-
-def _migrate_app(config: Config, app: App) -> None:
-    record = config.app_dir(app.name) / "app"
-    old: dict[str, str] = {}
-    keep: list[str] = []
-    for line in record.read_text().splitlines():
-        key, _, value = line.partition(" ")
-        if key in ("containerfile", "compose", "image", "recipe"):
-            old[key] = value.strip()
-        else:
-            keep.append(line)
-    if not old:
-        return
-    runs = _migrate_runs(config, app, old)
-    text = "\n".join(keep)
-    if runs:
-        text += f"\nruns {runs}"
-    atomic_write(record, text + "\n")
-    _migrate_deployed(config, app, old, runs)
-    recipe = config.app_dir(app.name) / "recipe"
-    if recipe.is_dir():
-        recipe.rename(config.app_dir(app.name) / "compose")
-    (config.app_dir(app.name) / "revision").unlink(missing_ok=True)
-
-
-def _migrate_runs(config: Config, app: App, old: dict[str, str]) -> str:
-    """The old fields' runs value. `containerfile yard` pins the detected template:
-    auto would let a repo Dockerfile or compose.yml take over what Yard wrote before."""
-    if old.get("containerfile") == "yard":
-        return _migrate_template(config, app.name)
-    return old.get("containerfile") or old.get("compose") or old.get("image") or old.get("recipe") or ""
-
-
-def _migrate_template(config: Config, name: str) -> str:
-    try:
-        return detect.language(config.clone(name), name).answer
-    except YardError:
-        return ""
-
-
-def _migrate_deployed(config: Config, app: App, old: dict[str, str], runs: str) -> None:
-    if read_deployed(config, app.name) is not None:
-        return
-    revision_file = config.app_dir(app.name) / "revision"
-    old_revision = revision_file.read_text().strip() if revision_file.is_file() else ""
-    if "image" in old or "recipe" in old:
-        revision = old_revision
-        runs = old.get("image") or old.get("recipe") or ""
-        kind = "image" if "image" in old else "compose"
-    else:
-        revision = git.head(config.clone(app.name))
-        kind = "compose" if "compose" in old else "containerfile"
-    if revision or runs:
-        write_deployed(config, app.name, Deployed(revision=revision, runs=runs, kind=kind))
-
-
 def create(
     yard: Yard,
     name: str,
@@ -232,7 +167,6 @@ async def delete(yard: Yard, name: str, *, with_binds: bool = False, actor: str 
 class Outcome:
     status: str
     image: str = ""
-    log: str = ""
     error: str = ""
     previous: str = ""
     missing_env: str = ""
@@ -274,7 +208,7 @@ async def _finish(yard: Yard, job: Job) -> Outcome:
     try:
         outcome = await _deploy_body(yard, job)
     except Exception as exc:
-        outcome = Outcome("failed", error=str(exc), log=f"{exc}\n")
+        outcome = Outcome("failed", error=str(exc))
         job.push(f"!! {exc}")
     job.status = outcome.status
     job.ended = now()
@@ -292,20 +226,16 @@ async def _deploy_body(yard: Yard, job: Job) -> Outcome:
             job.push(f"!! {exc}")
             return Outcome("failed", error=str(exc))
         if yard.skip_deploy:
-            line = "YARD_SKIP_DEPLOY is set. Deploy did not run."
-            job.push(line)
-            return Outcome("skipped", log=line + "\n")
+            job.push("YARD_SKIP_DEPLOY is set. Deploy did not run.")
+            return Outcome("skipped")
         if app.repo:
             job.push(f"== sync {app.repo} {app.ref}")
             return await _deploy_repo(yard, app, job, cause=job.cause, actor=job.actor)
         kind, _value = parse_runs(app.runs)
         if kind not in ("image", "url"):
             job.push(f"!! app {name} has no repo")
-            return Outcome(
-                "failed",
-                error=f"app {name} has no repo",
-                log="Set the repo: yard app set --repo https://<host>/<owner>/<name>\n",
-            )
+            job.push("Set the repo: yard app set --repo https://<host>/<owner>/<name>")
+            return Outcome("failed", error=f"app {name} has no repo")
         job.push(f"== pull {app.runs}" if kind == "image" else f"== fetch {app.runs}")
         return await _deploy_source(yard, app, kind, job, cause=job.cause, actor=job.actor)
 
@@ -315,7 +245,7 @@ async def _deploy_repo(yard: Yard, app: App, job: Job, *, cause: str, actor: str
     try:
         forge = yard.forge(app.repo)
     except YardError as exc:
-        return Outcome("failed", error=str(exc), log=f"{exc}\n")
+        return Outcome("failed", error=str(exc))
     if not forge.connected():
         return Outcome(
             "failed",
@@ -335,7 +265,7 @@ async def _deploy_repo(yard: Yard, app: App, job: Job, *, cause: str, actor: str
     except YardError as exc:
         # A sync or plan failure never reaches apply; deploy.end alone is the record.
         job.push(f"!! {exc}")
-        outcome = Outcome("failed", error=str(exc), log=f"{exc}\n")
+        outcome = Outcome("failed", error=str(exc))
     _deploy_end(yard, app, head, outcome)
     yard.spawn(_report_outcome(yard, app, forge, head, outcome, pending))
     return outcome
@@ -402,7 +332,7 @@ async def _deploy_source(yard: Yard, app: App, kind: str, job: Job, *, cause: st
             _write_copy(config, app.name, revision, body)
     except YardError as exc:
         job.push(f"!! {exc}")
-        return Outcome("failed", error=str(exc), log=f"{exc}\n")
+        return Outcome("failed", error=str(exc))
     _set_tried(yard, app.name, revision, "")
     journal.send(
         yard.config,
@@ -426,14 +356,13 @@ async def _deploy_source(yard: Yard, app: App, kind: str, job: Job, *, cause: st
         previous_copy = config.app_dir(app.name) / "compose" / f"{previous_deployed.revision[7:19]}.yml"
         if previous_copy.is_file():
             project.env["PREVIOUS_COMPOSE_FILE"] = str(previous_copy)
-    code, text = await compose.apply(config, app.name, "up", project, on_line=job.push)
-    log_text = text if text.endswith("\n") or not text else text + "\n"
+    code, _text = await compose.apply(config, app.name, "up", project, on_line=job.push)
     if code == 3:
-        outcome = Outcome("reverted", image, log_text, f"unhealthy; reverted to {previous}", previous)
+        outcome = Outcome("reverted", image, f"unhealthy; reverted to {previous}", previous)
     elif code:
-        outcome = Outcome("failed", image, log_text, f"apply exited {code}", previous)
+        outcome = Outcome("failed", image, f"apply exited {code}", previous)
     else:
-        outcome = Outcome("ok", image, log_text, previous=previous)
+        outcome = Outcome("ok", image, previous=previous)
     _deploy_end(yard, app, revision, outcome)
     if outcome.status == "ok":
         write_deployed(config, app.name, Deployed(revision=revision, runs=app.runs, kind=kind))
@@ -554,7 +483,7 @@ async def _apply(yard: Yard, app: App, plan: Plan, sha: str, job: Job, *, cause:
         project = compose.project(config, app, plan.kind, plan.answer, sha, image, checkout, dockerfile)
     except Exception as exc:
         job.push(f"!! {exc}")
-        return Outcome("failed", image, f"{exc}\n", str(exc))
+        return Outcome("failed", image, str(exc))
 
     journal.send(
         config,
@@ -582,7 +511,7 @@ async def _apply(yard: Yard, app: App, plan: Plan, sha: str, job: Job, *, cause:
         project.env["PREVIOUS_IMAGE"] = previous
 
     # One apply container runs compose up. The deploy container is the record of this run.
-    code, text = await compose.apply(
+    code, _text = await compose.apply(
         config,
         app.name,
         "up",
@@ -590,35 +519,31 @@ async def _apply(yard: Yard, app: App, plan: Plan, sha: str, job: Job, *, cause:
         detach=app.name == "yard",
         on_line=job.push,
     )
-    log_text = text if text.endswith("\n") or not text else text + "\n"
-    log_text = line + "\n" + log_text
-    log_text, missing_env = _env_hint(yard, app, log_text, job)
+    missing_env = _env_hint(yard, app, job)
     if app.name == "yard":
         # Upgrading yard replaces this process, so that apply run is detached.
-        return Outcome("pending", image, log_text, previous=previous, missing_env=missing_env)
+        return Outcome("pending", image, previous=previous, missing_env=missing_env)
     if code == 3:
-        return Outcome("reverted", image, log_text, f"unhealthy; reverted to {previous}", previous, missing_env)
+        return Outcome("reverted", image, f"unhealthy; reverted to {previous}", previous, missing_env)
     if code:
-        return Outcome("failed", image, log_text, f"apply exited {code}", previous, missing_env)
+        return Outcome("failed", image, f"apply exited {code}", previous, missing_env)
     write_deployed(
         config,
         app.name,
         Deployed(revision=sha, runs=plan.answer, kind=plan.kind, reason=plan.reason, template=plan.template),
     )
-    return Outcome(
-        "ok", image, log_text, previous=previous, missing_env=missing_env, port=await _exposed_port(yard, app.name)
-    )
+    return Outcome("ok", image, previous=previous, missing_env=missing_env, port=await _exposed_port(yard, app.name))
 
 
-def _env_hint(yard: Yard, app: App, log: str, job: Job | None = None) -> tuple[str, str]:
+def _env_hint(yard: Yard, app: App, job: Job) -> str:
     """A deploy-log hint when the app's code reads env keys that its env file does not set."""
     try:
         env = yard.store.read_env(app.name)
         missing = [s for s in detect.settings(yard.config.clone(app.name)) if s.required and s.key not in env]
     except Exception:
-        return log, ""
+        return ""
     if not missing:
-        return log, ""
+        return ""
     width = max(len(s.key) for s in missing)
     rows = "".join(f"  {s.key:<{width}}  {s.where}\n" for s in missing)
     keys = " ".join(f"{s.key}=\u2026" for s in missing)
@@ -629,11 +554,9 @@ def _env_hint(yard: Yard, app: App, log: str, job: Job | None = None) -> tuple[s
         f"Or edit the env: yard env edit --app {app.name}\n"
         f"Then deploy: yard app deploy --app {app.name}\n"
     )
-    if job is not None:
-        for text in hint.splitlines():
-            job.push(text)
-    log += hint
-    return log, ",".join(s.key for s in missing)
+    for text in hint.splitlines():
+        job.push(text)
+    return ",".join(s.key for s in missing)
 
 
 def app_file(config: Config, app: App, which: str) -> str:

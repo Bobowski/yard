@@ -45,7 +45,6 @@ from app.shared import (
     atomic_write,
     check_app_name,
     check_domain,
-    check_env,
     check_repo,
     check_window,
     explain,
@@ -421,7 +420,9 @@ def _cmd_app_new(args: argparse.Namespace) -> None:
         body["runs"] = runs
     raw = _api(session, "POST", "/api/v1/apps", body)
     if env:
-        _api(session, "PUT", f"/api/v1/apps/{quote(name)}/env", env)
+        code, text = _api_try(session, "PUT", f"/api/v1/apps/{quote(name)}/env", env)
+        if code >= 300:
+            _die(f"{name} was created, but its env was not saved: {explain(text)}\nSet it: yard env edit --app {name}")
     wrap = _object(raw)
     app = wrap.get("app") if isinstance(wrap, dict) else None
     if args.no_deploy:
@@ -474,7 +475,6 @@ def _new_app_env(args: argparse.Namespace) -> dict[str, str]:
         _die(f"cannot read {args.env_file}: {exc.strerror or exc}")
     except YardError as exc:
         _fail(exc)
-    check_env(env)
     return env
 
 
@@ -742,9 +742,6 @@ def _print_deploy_note(note: dict, name: str) -> None:
         line = ansi(line, _deploy_attention(status)) or line
     if line:
         print(line)
-    text = str(note.get("log") or "")
-    if text:
-        print(text, end="" if text.endswith("\n") else "\n")
     if status == "failed":
         print(f"Read the full log: yard app logs --deploy --app {name}")
     elif status == "reverted":

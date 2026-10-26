@@ -169,8 +169,8 @@ def test_app_deploy(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixtu
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
     _env(monkeypatch)
-    note = {"status": "ok", "image": "localhost/app:abc", "log": "ready\n"}
-    monkeypatch.setattr(cli, "_follow_deploy", lambda *a: note)
+    note = {"status": "ok", "image": "localhost/app:abc"}
+    monkeypatch.setattr(cli, "_follow_deploy", lambda *a: (print("ready"), note)[1])
 
     main(["app", "deploy", "--app", "nightly", "--text"])
     assert seen[("POST", "/api/v1/apps/nightly/deploy")] == {}
@@ -1972,3 +1972,20 @@ def test_app_new_failed_first_deploy_exits_1(monkeypatch: pytest.MonkeyPatch, ca
     # The bind still went in so Caddy is ready after the fix.
     assert _bind_calls(sent)[0][2]["dial"] == "web-app-1:8000"
     assert "web was created, but the first deploy failed." in capsys.readouterr().err
+
+
+def test_app_new_env_put_failure_dies_cleanly(monkeypatch: pytest.MonkeyPatch, capsys):
+    def fake_api_try(client, method, path, body, timeout=None):
+        if path == "/api/v1/apps":
+            return 200, json.dumps({"app": {"name": "x"}})
+        if "/env" in path:
+            return 500, json.dumps({"error": {"message": "disk full"}})
+        return 200, "{}"
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    _env(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(["app", "new", "--text", "--repo", "https://origin.cursor.com/org/x", "-e", "A=1"])
+    err = capsys.readouterr().err
+    assert "x was created, but its env was not saved" in err
+    assert "yard env edit --app x" in err
