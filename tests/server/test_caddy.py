@@ -10,7 +10,6 @@ import pytest
 
 from app.server.caddy import (
     Caddy,
-    find_route,
     normalize_dial,
     proxy_route,
     read_routes,
@@ -185,14 +184,13 @@ def test_proxy_route_keeps_one_id():
     assert proxy["upstreams"] == [{"dial": "heldso:8000"}]
 
 
-def test_find_route_uses_the_array_index():
+def test_read_routes_marks_a_route_without_an_id():
     raw = json.dumps(
         [
             {"match": [{"host": ["other.example.com"]}]},
             {"@id": "yard-heldso.example.com", "match": [{"host": ["heldso.example.com"]}], "handle": []},
         ]
     )
-    assert find_route(raw, "heldso.example.com") == (1, "yard-heldso.example.com")
-    assert find_route(raw, "other.example.com") == (0, "")
-    assert find_route(raw, "missing.example.com") is None
-    assert read_routes(raw)[0]["id"] == ""
+    rows = read_routes(raw)
+    assert rows[0]["id"] == ""
+    assert rows[1]["id"] == "yard-heldso.example.com"

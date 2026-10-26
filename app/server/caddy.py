@@ -126,22 +126,6 @@ def read_routes(raw: bytes | str) -> list[dict[str, str]]:
     return found
 
 
-def find_route(raw: bytes | str, host: str) -> tuple[int, str] | None:
-    """The index of this host in the routes array, and its stored id."""
-    text = raw.decode() if isinstance(raw, bytes) else raw
-    try:
-        rows = json.loads(text or "[]")
-    except ValueError:
-        return None
-    if not isinstance(rows, list):
-        return None
-    for index, row in enumerate(rows):
-        if isinstance(row, dict) and _match_host(row) == host:
-            ident = row.get("@id")
-            return index, ident if isinstance(ident, str) else ""
-    return None
-
-
 def _match_host(row: dict[str, object]) -> str:
     match = row.get("match")
     if not isinstance(match, list) or not match or not isinstance(match[0], dict):
