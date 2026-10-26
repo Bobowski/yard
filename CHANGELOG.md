@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.0
 
 - Deploys are jobs. `POST /api/v1/apps/{name}/deploy` answers 202 with the job, `GET` on the same route returns it (`?follow=1` streams the log as `x-ndjson`, ending with the deploy object), and the app page gains a `job` field. Breaking for API callers that expected the deploy body back in the POST.
 - `yard app deploy` and `yard app new` stream the deploy log live; `yard app logs --deploy` reads the job's lines.
