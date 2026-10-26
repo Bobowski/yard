@@ -81,7 +81,7 @@ def test_put_twice_replaces_under_a_stored_id(tmp_path: Path):
     ]
 
 
-def test_put_adopts_a_route_without_an_id(tmp_path: Path):
+def test_put_adds_a_route_when_the_match_has_no_id(tmp_path: Path):
     routes = [
         {"match": [{"host": ["other.example.com"]}]},
         {"match": [{"host": ["heldso.example.com"]}]},
@@ -89,24 +89,22 @@ def test_put_adopts_a_route_without_an_id(tmp_path: Path):
     yard = _yard(tmp_path, routes)
     asyncio.run(binds.put_bind(yard, "heldso.example.com", "heldso", "10s"))
     calls = [(m, p) for m, p, _b in _calls(yard)]
-    assert ("PATCH", f"{caddy.ROUTES_PATH}/1") in calls
-    assert _routes_for(yard, "heldso.example.com") == [
-        {"host": "heldso.example.com", "dial": "heldso:8000", "id": "yard-heldso.example.com", "try": "10s"}
-    ]
-    # The other route is untouched, at its index.
+    # A route with no id counts as not found, so Yard posts its own id-bearing route.
+    assert ("POST", caddy.ROUTES_PATH) in calls
+    posted = [json.loads(b) for m, p, b in _calls(yard) if m == "POST" and b]
+    assert posted[0]["@id"] == "yard-heldso.example.com"
+    assert posted[0]["handle"][0]["upstreams"] == [{"dial": "heldso:8000"}]
+    # The other route is untouched.
     assert routes[0]["match"] == [{"host": ["other.example.com"]}]
 
 
-def test_put_twice_keeps_one_route_adopted_by_index(tmp_path: Path):
+def test_put_twice_patches_the_id(tmp_path: Path):
     routes = [{"match": [{"host": ["heldso.example.com"]}]}]
     yard = _yard(tmp_path, routes)
     asyncio.run(binds.put_bind(yard, "heldso.example.com", "heldso:9000", "30s"))
     asyncio.run(binds.put_bind(yard, "heldso.example.com", "heldso:9100", "45s"))
-    assert _routes_for(yard, "heldso.example.com") == [
-        {"host": "heldso.example.com", "dial": "heldso:9100", "id": "yard-heldso.example.com", "try": "45s"}
-    ]
     calls = [(m, p) for m, p, _b in _calls(yard)]
-    assert ("PATCH", f"{caddy.ROUTES_PATH}/0") in calls
+    assert ("POST", caddy.ROUTES_PATH) in calls
     assert ("PATCH", "/id/yard-heldso.example.com") in calls
 
 

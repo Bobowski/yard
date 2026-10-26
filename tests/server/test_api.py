@@ -482,7 +482,7 @@ async def test_app_status_and_doctor(yard, monkeypatch):
 
     checks = {check["name"]: check for check in (await client.get("/api/v1/doctor", headers=auth(token))).json()}
     assert checks["podman"] == {"name": "podman", "ok": True, "detail": "podman 5.3.1", "warn": False}
-    assert checks["caddy"]["detail"] == "skipped: no host"
+    assert "caddy" not in checks
     assert checks["origin"]["ok"] is False
 
 

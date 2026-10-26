@@ -157,7 +157,7 @@ async def _binds(yard: Yard) -> list[binds.Bind]:
 
 def deploy_record(listed: dict[str, Container], name: str) -> dict[str, Any] | None:
     """The deploy container is the deploy. One row, or none."""
-    item = listed.get(f"deploy-{name}") or listed.get(f"up-{name}")
+    item = listed.get(f"deploy-{name}")
     if item is None:
         return None
     if item.running:

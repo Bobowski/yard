@@ -38,7 +38,6 @@ def test_parse_ps_reads_name_and_labels():
     raw = """[
         {"Id":"app","Names":["heldso-app-1"],
          "Labels":{"com.docker.compose.project":"heldso","com.docker.compose.service":"app"}},
-        {"Id":"run","Names":["up-backup-job"]},
         {"Id":"build","Names":["deploy-backup"]},
         {"Id":"bare","Names":["caddy"]}
     ]"""
@@ -49,10 +48,7 @@ def test_parse_ps_reads_name_and_labels():
     assert got["heldso-app-1"].service == "app"
     assert got["heldso-app-1"].role == "app"
 
-    # An apply container is deploy-<app>. A leftover up-<app> or -job name is the same.
-    assert got["up-backup-job"].app == "backup"
-    assert got["up-backup-job"].service == ""
-    assert got["up-backup-job"].role == "deploy"
+    # An apply container is deploy-<app>.
     assert got["deploy-backup"].app == "backup"
     assert got["deploy-backup"].role == "deploy"
 

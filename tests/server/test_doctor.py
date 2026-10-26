@@ -248,9 +248,9 @@ def test_doctor_disk_omits_missing_parts(tmp_path: Path, monkeypatch: pytest.Mon
 def test_doctor_skips_the_proxy_checks_without_a_host(tmp_path: Path):
     yard = _yard(tmp_path, sock=False)
     found = _run(yard)
-    assert found["caddy"] == {"name": "caddy", "ok": True, "detail": "skipped: no host", "warn": False}
-    assert found["caddy admin"]["ok"]
-    assert found["caddy routes"]["ok"]
+    assert "caddy" not in found
+    assert "caddy admin" not in found
+    assert "caddy routes" not in found
     assert not any(name.startswith("dns ") for name in found)
 
 
