@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0
 
 Breaking: the app record's four fields are one `runs`.
 
@@ -11,6 +11,7 @@ Breaking: the app record's four fields are one `runs`.
 - `POST`/`PATCH /api/v1/apps` reject unknown fields with `unknown_field`. `app_json` carries `runs` and a `deployed` object; the files route reads the deployed answer.
 - Removed old-host compatibility: `up-`/`-job` containers, routes without an id, the :8443 Caddy convergence, the account backfill, and install.sh's yardd/podman-static/tailscale/caddy.service cleanup. Off-host `yard status --full` omits the skipped rows.
 - `app new --public` binds after the first deploy, on the port the container exposes (`--port` overrides; a repo app falls back to 8000).
+- An image or URL app has an empty `ref`; setting one is a 400 `bad_ref`. The `yard app ls` column is `source`.
 - New template `yard:http-nu` runs cross.stream (xs) apps: a repo with `serve.nu` gets a static http-nu binary (sha256-checked per arch), a persistent xs store in `/data/store`, and the Datastar bundle served. The env hint reads `$env.KEY`.
 
 ## 0.6.2
