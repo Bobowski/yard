@@ -22,13 +22,13 @@ from pathlib import Path
 
 from app.server import git
 from app.server.compose import COMPOSE_NAMES, DOCKERFILES
-from app.server.detect import go, node, python, stario
+from app.server.detect import go, http_nu, node, python, stario
 from app.server.detect.base import Plan, Repo, Setting, _join
 from app.shared import YardError
 
 log = logging.getLogger("yard")
 
-DETECTORS = (stario, python, go, node)
+DETECTORS = (stario, python, go, node, http_nu)
 
 __all__ = ["DETECTORS", "Plan", "Repo", "Setting", "classify", "language", "plan_for", "resolve", "settings"]
 

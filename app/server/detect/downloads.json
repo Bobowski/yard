@@ -1,0 +1,10 @@
+{
+  "http-nu": {
+    "repo": "cablehead/http-nu",
+    "version": "0.18.0",
+    "sha256": {
+      "amd64": "28814093dd40cebc32cd533dde6ac10a0be67698a25c47ffd16b47d32fd65954",
+      "arm64": "6714826225d66bfceb1cf029f6df3024f6f013c9e4c4e2bc62a7c660f9262f28"
+    }
+  }
+}

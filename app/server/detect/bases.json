@@ -7,5 +7,6 @@
   "golang:1.26": "sha256:672c944cfd07599b5f1bb179869270cdc94c6254e41db4d431259693cb286b82",
   "golang:1.27": "sha256:f20d83a83e18dbd2a4714b8ffd4b30b287b6243962dd75608e86abcc63ba4efc",
   "gcr.io/distroless/static-debian12": "sha256:d75cdd72874d4790092fcb1b058493ecf6bb5bf2b2b897045b00ff01d91843f2",
-  "ghcr.io/astral-sh/uv:0.13.5": "sha256:32a7bb39b496babbd997b0a39a4d66c126bdaf5661b302bf6f06abda8deca6ff"
+  "ghcr.io/astral-sh/uv:0.13.5": "sha256:32a7bb39b496babbd997b0a39a4d66c126bdaf5661b302bf6f06abda8deca6ff",
+  "alpine:3.22": "sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f"
 }
