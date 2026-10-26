@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Deploys are jobs. `POST /api/v1/apps/{name}/deploy` answers 202 with the job, `GET` on the same route returns it (`?follow=1` streams the log as `x-ndjson`, ending with the deploy object), and the app page gains a `job` field. Breaking for API callers that expected the deploy body back in the POST.
+- `yard app deploy` and `yard app new` stream the deploy log live; `yard app logs --deploy` reads the job's lines.
+- `yard app new` takes `-e/--env KEY=VALUE`, `--env-file`, and `--edit-env`, so the first deploy can have its settings.
+- The one-time 0.8.0 record migration is removed: a host older than 0.8.0 upgrades to 0.8.0 first.
+- The `yard status` bind column elides the app's own container (`host → :PORT` for another port, `host` for 8000).
+- The settings hint stays a warning: it never blocks a deploy.
+
 ## 0.8.0
 
 Breaking: the app record's four fields are one `runs`.

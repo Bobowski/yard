@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import json
@@ -271,11 +272,13 @@ async def test_app_deploy_reports_the_outcome(yard):
     )
     assert res.status_code == 200
     res = await client.post("/api/v1/apps/heldso/deploy", headers=auth(token))
-    assert res.status_code == 200
+    assert res.status_code == 202
     body = res.json()
-    assert body["app"]["name"] == "heldso"
-    # YARD_SKIP_DEPLOY is set in the fixture.
-    assert body["deploy"]["status"] == "skipped"
+    assert body["deploy"]["app"] == "heldso"
+    # YARD_SKIP_DEPLOY is set in the fixture, so the job ends "skipped".
+    await asyncio.sleep(0.2)
+    res = await client.get("/api/v1/apps/heldso/deploy", headers=auth(token))
+    assert res.json()["deploy"]["status"] == "skipped"
 
     res = await client.post("/api/v1/apps/nope/deploy", headers=auth(token))
     assert res.status_code == 404
@@ -865,3 +868,66 @@ async def test_page_record_is_the_record():
     assert data["app"]["deployed"] is None
     assert data["image"] == "localhost/heldso:abc1234"
     assert data["sha"] == "abc1234"
+
+
+async def test_deploy_is_a_job(yard):
+    client, token, _root = yard
+    await client.post("/api/v1/apps", json={"name": "db", "runs": "postgres:17"}, headers=auth(token))
+    res = await client.post("/api/v1/apps/db/deploy", json={}, headers=auth(token))
+    assert res.status_code == 202
+    job = res.json()["deploy"]
+    assert job["app"] == "db" and job["cause"] == "manual"
+    fields = {
+        "id",
+        "app",
+        "status",
+        "cause",
+        "actor",
+        "started",
+        "ended",
+        "image",
+        "error",
+        "previous",
+        "missing_env",
+        "port",
+    }
+    assert fields <= set(job)
+    res = await client.post("/api/v1/apps/db/deploy", json={"sha": "abc"}, headers=auth(token))
+    assert res.status_code == 400 and "Yard deploys what the source says now" in res.text
+    res = await client.post("/api/v1/apps/db/deploy", json={"other": 1}, headers=auth(token))
+    assert res.status_code == 400 and res.json()["error"]["code"] == "unknown_field"
+
+
+async def test_deploy_get_and_follow(yard):
+    client, token, _root = yard
+    res = await client.get("/api/v1/apps/db/deploy", headers=auth(token))
+    assert res.status_code == 404
+    await client.post("/api/v1/apps", json={"name": "db", "runs": "postgres:17"}, headers=auth(token))
+    await client.post("/api/v1/apps/db/deploy", json={}, headers=auth(token))
+    await asyncio.sleep(0.2)
+    res = await client.get("/api/v1/apps/db/deploy", headers=auth(token))
+    job = res.json()["deploy"]
+    assert job["status"] == "skipped"
+    assert "lines" in job
+    text = (
+        await client.get("/api/v1/apps/db/deploy?follow=1", headers={**auth(token), "accept-encoding": "identity"})
+    ).text
+    rows = [json.loads(line) for line in text.splitlines() if line]
+    assert all("line" in row or "deploy" in row for row in rows)
+    assert rows[-1]["deploy"]["status"] == "skipped"
+
+
+async def test_deploy_second_post_returns_the_running_job(yard, monkeypatch):
+    client, token, _root = yard
+    await client.post("/api/v1/apps", json={"name": "db", "runs": "postgres:17"}, headers=auth(token))
+    gate = asyncio.Event()
+
+    async def slow(yard_, name, **kw):
+        await gate.wait()
+
+    monkeypatch.setattr(apps, "_finish", slow)
+    first = await client.post("/api/v1/apps/db/deploy", json={}, headers=auth(token))
+    second = await client.post("/api/v1/apps/db/deploy", json={}, headers=auth(token))
+    gate.set()
+    assert first.json()["deploy"]["id"] == second.json()["deploy"]["id"]
+    assert second.json()["deploy"]["status"] == "running"

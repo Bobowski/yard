@@ -169,6 +169,8 @@ def test_app_deploy(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixtu
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
     _env(monkeypatch)
+    note = {"status": "ok", "image": "localhost/app:abc"}
+    monkeypatch.setattr(cli, "_follow_deploy", lambda *a: (print("ready"), note)[1])
 
     main(["app", "deploy", "--app", "nightly", "--text"])
     assert seen[("POST", "/api/v1/apps/nightly/deploy")] == {}
@@ -358,8 +360,10 @@ def test_app_deploy_failed_reads_the_log_hint(monkeypatch: pytest.MonkeyPatch, c
         "deploy": {"status": "failed", "image": "localhost/heldso:abc", "log": "== boom\n", "error": "apply exited 1"},
     }
     monkeypatch.setattr(cli, "_api_try", lambda *a, **k: (200, json.dumps(wrap)))
+    monkeypatch.setattr(cli, "_follow_deploy", lambda *a: wrap["deploy"])
     _env(monkeypatch)
-    main(["app", "deploy", "--app", "heldso", "--text"])
+    with pytest.raises(SystemExit):
+        main(["app", "deploy", "--app", "heldso", "--text"])
     out = capsys.readouterr().out
     assert "failed" in out
     assert "Read the full log: yard app logs --deploy --app heldso" in out
@@ -376,6 +380,7 @@ def test_app_deploy_reverted_explains_the_old_image(monkeypatch: pytest.MonkeyPa
         },
     }
     monkeypatch.setattr(cli, "_api_try", lambda *a, **k: (200, json.dumps(wrap)))
+    monkeypatch.setattr(cli, "_follow_deploy", lambda *a: wrap["deploy"])
     _env(monkeypatch)
     main(["app", "deploy", "--app", "heldso", "--text"])
     out = capsys.readouterr().out
@@ -419,6 +424,9 @@ def test_app_new(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture)
         raise AssertionError(path)
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    monkeypatch.setattr(
+        cli, "_follow_deploy", lambda *a: {"status": "ok", "image": "localhost/web:abc", "log": "== started\n"}
+    )
     _env(monkeypatch)
 
     main(
@@ -471,9 +479,7 @@ def test_app_new_no_deploy(monkeypatch: pytest.MonkeyPatch, capsys: pytest.Captu
         ("POST", "/api/v1/apps", {"name": "heldso", "repo": "https://origin.cursor.com/org/heldso", "ref": "main"})
     ]
     out = capsys.readouterr().out
-    assert "Not deployed yet. Set its settings first if it needs any, then deploy:" in out
-    assert "  yard env set KEY=VALUE --app heldso" in out
-    assert "  yard app deploy --app heldso" in out
+    assert "Not deployed yet. Deploy it: yard app deploy --app heldso" in out
 
 
 def test_app_new_a_failed_deploy_keeps_the_app(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
@@ -539,6 +545,7 @@ def test_app_new_trigger(monkeypatch: pytest.MonkeyPatch, capsys: pytest.Capture
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
     _env(monkeypatch)
+    monkeypatch.setattr(cli, "_follow_deploy", lambda *a: {"status": "ok"})
 
     main(["app", "new", "--text", "--repo", "https://origin.cursor.com/org/app", "--ref", "dev", "--trigger", "manual"])
     body = seen[("POST", "/api/v1/apps")]
@@ -562,6 +569,8 @@ def test_app_new_ref_follows_the_checkout_repo(monkeypatch: pytest.MonkeyPatch, 
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
     _env(monkeypatch)
+    monkeypatch.setattr(cli, "_follow_deploy", lambda *a: {"status": "ok"})
+    monkeypatch.setattr(cli, "_follow_deploy", lambda *a: {"status": "ok"})
 
     # A repo that is not the checkout's gets main, not the checkout branch.
     main(["app", "new", "--text", "--repo", "https://origin.cursor.com/org/other"])
@@ -832,6 +841,7 @@ def test_app_deduction_feature_branch_names_the_app(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
     _env(monkeypatch)
+    monkeypatch.setattr(cli, "_follow_deploy", lambda *a: {"status": "ok"})
     main(["app", "new", "--text"])
     assert seen[("POST", "/api/v1/apps")] == {
         "name": "heldso-feature-x",
@@ -1540,12 +1550,17 @@ def test_app_logs_builds_the_query(monkeypatch: pytest.MonkeyPatch, capsys: pyte
 
     def fake_api_try(client, method, path, body, timeout=None):
         calls.append((method, path, body))
+        if path == "/api/v1/apps/heldso/deploy":
+            return 404, "no deploy since Yard started"
         return 200, "line one\n"
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
     _env(monkeypatch)
     main(["app", "logs", "--app", "heldso", "--since", "-1h", "--deploy", "--tail", "50", "--text"])
-    assert calls == [("GET", "/api/v1/logs?lines=50&container=deploy-heldso&since=-1h", None)]
+    assert calls == [
+        ("GET", "/api/v1/apps/heldso/deploy", None),
+        ("GET", "/api/v1/logs?lines=50&container=deploy-heldso&since=-1h", None),
+    ]
     assert "line one" in capsys.readouterr().out
 
 
@@ -1628,6 +1643,7 @@ def test_app_new_image(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFi
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
     _env(monkeypatch)
+    monkeypatch.setattr(cli, "_follow_deploy", lambda *a: {"status": "ok"})
     main(["app", "new", "--runs", "ghcr.io/you/api:1.4", "--text"])
     method, path, body = sent[0]
     assert body["name"] == "api"
@@ -1650,6 +1666,7 @@ def test_app_new_recipe_public_port(monkeypatch: pytest.MonkeyPatch, capsys: pyt
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
     _env(monkeypatch)
+    monkeypatch.setattr(cli, "_follow_deploy", lambda *a: {"status": "ok", "port": 3000})
     main(
         [
             "app",
@@ -1709,6 +1726,7 @@ def test_app_new_binds_the_exposed_port(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
     _env(monkeypatch)
+    monkeypatch.setattr(cli, "_follow_deploy", lambda *a: {"status": "ok", "port": 3000})
     main(
         [
             "app",
@@ -1739,6 +1757,7 @@ def test_app_new_port_flag_overrides(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
     _env(monkeypatch)
+    monkeypatch.setattr(cli, "_follow_deploy", lambda *a: {"status": "ok", "port": 3000})
     main(
         [
             "app",
@@ -1768,6 +1787,7 @@ def test_app_new_repo_app_falls_back_to_8000(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
     _env(monkeypatch)
+    monkeypatch.setattr(cli, "_follow_deploy", lambda *a: {"status": "ok", "port": 0})
     main(
         [
             "app",
@@ -1795,6 +1815,7 @@ def test_app_new_repo_less_port_zero_prints_hint(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
     _env(monkeypatch)
+    monkeypatch.setattr(cli, "_follow_deploy", lambda *a: {"status": "ok", "port": 0})
     main(["app", "new", "--runs", "postgres:17", "--public", "db.example.com", "--text"])
     assert _bind_calls(sent) == []
     assert "Bind it: yard bind set db.example.com postgres-app-1:PORT" in capsys.readouterr().out
@@ -1850,3 +1871,121 @@ def test_app_new_no_deploy_repo_app_binds_8000(monkeypatch: pytest.MonkeyPatch):
         ]
     )
     assert _bind_calls(sent)[0][2]["dial"] == "web-app-1:8000"
+
+
+def _new_env_fakes(monkeypatch, sent):
+    def fake_api_try(client, method, path, body, timeout=None):
+        sent.append((method, path, body))
+        return 200, json.dumps({"app": {"name": "heldso"}})
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    monkeypatch.setattr(cli, "_follow_deploy", lambda *a: {"status": "ok"})
+    _env(monkeypatch)
+
+
+def test_app_new_env_flag_puts_the_env(monkeypatch: pytest.MonkeyPatch):
+    sent = []
+    _new_env_fakes(monkeypatch, sent)
+    main(["app", "new", "--text", "--repo", "https://origin.cursor.com/org/x", "-e", "A=1", "-e", "B=two"])
+    put = next(c for c in sent if c[0] == "PUT" and c[1].endswith("/env"))
+    assert put[2] == {"A": "1", "B": "two"}
+    assert sent.index(put) < sent.index(next(c for c in sent if c[1].endswith("/deploy")))
+
+
+def test_app_new_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    sent = []
+    dotenv = tmp_path / "x.env"
+    dotenv.write_text("A=from-file\nB=file-two\n")
+    _new_env_fakes(monkeypatch, sent)
+    main(["app", "new", "--text", "--repo", "https://origin.cursor.com/org/x", "--env-file", str(dotenv)])
+    put = next(c for c in sent if c[0] == "PUT" and c[1].endswith("/env"))
+    assert put[2] == {"A": "from-file", "B": "file-two"}
+
+
+def test_app_new_env_merge_order(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    sent = []
+    dotenv = tmp_path / "x.env"
+    dotenv.write_text("A=file\nB=file\n")
+    _new_env_fakes(monkeypatch, sent)
+    main(
+        [
+            "app",
+            "new",
+            "--text",
+            "--repo",
+            "https://origin.cursor.com/org/x",
+            "--env-file",
+            str(dotenv),
+            "-e",
+            "A=flag",
+        ]
+    )
+    put = next(c for c in sent if c[0] == "PUT" and c[1].endswith("/env"))
+    assert put[2] == {"A": "flag", "B": "file"}
+
+
+def test_app_new_env_edit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    sent = []
+    _new_env_fakes(monkeypatch, sent)
+    monkeypatch.setattr(sys, "stdin", _TTY())
+    monkeypatch.setattr(cli, "_edit_text", lambda text: "A=edited\n")
+    main(["app", "new", "--text", "--repo", "https://origin.cursor.com/org/x", "-e", "A=1", "--edit-env"])
+    put = next(c for c in sent if c[0] == "PUT" and c[1].endswith("/env"))
+    assert put[2] == {"A": "edited"}
+
+
+def test_app_new_bad_env_fails_before_post(monkeypatch: pytest.MonkeyPatch):
+    sent = []
+    _new_env_fakes(monkeypatch, sent)
+    with pytest.raises(SystemExit):
+        main(["app", "new", "--text", "--repo", "https://origin.cursor.com/org/x", "-e", "NOTAPAIR"])
+    assert sent == []
+
+
+def test_app_new_failed_first_deploy_exits_1(monkeypatch: pytest.MonkeyPatch, capsys):
+    sent = []
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        sent.append((method, path, body))
+        if path == "/api/v1/apps":
+            return 200, json.dumps({"app": {"name": "web"}})
+        if "/binds/" in path:
+            return 200, "{}"
+        return 200, json.dumps({"deploy": {"status": "ok"}})
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    monkeypatch.setattr(cli, "_follow_deploy", lambda *a: {"status": "failed", "log": "== boom\n"})
+    _env(monkeypatch)
+    with pytest.raises(SystemExit) as caught:
+        main(
+            [
+                "app",
+                "new",
+                "--text",
+                "--repo",
+                "https://origin.cursor.com/org/web",
+                "--public",
+                "web.example.com",
+            ]
+        )
+    assert caught.value.code == 1
+    # The bind still went in so Caddy is ready after the fix.
+    assert _bind_calls(sent)[0][2]["dial"] == "web-app-1:8000"
+    assert "web was created, but the first deploy failed." in capsys.readouterr().err
+
+
+def test_app_new_env_put_failure_dies_cleanly(monkeypatch: pytest.MonkeyPatch, capsys):
+    def fake_api_try(client, method, path, body, timeout=None):
+        if path == "/api/v1/apps":
+            return 200, json.dumps({"app": {"name": "x"}})
+        if "/env" in path:
+            return 500, json.dumps({"error": {"message": "disk full"}})
+        return 200, "{}"
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    _env(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(["app", "new", "--text", "--repo", "https://origin.cursor.com/org/x", "-e", "A=1"])
+    err = capsys.readouterr().err
+    assert "x was created, but its env was not saved" in err
+    assert "yard env edit --app x" in err

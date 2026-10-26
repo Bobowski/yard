@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -123,6 +124,7 @@ async def apply(
     project: Project,
     *,
     detach: bool = False,
+    on_line: Callable[[str], None] | None = None,
 ) -> tuple[int, str]:
     """Run the apply script as one Podman container. A non-zero exit is the deploy log, not an exception."""
     sock = config.podman_sock or "/run/podman/podman.sock"
@@ -150,7 +152,7 @@ async def apply(
     if detach:
         argv.append("-d")
     argv += ["localhost/yard-apply", command]
-    return await _run(argv, _process_env(config))
+    return await _run(argv, _process_env(config), on_line=on_line)
 
 
 async def build_apply(config: Config) -> tuple[int, str]:
@@ -183,13 +185,18 @@ def _process_env(config: Config) -> dict[str, str]:
     return env
 
 
-async def _run(argv: list[str], env: dict[str, str]) -> tuple[int, str]:
+async def _run(
+    argv: list[str],
+    env: dict[str, str],
+    on_line: Callable[[str], None] | None = None,
+) -> tuple[int, str]:
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
             env=env or None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            limit=16 * 1024 * 1024,
         )
     except FileNotFoundError as exc:
         raise YardError(
@@ -198,5 +205,12 @@ async def _run(argv: list[str], env: dict[str, str]) -> tuple[int, str]:
             f"{argv[0]} is not on PATH: {exc}",
             help_text="The yard image ships docker-compose and podman.",
         ) from exc
-    out, _ = await proc.communicate()
-    return proc.returncode or 0, (out or b"").decode(errors="replace")
+    text = ""
+    assert proc.stdout is not None
+    while chunk := await proc.stdout.readline():
+        decoded = chunk.decode(errors="replace")
+        text += decoded
+        if on_line is not None:
+            on_line(decoded.rstrip("\n"))
+    await proc.wait()
+    return proc.returncode or 0, text

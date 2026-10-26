@@ -49,8 +49,11 @@ class _Apply:
         self.code = code
         self.text = text
 
-    async def __call__(self, config, app, command, project, *, detach=False) -> tuple[int, str]:
+    async def __call__(self, config, app, command, project, *, detach=False, on_line=None) -> tuple[int, str]:
         self.calls.append({"command": command, "app": app, "project": project, "detach": detach})
+        if on_line is not None:
+            for line in self.text.splitlines():
+                on_line(line)
         return self.code, self.text
 
 
@@ -121,7 +124,7 @@ async def test_deploy_needs_a_repo(tmp_path: Path):
     yard.store.create_app("yard", "")
     outcome = await apps.deploy(yard, "yard")
     assert outcome.status == "failed"
-    assert "yard app set --repo" in outcome.log
+    assert "yard app set --repo" in "\n".join(yard.deploys["yard"].lines)
 
 
 async def test_deploy_needs_a_forge(tmp_path: Path):
@@ -248,7 +251,7 @@ async def test_deploy_runs_path_missing_fails(tmp_path: Path, monkeypatch: pytes
     monkeypatch.setattr(git, "sync", fake_sync)
     outcome = await apps.deploy(yard, "heldso")
     assert outcome.status == "failed"
-    assert "deploy/x.yml is not a file" in outcome.log
+    assert "deploy/x.yml is not a file" in outcome.error
 
 
 async def test_deploy_image_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -994,58 +997,6 @@ async def test_source_deploy_failed_is_not_retried(tmp_path: Path, monkeypatch: 
     assert recorder.calls
 
 
-async def test_migrate_rewrites_the_old_records(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Each old field shape becomes runs; the deployed file carries the last answer."""
-    yard = make_yard(tmp_path)
-    cases = {
-        "tpl-app": "containerfile yard",
-        "cf-app": "containerfile ops/Dockerfile",
-        "co-app": "compose ops/stack.yml",
-        "img-app": "image postgres:17",
-        "url-app": "recipe https://example.com/x.yml",
-    }
-    for name, line in cases.items():
-        record = tmp_path / "apps" / name / "app"
-        record.parent.mkdir(parents=True)
-        repo = "" if name in ("img-app", "url-app") else "https://origin.cursor.com/org/x"
-        record.write_text(f"repo {repo}\nref main\ntrigger push\ncreated t\n{line}\n")
-    # Image: the old revision file gives the deployed revision.
-    (tmp_path / "apps" / "img-app" / "revision").write_text("sha256:" + "a" * 64 + "\n")
-    # Recipe: same, plus the recipe dir moves to compose/.
-    (tmp_path / "apps" / "url-app" / "revision").write_text("sha256:" + "b" * 64 + "\n")
-    recipe = tmp_path / "apps" / "url-app" / "recipe"
-    recipe.mkdir()
-    (recipe / f"{'b' * 12}.yml").write_text("services: {}\n")
-    # Repo apps: a clone gives the deployed revision.
-    clone = _stario_clone(yard, "tpl-app")
-    tip = git.head(clone)
-    apps.migrate(yard)
-
-    store = Store.open(tmp_path)
-    assert store.app("tpl-app").runs == "yard:python-uv"
-    assert store.app("cf-app").runs == "ops/Dockerfile"
-    assert store.app("co-app").runs == "ops/stack.yml"
-    assert store.app("img-app").runs == "postgres:17"
-    assert store.app("url-app").runs == "https://example.com/x.yml"
-
-    dep = read_deployed(yard.config, "tpl-app")
-    assert dep is not None
-    assert dep.revision == tip and dep.runs == "yard:python-uv" and dep.kind == "containerfile"
-    assert dep.template == ""
-    dep = read_deployed(yard.config, "img-app")
-    assert dep is not None
-    assert dep.revision == "sha256:" + "a" * 64 and dep.kind == "image"
-    dep = read_deployed(yard.config, "url-app")
-    assert dep is not None
-    assert dep.revision == "sha256:" + "b" * 64 and dep.kind == "compose"
-    assert (tmp_path / "apps" / "url-app" / "compose" / f"{'b' * 12}.yml").is_file()
-    assert not (tmp_path / "apps" / "url-app" / "recipe").exists()
-    assert not (tmp_path / "apps" / "img-app" / "revision").exists()
-    dep = read_deployed(yard.config, "co-app")
-    assert dep is not None
-    assert dep.runs == "ops/stack.yml" and dep.kind == "compose" and dep.template == ""
-
-
 async def test_deploy_hint_for_unset_required_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yard = make_yard(tmp_path, skip=False)
     yard.store.create_app("heldso", "https://origin.cursor.com/org/app")
@@ -1061,40 +1012,9 @@ async def test_deploy_hint_for_unset_required_settings(tmp_path: Path, monkeypat
     monkeypatch.setattr(git, "sync", fake_sync)
     outcome = await apps.deploy(yard, "heldso")
     assert outcome.status == "ok"
-    assert "hint: heldso reads settings that its env does not set:" in outcome.log
-    assert "SECRET_KEY" in outcome.log
-
-
-async def test_migrate_containerfile_yard_pins_the_template_over_a_repo_dockerfile(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    """`containerfile yard` meant "Yard writes the file": a repo Dockerfile must not take it over."""
-    yard = make_yard(tmp_path, skip=False)
-    clone = _stario_clone(yard, "tpl-app")
-    (clone / "Dockerfile").write_text("FROM scratch\n")
-    record = tmp_path / "apps" / "tpl-app" / "app"
-    record.write_text("repo https://origin.cursor.com/org/x\nref main\ntrigger push\ncreated t\ncontainerfile yard\n")
-    apps.migrate(yard)
-    store = Store.open(tmp_path)
-    assert store.app("tpl-app").runs == "yard:python-uv"
-    dep = read_deployed(yard.config, "tpl-app")
-    assert dep is not None and dep.runs == "yard:python-uv"
-
-    # And the next deploy runs the template, not the Dockerfile: no guard error.
-    _connect(monkeypatch)
-    recorder = _Apply()
-    monkeypatch.setattr(compose, "apply", recorder)
-
-    async def fake_sync(_c, url, ref, token=""):
-        return git.head(clone)
-
-    monkeypatch.setattr(git, "sync", fake_sync)
-    outcome = await apps.deploy(yard, "tpl-app")
-    assert outcome.status == "ok"
-    after = read_deployed(yard.config, "tpl-app")
-    assert after is not None
-    assert outcome.image.endswith(after.template)
-    assert "yard:python-uv" in outcome.log
+    lines = "\n".join(yard.deploys["heldso"].lines)
+    assert "hint: heldso reads settings that its env does not set:" in lines
+    assert "SECRET_KEY" in lines
 
 
 async def test_check_plan_failure_is_not_retried(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1169,3 +1089,79 @@ async def test_check_url_containerfile_is_not_retried(tmp_path: Path, monkeypatc
     assert tried[0].startswith("sha256:")
     await apps.check_all(yard)
     assert yard.tips["umami"].tried == tried  # no new deploy attempt
+
+
+async def test_a_deploy_writes_a_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard, _recorder = _deploy_yard(tmp_path, monkeypatch)
+    outcome = await apps.deploy(yard, "heldso")
+    job = yard.deploys["heldso"]
+    assert outcome.status == "ok"
+    assert job.status == "ok" and job.ended and job.outcome is not None
+    assert job.outcome["status"] == "ok"
+    assert job.lines[0] == "== sync https://origin.cursor.com/org/app main"
+    assert any(line.startswith("== runs ") for line in job.lines)
+    assert job.lines[-1].startswith(("== ", "hint:", "  ", "Set ", "Or ", "Then "))
+    assert job.id and job.cause == "manual"
+
+
+async def test_start_deploy_returns_the_running_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard, _recorder = _deploy_yard(tmp_path, monkeypatch)
+    gate = asyncio.Event()
+
+    async def slow(*a, **kw):
+        gate.set()
+        await asyncio.sleep(0.05)
+        return (0, "== done\n")
+
+    monkeypatch.setattr(compose, "apply", slow)
+    job = apps.start_deploy(yard, "heldso")
+    assert job.status == "running"
+    await gate.wait()
+    assert apps.start_deploy(yard, "heldso").id == job.id
+    await asyncio.sleep(0.1)
+    assert job.status == "ok"
+
+
+async def test_apply_lines_reach_the_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard, _recorder = _deploy_yard(tmp_path, monkeypatch)
+    await apps.deploy(yard, "heldso")
+    lines = yard.deploys["heldso"].lines
+    assert "== build localhost/heldso:abc" in lines
+    assert lines.index("== build localhost/heldso:abc") < lines.index("== started localhost/heldso:abc")
+
+
+def test_job_lines_trim_keeps_the_offset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A follower mid-stream loses no line when the buffer trims at JOB_LINES."""
+    import app.server.yard as yard_mod
+
+    monkeypatch.setattr(yard_mod, "JOB_LINES", 5)
+    job = apps._new_job(make_yard(tmp_path), "x", "manual", "")
+    for index in range(7):
+        job.push(f"l{index}")
+    # Follower pass 1 reads every unseen line (only the last 5 are buffered).
+    seen, got = 0, []
+    start = max(0, len(job.lines) - (job.pushed - seen))
+    got += job.lines[start:]
+    seen = job.pushed
+    for index in range(7, 12):
+        job.push(f"l{index}")
+    # Pass 2 emits exactly the five new lines — no repeats, tail complete.
+    start = max(0, len(job.lines) - (job.pushed - seen))
+    got += job.lines[start:]
+    assert len(got) == len(set(got))
+    assert got == [f"l{i}" for i in range(2, 12)]
+
+
+async def test_a_very_long_apply_line_still_deploys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard, _recorder = _deploy_yard(tmp_path, monkeypatch)
+    long_line = "x" * (100 * 1024)
+
+    async def apply(config, name, command, project, *, detach=False, on_line=None):
+        if on_line:
+            on_line(long_line)
+        return 0, long_line + "\n"
+
+    monkeypatch.setattr(compose, "apply", apply)
+    outcome = await apps.deploy(yard, "heldso")
+    assert outcome.status == "ok"
+    assert long_line in yard.deploys["heldso"].lines

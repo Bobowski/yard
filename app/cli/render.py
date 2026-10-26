@@ -46,7 +46,7 @@ def _status_cells(row: dict, now: datetime) -> list[str]:
         mem,
         format_bytes(int(row.get("data") or 0)) if row.get("data") else "",
         _rev(str(row.get("sha") or ""), str(row.get("tip") or "")),
-        _bind_text(row.get("binds")),
+        _bind_text(row.get("binds"), str(row.get("container") or "")),
         _deploy_text(row.get("deploy")),
     ]
 
@@ -85,8 +85,8 @@ def _state_text(row: dict, now: datetime) -> str:
     return state
 
 
-def _bind_text(binds: Any) -> str:
-    """Hosts that share a dial stay in one phrase. A second dial is a second phrase."""
+def _bind_text(binds: Any, container: str = "") -> str:
+    """Hosts that share a dial stay in one phrase. The row's own container is elided."""
     if not isinstance(binds, list):
         return ""
     groups: dict[str, list[str]] = {}
@@ -98,6 +98,10 @@ def _bind_text(binds: Any) -> str:
         dial = str(row.get("dial") or "")
         if not host:
             continue
+        if container and (dial == container or dial == f"{container}:8000"):
+            dial = ""
+        elif container and dial.startswith(f"{container}:"):
+            dial = dial.removeprefix(container)
         if dial not in groups:
             groups[dial] = []
             order.append(dial)
