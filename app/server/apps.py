@@ -28,7 +28,7 @@ def ensure_host(yard: Yard) -> None:
     except YardError as exc:
         if exc.code != "not_found":
             raise
-        yard.store.create_app("yard", "", "main", "manual")
+        yard.store.create_app("yard", "", "", "manual")
     # A yard self-deploy ends "pending": the running process is the truth, so the
     # boot sha is the deployed revision. Without this the check loop would
     # redeploy Yard on every restart.
@@ -552,7 +552,9 @@ async def _apply(yard: Yard, app: App, plan: Plan, sha: str, *, cause: str, acto
         app.name,
         Deployed(revision=sha, runs=plan.answer, kind=plan.kind, reason=plan.reason, template=plan.template),
     )
-    return Outcome("ok", image, log_text, previous=previous, missing_env=missing_env)
+    return Outcome(
+        "ok", image, log_text, previous=previous, missing_env=missing_env, port=await _exposed_port(yard, app.name)
+    )
 
 
 def _env_hint(yard: Yard, app: App, log: str) -> tuple[str, str]:

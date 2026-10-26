@@ -443,13 +443,13 @@ def test_app_new(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture)
         "/api/v1/apps",
         {"name": "web", "repo": "https://origin.cursor.com/org/heldso", "ref": "main"},
     )
-    assert seen[1] == (
+    # A new app deploys right away, and the bind follows it.
+    assert seen[1] == ("POST", "/api/v1/apps/web/deploy", {})
+    assert seen[2] == (
         "PUT",
         "/api/v1/binds/heldso.example.com",
         {"dial": "web-app-1:8000", "try": "30s"},
     )
-    # A new app deploys right away.
-    assert seen[2] == ("POST", "/api/v1/apps/web/deploy", {})
     out = capsys.readouterr().out
     assert "https://origin.cursor.com/org/heldso" in out
     assert "Deploying web now…" in out
@@ -1690,3 +1690,163 @@ def test_app_set_runs_manual_message(monkeypatch: pytest.MonkeyPatch, capsys: py
     out = capsys.readouterr().out
     assert "still runs the old way until the next deploy" in out
     assert "Deploy now: yard app deploy --app db" in out
+
+
+def _bind_calls(sent):
+    return [call for call in sent if call[0] == "PUT" and call[1].startswith("/api/v1/binds/")]
+
+
+def test_app_new_binds_the_exposed_port(monkeypatch: pytest.MonkeyPatch):
+    sent = []
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        sent.append((method, path, body))
+        if path == "/api/v1/apps":
+            return 200, json.dumps({"app": {"name": "web"}})
+        if path.endswith("/deploy"):
+            return 200, json.dumps({"deploy": {"status": "ok", "port": 3000}})
+        return 200, "{}"
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    _env(monkeypatch)
+    main(
+        [
+            "app",
+            "new",
+            "--text",
+            "--repo",
+            "https://origin.cursor.com/org/web",
+            "--public",
+            "web.example.com",
+        ]
+    )
+    bind = _bind_calls(sent)[0]
+    assert bind[2]["dial"] == "web-app-1:3000"
+    # The bind comes after the deploy.
+    assert sent.index(("POST", "/api/v1/apps/web/deploy", {})) < sent.index(bind)
+
+
+def test_app_new_port_flag_overrides(monkeypatch: pytest.MonkeyPatch):
+    sent = []
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        sent.append((method, path, body))
+        if path == "/api/v1/apps":
+            return 200, json.dumps({"app": {"name": "web"}})
+        if path.endswith("/deploy"):
+            return 200, json.dumps({"deploy": {"status": "ok", "port": 3000}})
+        return 200, "{}"
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    _env(monkeypatch)
+    main(
+        [
+            "app",
+            "new",
+            "--text",
+            "--repo",
+            "https://origin.cursor.com/org/web",
+            "--public",
+            "web.example.com",
+            "--port",
+            "9000",
+        ]
+    )
+    assert _bind_calls(sent)[0][2]["dial"] == "web-app-1:9000"
+
+
+def test_app_new_repo_app_falls_back_to_8000(monkeypatch: pytest.MonkeyPatch):
+    sent = []
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        sent.append((method, path, body))
+        if path == "/api/v1/apps":
+            return 200, json.dumps({"app": {"name": "web"}})
+        if path.endswith("/deploy"):
+            return 200, json.dumps({"deploy": {"status": "ok", "port": 0}})
+        return 200, "{}"
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    _env(monkeypatch)
+    main(
+        [
+            "app",
+            "new",
+            "--text",
+            "--repo",
+            "https://origin.cursor.com/org/web",
+            "--public",
+            "web.example.com",
+        ]
+    )
+    assert _bind_calls(sent)[0][2]["dial"] == "web-app-1:8000"
+
+
+def test_app_new_repo_less_port_zero_prints_hint(monkeypatch: pytest.MonkeyPatch, capsys):
+    sent = []
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        sent.append((method, path, body))
+        if path == "/api/v1/apps":
+            return 200, json.dumps({"app": {"name": "db"}})
+        if path.endswith("/deploy"):
+            return 200, json.dumps({"deploy": {"status": "ok", "port": 0}})
+        return 200, "{}"
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    _env(monkeypatch)
+    main(["app", "new", "--runs", "postgres:17", "--public", "db.example.com", "--text"])
+    assert _bind_calls(sent) == []
+    assert "Bind it: yard bind set db.example.com postgres-app-1:PORT" in capsys.readouterr().out
+
+
+def test_app_new_failed_deploy_binds_8000_for_a_repo_app(monkeypatch: pytest.MonkeyPatch):
+    sent = []
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        sent.append((method, path, body))
+        if path == "/api/v1/apps":
+            return 200, json.dumps({"app": {"name": "web"}})
+        if path.endswith("/deploy"):
+            return 500, json.dumps({"error": {"message": "build failed"}})
+        return 200, "{}"
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    _env(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "app",
+                "new",
+                "--text",
+                "--repo",
+                "https://origin.cursor.com/org/web",
+                "--public",
+                "web.example.com",
+            ]
+        )
+    assert _bind_calls(sent)[0][2]["dial"] == "web-app-1:8000"
+
+
+def test_app_new_no_deploy_repo_app_binds_8000(monkeypatch: pytest.MonkeyPatch):
+    sent = []
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        sent.append((method, path, body))
+        return 200, json.dumps({"app": {"name": "web"}})
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    _env(monkeypatch)
+    main(
+        [
+            "app",
+            "new",
+            "--text",
+            "--repo",
+            "https://origin.cursor.com/org/web",
+            "--public",
+            "web.example.com",
+            "--no-deploy",
+        ]
+    )
+    assert _bind_calls(sent)[0][2]["dial"] == "web-app-1:8000"
