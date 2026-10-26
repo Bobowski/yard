@@ -333,6 +333,10 @@ def test_the_runs_line_renders_all_kinds():
     out = format_record(json.dumps(template))
     assert "runs  auto → yard:python-uv @3f9a1c2e (containerfile; stario: pyproject.toml declares stario)" in out
 
+    pinned = {**template, "runs": "yard:python-uv"}
+    out = format_record(json.dumps(pinned))
+    assert "runs  yard:python-uv @3f9a1c2e (containerfile; stario: pyproject.toml declares stario)" in out
+
     path = {"runs": "ops/stack.yml", "deployed": {"runs": "ops/stack.yml", "kind": "compose", "revision": "abc"}}
     assert "runs  ops/stack.yml (compose)" in format_record(json.dumps(path))
 
