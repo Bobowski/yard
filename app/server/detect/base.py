@@ -1,10 +1,14 @@
 """The shared spine of the detectors: the checkout handle, the plan, the settings row."""
 
+import hashlib
+import json
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-_TEMPLATES = Path(__file__).resolve().parent / "templates"
+_HERE = Path(__file__).resolve().parent
+_TEMPLATES = _HERE / "templates"
+BASES: dict[str, str] = json.loads((_HERE / "bases.json").read_text())
 
 SET_BY_YARD = {
     "PROJECT_NAME",
@@ -45,11 +49,11 @@ class Repo:
 class Plan:
     """One answer to "what does the app run"."""
 
-    field: str  # "compose" or "containerfile"
-    value: str  # a repo-relative path, or "yard" for the written Containerfile
-    reason: str  # human text: "found compose.yml", "pyproject.toml declares stario"
-    generated: str = ""  # the rendered Containerfile when value is "yard"
-    kind: str = ""  # stario, python, go, or node
+    kind: str  # "compose" or "containerfile"
+    answer: str  # a repo-relative path, or "yard:<template>" for a written Containerfile
+    reason: str  # human text: "found compose.yml", "stario: pyproject.toml declares stario"
+    generated: str = ""  # the rendered Containerfile when answer is "yard:<name>"
+    template: str = ""  # first 8 hex of the rendered text's sha256
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,19 +65,35 @@ class Setting:
     where: str  # "app/config.py:37"
 
 
-def _header(kind: str, reason: str, name: str) -> str:
+def pin(ref: str) -> str:
+    """image:tag@sha256:<index digest>, from the pinned base table."""
+    return f"{ref}@{BASES[ref]}"
+
+
+def _header(answer: str, reason: str, name: str) -> str:
     return (
-        f"# Written by Yard for a {kind} app ({reason})."
+        f"# Written by Yard for {answer} ({reason})."
         f" To change it, copy it into your repo: yard app cat containerfile --app {name or '<name>'} > Containerfile\n"
     )
 
 
-def render(kind: str, reason: str, name: str, template: str = "", **values: str) -> str:
-    text = (_TEMPLATES / f"{template or kind}.Containerfile").read_text()
+def render(answer: str, reason: str, name: str, template: str = "", **values: str) -> str:
+    text = (_TEMPLATES / f"{template or answer}.Containerfile").read_text()
     values["name"] = name or "<name>"
     for key, value in values.items():
         text = text.replace(f"{{{{{key}}}}}", value)
-    return _header(kind, reason, name) + text
+    return _header(answer, reason, name) + text
+
+
+def plan_template(answer: str, reason: str, name: str, template: str = "", **values: str) -> Plan:
+    """A containerfile plan: the rendered text and its 8-hex template stamp."""
+    generated = render(answer, reason, name, template, **values)
+    return Plan("containerfile", answer, reason, generated, template_hash(generated))
+
+
+def template_hash(text: str) -> str:
+    """The template stamp: first 8 hex of the written file's sha256."""
+    return hashlib.sha256(text.encode()).hexdigest()[:8]
 
 
 def _join(items: list[str]) -> str:

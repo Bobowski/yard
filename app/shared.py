@@ -266,6 +266,7 @@ def check_build_path(text: str) -> str:
         or len(value) > 200
         or value.startswith("/")
         or "\\" in value
+        or ":" in value
         or ".." in value.split("/")
         or any(ch.isspace() or ord(ch) < 32 for ch in value)
     ):
@@ -280,24 +281,45 @@ def check_build_path(text: str) -> str:
     return value
 
 
-def check_containerfile(text: str) -> str:
-    """The app's Containerfile: `yard` writes one, anything else is a repo path."""
-    if text.strip() == "yard":
-        return "yard"
-    return check_build_path(text)
+# The Containerfiles Yard writes. `runs yard:<name>` names one of these.
+TEMPLATES = ("python-uv", "python-pip", "go", "node-npm")
+
+_TEMPLATE = re.compile(r"yard:[a-z0-9-]+$")
 
 
-def check_compose(text: str) -> str:
-    """The app's compose file: always a repo-relative path."""
-    if text.strip() == "yard":
-        raise YardError(
-            400,
-            "bad_compose",
-            "compose must be a file inside the repo",
-            context={"compose": text},
-            help_text="Yard's own compose file comes with --containerfile.",
-        )
-    return check_build_path(text)
+def parse_runs(text: str) -> tuple[str, str]:
+    """Classify a `runs` value. Returns (kind, normalized).
+
+    Kinds: auto (unset), template (yard:<name>), url (https), image, path.
+    """
+    value = text.strip()
+    if value in {"", "auto"}:
+        return "auto", ""
+    if value.startswith("yard:"):
+        if not _TEMPLATE.fullmatch(value):
+            raise _bad_runs(value, f"template names are lowercase: {', '.join(f'yard:{t}' for t in TEMPLATES)}")
+        return "template", value
+    if value.startswith("https://"):
+        if len(value) > 500:
+            raise _bad_runs(value, "the URL is over 500 characters")
+        return "url", value
+    if value.startswith("http://"):
+        raise _bad_runs(value, "files are fetched over https")
+    if "://" in value:
+        raise _bad_runs(value, "files are fetched over https")
+    if ":" in value or "@" in value:
+        return "image", check_image(value)
+    return "path", check_build_path(value)
+
+
+def _bad_runs(value: str, message: str) -> YardError:
+    return YardError(
+        400,
+        "bad_runs",
+        f"runs {value}: {message}",
+        context={"runs": value},
+        help_text="auto, a path in the repo, yard:<template>, an image name:tag, or an https URL.",
+    )
 
 
 def name_ok(name: str) -> bool:
@@ -326,10 +348,16 @@ def check_env(env: Mapping[str, str | None]) -> None:
 
 
 def image_sha(image: str) -> str:
+    """The image tag, with a template suffix dropped: localhost/x:sha12-tpl8 -> sha12."""
     if ":" not in image:
         return ""
     head, _, tail = image.rpartition(":")
-    return tail if head and tail else ""
+    if not head or not tail:
+        return ""
+    base, dash, suffix = tail.rpartition("-")
+    if dash and head.startswith("localhost/") and re.fullmatch(r"[0-9a-f]{8}", suffix):
+        return base
+    return tail
 
 
 def short_sha(sha: str) -> str:
@@ -494,12 +522,9 @@ def ensure_file(path: Path, mode: int = 0o600) -> None:
         atomic_write(path, "", mode)
 
 
-RECIPES = "https://raw.githubusercontent.com/Bobowski/yard/main/recipes"
-
 _IMAGE_REPO = re.compile(r"[a-z0-9._-]+")
 _IMAGE_TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
 _IMAGE_DIGEST = re.compile(r"[0-9a-f]{64}")
-_RECIPE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 
 
 def check_image(text: str) -> str:
@@ -528,27 +553,3 @@ def check_image(text: str) -> str:
     if not colon and not sep:
         raise bad
     return ref
-
-
-def check_recipe(text: str) -> str:
-    """A recipe: a name of one Yard recipe, or an https URL. The stored value is the URL."""
-    value = text.strip()
-    if _RECIPE_NAME.fullmatch(value):
-        return f"{RECIPES}/{value}.yml"
-    if value.startswith("http://"):
-        raise YardError(
-            400,
-            "bad_recipe",
-            "recipes are fetched over https",
-            context={"recipe": text},
-            help_text=f"Use the https URL, or a name of one: {RECIPES}/",
-        )
-    if value.startswith("https://") and len(value) <= 500:
-        return value
-    raise YardError(
-        400,
-        "bad_recipe",
-        "a recipe is a name or an https URL",
-        context={"recipe": text},
-        help_text=f"Like postgres, or an https URL to a compose file. Yard recipes: {RECIPES}/",
-    )

@@ -1,4 +1,4 @@
-FROM golang:{{version}} AS builder
+FROM {{golang}} AS builder
 
 WORKDIR /workspace
 
@@ -9,7 +9,7 @@ COPY . /workspace
 
 RUN CGO_ENABLED=0 go build -trimpath -o /out/app {{pkg}}
 
-FROM gcr.io/distroless/static-debian12
+FROM {{static}}
 
 ENV PORT=8000
 

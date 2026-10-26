@@ -98,7 +98,9 @@ def test_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     data.mkdir(parents=True)
     (data / "f").write_bytes(b"x" * 10)
 
-    yard.tips["heldso"] = "tip9"
+    from app.server.yard import Tip
+
+    yard.tips["heldso"] = Tip(revision="tip9")
     report = asdict(asyncio.run(status.report(yard)))
 
     assert report["host"] == {
@@ -197,7 +199,9 @@ def test_app_report_is_the_app_page(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         return True
 
     monkeypatch.setattr(status, "probe", fake_probe)
-    yard.tips["heldso"] = "tip9"
+    from app.server.yard import Tip
+
+    yard.tips["heldso"] = Tip(revision="tip9")
     found = asdict(asyncio.run(status.app_report(yard, "heldso")))
 
     assert found["app"]["name"] == "heldso"
@@ -243,36 +247,39 @@ def test_two_public_names_stay_on_the_app_row(tmp_path: Path, monkeypatch: pytes
     assert rows["heldso-worker"]["binds"] == []
 
 
-def test_recipe_row_shows_the_revision(tmp_path):
-    """A recipe app's container runs the recipe's image; the rev is the revision file."""
-    from app.server import compose
+def test_url_row_shows_the_deployed_revision(tmp_path):
+    """A URL app's container runs the compose's image; the rev is the deployed file."""
     from app.server.podman import Container
-    from app.server.store import Store
+    from app.server.store import Deployed, Store, write_deployed
+    from app.server.yard import Tip
 
     store = Store.open(tmp_path)
-    app = store.create_app("umami", "", recipe="https://example.com/umami.yml")
+    app = store.create_app("umami", "", runs="https://example.com/umami.yml")
     revision = "sha256:" + "b" * 64
-    compose.write_revision(
-        store_config := __import__("app.server.store", fromlist=["Config"]).Config(
-            root=tmp_path,
-            podman_sock="",
-            podman_bin="",
-            skip_deploy=True,
-            boot=False,
-            remote=False,
-            journal_dir=tmp_path / "j",
-            journalctl_bin="",
-            journal_socket=tmp_path / "s.sock",
-        ),
-        "umami",
-        revision,
+    config = __import__("app.server.store", fromlist=["Config"]).Config(
+        root=tmp_path,
+        podman_sock="",
+        podman_bin="",
+        skip_deploy=True,
+        boot=False,
+        remote=False,
+        journal_dir=tmp_path / "j",
+        journalctl_bin="",
+        journal_socket=tmp_path / "s.sock",
     )
-    config = store_config
+    write_deployed(config, "umami", Deployed(revision=revision, runs=app.runs, kind="compose"))
     item = Container(name="umami-app-1", image="postgres:17", app="umami", running=True, state="running")
-    row = status._row(config, item, app, None, revision, None, [], {})
+    row = status._row(
+        config, item, app, None, Tip(revision="sha256:" + "c" * 64), read_dep(config, "umami"), None, [], {}
+    )
     assert row.sha == revision
-    row2 = status._row(config, item, app, None, "sha256:" + "c" * 64, None, [], {})
-    assert row2.tip == "sha256:" + "c" * 64
+    assert row.tip == "sha256:" + "c" * 64
+
+
+def read_dep(config, name):
+    from app.server.store import read_deployed
+
+    return read_deployed(config, name)
 
 
 async def test_probe_uses_the_bind_port(tmp_path, monkeypatch):

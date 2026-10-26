@@ -1,5 +1,5 @@
 # Uptime Kuma: a self-hosted status monitor. https://github.com/louislam/uptime-kuma
-# port: 3001
+# yard app new --runs https://raw.githubusercontent.com/Bobowski/yard/main/examples/uptime-kuma.compose.yml --public <host>
 services:
   app:
     image: docker.io/louislam/uptime-kuma:1@sha256:70233f4acb5163fd2a59a49909cf01e44415cecff13dba69e3a86647a2919f83
@@ -10,6 +10,8 @@ services:
       - ${DATA_DIR}:/app/data
     env_file:
       - ${APP_ENV}
+    expose:
+      - "3001"
 networks:
   yard:
     external: true

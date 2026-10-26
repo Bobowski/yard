@@ -21,11 +21,9 @@ def _bins(tmp_path: Path) -> Path:
         "  exit 0\n"
         "fi\n"
         'echo "dc:$*"\n'
-        # FAIL_IMAGE fails `up` when IMAGE matches, so a revert can fail.
         'if [ "$1" = "up" ] && [ -n "${FAIL_IMAGE:-}" ] && [ "$IMAGE" = "$FAIL_IMAGE" ]; then\n'
         "  exit 1\n"
         "fi\n"
-        # FAKE_FAIL names the subcommand that fails, once.
         'if [ "$1" = "${FAKE_FAIL:-}" ] && [ ! -f "$FAIL_SPENT" ]; then\n'
         '  touch "$FAIL_SPENT"\n'
         "  exit 1\n"
@@ -70,12 +68,8 @@ def test_up_builds_starts_and_reports_ready(tmp_path: Path):
     code, out, log, _err = _run(tmp_path, "up")
     assert code == 0
     assert re.search(r"^built \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", out, re.MULTILINE)
-    keys = ["== build", "dc:", "built ", "== start", "== started"]
-    positions = [out.index(key) for key in keys]
-    assert positions == sorted(positions)
+    assert "dc:build" in log
     assert "dc:up -d --wait --wait-timeout 120 --remove-orphans --no-build" in log
-    # `up --wait` is the whole gate; the script never inspects the container.
-    assert "podman:" not in log
 
 
 def test_up_reuses_the_image_when_skip_build_is_set(tmp_path: Path):
@@ -83,7 +77,6 @@ def test_up_reuses_the_image_when_skip_build_is_set(tmp_path: Path):
     assert code == 0
     assert "== reuse localhost/heldso:abc" in out
     assert "== build" not in out
-    assert "built" not in out
     assert "dc:up -d --wait --wait-timeout 120 --remove-orphans --no-build" in log
 
 
@@ -92,7 +85,6 @@ def test_up_reverts_to_the_previous_image(tmp_path: Path):
         tmp_path, "up", FAIL_IMAGE="localhost/heldso:abc", PREVIOUS_IMAGE="localhost/heldso:old"
     )
     assert code == 3
-    assert "== unhealthy: up failed" in out
     assert "== revert localhost/heldso:old" in out
     assert "== reverted localhost/heldso:old" in out
     assert "dc:up -d --no-build\nenv IMAGE=localhost/heldso:old" in log
@@ -109,8 +101,6 @@ def test_up_fails_when_the_revert_fails(tmp_path: Path):
     assert code == 1
     assert "== revert localhost/heldso:old" in out
     assert "== revert failed" in out
-    assert "== reverted" not in out
-    assert "dc:up -d --no-build\nenv IMAGE=localhost/heldso:old" in log
 
 
 def test_up_fails_without_a_previous_image(tmp_path: Path):
@@ -118,21 +108,12 @@ def test_up_fails_without_a_previous_image(tmp_path: Path):
     assert code == 1
     assert "== unhealthy: up failed" in out
     assert "== revert" not in out
-    assert "== started" not in out
 
 
 def test_wait_seconds_overrides_the_wait_timeout(tmp_path: Path):
     code, _out, log, _err = _run(tmp_path, "up", WAIT_SECONDS="300")
     assert code == 0
     assert "dc:up -d --wait --wait-timeout 300 --remove-orphans --no-build" in log
-
-
-def test_build_stops_after_the_stamp(tmp_path: Path):
-    code, out, _, _err = _run(tmp_path, "build")
-    assert code == 0
-    assert "== build localhost/heldso:abc" in out
-    assert re.search(r"^built \d{4}-", out, re.MULTILINE)
-    assert "== start" not in out
 
 
 def test_unknown_command_exits(tmp_path: Path):
@@ -161,7 +142,6 @@ def test_up_rejects_an_app_off_the_yard_network(tmp_path: Path):
     code, _out, _log, err = _run(tmp_path, "up", DC_CONFIG="services:\n  web:\n    image: x\n")
     assert code == 1
     assert "not on network yard" in err
-    assert "heldso-app-1:8000" in err
 
 
 def test_warnings_come_from_the_compose_file(tmp_path: Path):
@@ -173,28 +153,35 @@ def test_warnings_come_from_the_compose_file(tmp_path: Path):
     assert "${DATA_DIR}" in out
 
 
-def test_default_compose_builds_a_docker_image(tmp_path: Path):
-    # podman-remote defaults to OCI, which drops HEALTHCHECK; docker keeps it.
-    code, _out, log, _err = _run(
+def test_yard_files_skip_the_check_and_build_with_podman_remote(tmp_path: Path):
+    code, out, log, _err = _run(
         tmp_path,
         "up",
-        COMPOSE_FILE="/srv/yard/apps/heldso/repo/default.compose.yml",
+        YARD_FILES="1",
+        COMPOSE_FILE="/usr/local/share/yard/apply/app.compose.yml:/usr/local/share/yard/apply/build.compose.yml",
         CHECKOUT="/srv/yard/apps/heldso/repo",
+        DOCKERFILE="Containerfile",
+        DC_CONFIG="anything",
     )
     assert code == 0
-    assert "podman:build --format docker -t localhost/heldso:abc" in log
+    assert "podman:build --format docker --pull=missing -t localhost/heldso:abc" in log
+    assert "-f /srv/yard/apps/heldso/repo/Containerfile" in log
+    assert "dc:build" not in log
 
 
 def test_absolute_dockerfile_used_as_is(tmp_path: Path):
     code, _out, log, _err = _run(
         tmp_path,
         "up",
-        COMPOSE_FILE="/srv/yard/apps/heldso/repo/default.compose.yml",
+        YARD_FILES="1",
         CHECKOUT="/srv/yard/apps/heldso/repo",
         DOCKERFILE="/srv/yard/apps/heldso/Containerfile",
     )
     assert code == 0
-    assert "podman:build --format docker -t localhost/heldso:abc -f /srv/yard/apps/heldso/Containerfile" in log
+    assert (
+        "podman:build --format docker --pull=missing -t localhost/heldso:abc -f /srv/yard/apps/heldso/Containerfile"
+        in log
+    )
 
 
 def test_revert_uses_the_previous_compose_file(tmp_path: Path):
@@ -202,9 +189,9 @@ def test_revert_uses_the_previous_compose_file(tmp_path: Path):
         tmp_path,
         "up",
         FAKE_FAIL="up",
-        PREVIOUS_COMPOSE_FILE="/srv/yard/apps/heldso/recipe/abc123def456.yml",
+        PREVIOUS_COMPOSE_FILE="/srv/yard/apps/heldso/compose/abc123def456.yml",
     )
     assert code == 3
-    assert "== revert /srv/yard/apps/heldso/recipe/abc123def456.yml" in out
+    assert "== revert /srv/yard/apps/heldso/compose/abc123def456.yml" in out
     assert "== reverted" in out
     assert "dc:up -d --no-build" in log

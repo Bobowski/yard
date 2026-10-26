@@ -110,7 +110,7 @@ def _bind_text(binds: Any) -> str:
 
 
 def _short(sha: str) -> str:
-    """A git sha reads as 7 chars; a sha256: image/recipe revision as the 12 after the prefix."""
+    """A git sha reads as 7 chars; a sha256: digest as the 12 after the prefix."""
     hexed = sha.removeprefix("sha256:")
     return hexed[:12] if len(hexed) > 40 else hexed[:7]
 
@@ -185,6 +185,8 @@ def format_app_status(report: dict, now: datetime, *, color: bool = False) -> st
     rev = f"rev {_short(sha)}" if sha else ""
     if tip and _short(tip) != _short(sha):
         rev += f" · tip {_short(tip)}"
+    if report.get("template_moved"):
+        rev += " · template moved"
     image = str(report.get("image") or "")
     if image:
         rev += f" · image {image}"
@@ -195,9 +197,7 @@ def format_app_status(report: dict, now: datetime, *, color: bool = False) -> st
         lines.append(rev)
     data = max((int(row.get("data") or 0) for row in rows), default=0)
     lines.append(f"data {format_bytes(data)} · env {report.get('env_file') or ''}")
-    for field in ("containerfile", "compose", "image", "recipe"):
-        if str(record.get(field) or ""):
-            lines.append(f"{field}  {record[field]}")
+    lines.append(f"runs  {_runs_text(record)}")
 
     binds = [row for row in report.get("binds") or [] if isinstance(row, dict) and row.get("host")]
     if binds:
@@ -278,7 +278,7 @@ def format_apps(rows: list, *, color: bool = False) -> str:
     for row in rows:
         if not isinstance(row, dict):
             continue
-        source = str(row.get("repo") or row.get("image") or row.get("recipe") or "")
+        source = str(row.get("repo") or row.get("runs") or "auto")
         ref = str(row.get("ref") or "") if row.get("repo") else ""
         body.append([str(row.get("name") or ""), source, ref, str(row.get("trigger") or "")])
     return _render(["app", "repo", "ref", "trigger"], body, color=color)
@@ -386,8 +386,34 @@ def format_record(body: str) -> str:
         return f"{data['name']}\n"
     if not data.get("repo"):
         data.pop("ref", None)
-    lines = [f"{key}  {value}" for key, value in data.items() if value not in ("", None, [], {})]
+    runs = _runs_text(data)
+    lines = [
+        f"{key}  {value}"
+        for key, value in data.items()
+        if key not in ("runs", "deployed") and value not in ("", None, [], {})
+    ]
+    lines.append(f"runs  {runs}")
     return ("\n".join(lines) + "\n") if lines else ""
+
+
+def _runs_text(record: dict) -> str:
+    """The runs line: the record's value plus what the last deploy answered."""
+    shown = str(record.get("runs") or "") or "auto"
+    deployed = record.get("deployed")
+    if not isinstance(deployed, dict):
+        return f"{shown} (not deployed yet)"
+    answer = str(deployed.get("runs") or "")
+    if str(deployed.get("template") or ""):
+        answer += f" @{deployed['template']}"
+    text = shown if answer in ("", "auto", shown) else f"{shown} → {answer}"
+    inner = str(deployed.get("kind") or "")
+    revision = str(deployed.get("revision") or "")
+    if revision.startswith("sha256:"):
+        inner += f" @{revision[:19]}"
+    reason = str(deployed.get("reason") or "")
+    if reason:
+        inner += f"; {reason}"
+    return f"{text} ({inner})" if inner else text
 
 
 # --- render and time -------------------------------------------------------

@@ -1,0 +1,15 @@
+# The build overlay: app.compose.yml plus this file builds the repo's Containerfile.
+services:
+  app:
+    build:
+      context: ${CHECKOUT}
+      dockerfile: ${DOCKERFILE}
+    pull_policy: never
+    environment:
+      PORT: "8000"
+      # A Stario app binds this address. 127.0.0.1 would hide it from Caddy.
+      STARIO_HOST: 0.0.0.0
+      STARIO_PORT: "8000"
+      STARIO_TRACER: json
+    expose:
+      - "8000"

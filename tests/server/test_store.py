@@ -1,11 +1,12 @@
-"""The file store: apps, tokens, and the admin token."""
+"""The file store: apps, tokens, the admin token, and the deployed file."""
 
 from pathlib import Path
 
 import pytest
 
-from app.server.store import Store, ensure_admin
+from app.server.store import Deployed, Store, ensure_admin, read_deployed, write_deployed
 from app.shared import YardError
+from tests.server.conftest import make_yard
 
 
 def test_store_rows(tmp_path):
@@ -87,72 +88,49 @@ def test_env_files_round_trip(tmp_path):
     assert oct(path.stat().st_mode & 0o777) == "0o600"
 
 
-def test_app_build_fields_round_trip(tmp_path: Path):
+def test_runs_round_trip(tmp_path: Path):
     store = Store.open(tmp_path)
-    app = store.create_app("heldso", "https://github.com/org/heldso", containerfile="Dockerfile")
-    assert app.containerfile == "Dockerfile"
-    assert store.app("heldso").containerfile == "Dockerfile"
-    app = store.update_app("heldso", compose="compose.yml")
-    assert app.compose == "compose.yml"
-    assert app.containerfile == ""
-    app = store.update_app("heldso", compose="")
-    assert app.compose == ""
-    app = store.update_app("heldso", containerfile="yard")
-    assert app.containerfile == "yard"
-    assert "containerfile yard" in (tmp_path / "apps" / "heldso" / "app").read_text()
+    app = store.create_app("heldso", "https://github.com/org/heldso", runs="ops/stack.yml")
+    assert app.runs == "ops/stack.yml"
+    assert store.app("heldso").runs == "ops/stack.yml"
+    app = store.update_app("heldso", runs="yard:python-uv")
+    assert app.runs == "yard:python-uv"
+    assert "runs yard:python-uv" in (tmp_path / "apps" / "heldso" / "app").read_text()
+    app = store.update_app("heldso", runs="")
+    assert app.runs == ""
 
 
-def test_app_build_fields_old_record(tmp_path: Path):
+def test_runs_kinds(tmp_path: Path):
     store = Store.open(tmp_path)
     store.create_app("heldso", "https://github.com/org/heldso")
-    record = "repo https://github.com/org/heldso\nref main\ntrigger push\ncreated now\n"
-    (tmp_path / "apps" / "heldso" / "app").write_text(record)
-    app = store.app("heldso")
-    assert app.containerfile == ""
-    assert app.compose == ""
+    for bad in ("/abs", "a/../b", "a b", "a\\b", "a:b"):
+        with pytest.raises(YardError):
+            store.update_app("heldso", runs=bad)
+    with pytest.raises(YardError, match="unknown template"):
+        store.update_app("heldso", runs="yard:rust")
+    with pytest.raises(YardError, match="runs a file from it|an app with a repo"):
+        store.update_app("heldso", runs="postgres:17")
 
 
-def test_app_build_fields_validate(tmp_path: Path):
+def test_runs_pair_rule(tmp_path: Path):
     store = Store.open(tmp_path)
-    store.create_app("heldso", "https://github.com/org/heldso")
-    for bad in ("/abs", "a/../b", "a b", "a\\b"):
-        with pytest.raises(YardError, match="bad_path|inside the repo"):
-            store.update_app("heldso", containerfile=bad)
-    with pytest.raises(YardError, match="bad_compose|compose"):
-        store.update_app("heldso", compose="yard")
-    with pytest.raises(YardError, match="not both"):
-        store.update_app("heldso", containerfile="Dockerfile", compose="compose.yml")
+    store.create_app("db", "", runs="postgres:17")
+    with pytest.raises(YardError, match="no repo"):
+        store.update_app("db", runs="ops/stack.yml")
+    # A repo set on an image app without runs is a 400: the pair rule applies
+    # after every update, so repo and image can never both be set.
+    with pytest.raises(YardError, match="runs a file from it"):
+        store.update_app("db", repo="https://github.com/org/db")
+    assert store.app("db").repo == ""
+    app = store.update_app("db", runs="https://example.com/x.yml")
+    assert app.runs == "https://example.com/x.yml"
 
 
-def test_app_build_fields_need_a_repo(tmp_path: Path):
-    store = Store.open(tmp_path)
-    store.create_app("yard", "")
-    with pytest.raises(YardError, match="no repo|Set the repo"):
-        store.update_app("yard", containerfile="Dockerfile")
-
-
-def test_app_source_fields(tmp_path: Path):
-    store = Store.open(tmp_path)
-    app = store.create_app("db", "", image="postgres:17")
-    assert app.image == "postgres:17"
-    assert store.app("db").image == "postgres:17"
-    assert "image postgres:17" in (tmp_path / "apps" / "db" / "app").read_text()
-
-    app = store.update_app("db", recipe="umami")
-    assert app.recipe.endswith("/umami.yml")
-    assert app.image == ""
-
-    with pytest.raises(YardError, match="not both"):
-        store.update_app("db", image="postgres:17", recipe="umami")
-
-    with pytest.raises(YardError, match="no repo|Set the repo"):
-        store.update_app("db", containerfile="Dockerfile")
-
-
-def test_app_source_fields_repo_app(tmp_path: Path):
-    store = Store.open(tmp_path)
-    store.create_app("heldso", "https://github.com/org/heldso")
-    with pytest.raises(YardError, match="an image app has no repo"):
-        store.update_app("heldso", image="postgres:17")
-    with pytest.raises(YardError, match="a recipe app has no repo"):
-        store.update_app("heldso", recipe="umami")
+def test_deployed_round_trip(tmp_path: Path):
+    yard = make_yard(tmp_path)
+    assert read_deployed(yard.config, "heldso") is None
+    dep = Deployed(revision="abc", runs="yard:python-uv", kind="containerfile", reason="r", template="3f9a1c2e")
+    write_deployed(yard.config, "heldso", dep)
+    found = read_deployed(yard.config, "heldso")
+    assert found == dep
+    assert "template 3f9a1c2e" in (tmp_path / "apps" / "heldso" / "deployed").read_text()

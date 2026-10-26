@@ -1,3 +1,4 @@
+import json
 import re
 from datetime import UTC, datetime, timedelta
 
@@ -125,6 +126,7 @@ def test_format_app_status():
         "heldso\n"
         "rev abc1234 · tip f00ba12 · image localhost/heldso:abc1234\n"
         "data 10MB · env /srv/yard/env/heldso.env\n"
+        "runs  auto (not deployed yet)\n"
         "\n"
         "binds\n"
         "  heldso.example.com      →  heldso:8000\n"
@@ -155,6 +157,7 @@ def test_format_app_status_minimal():
     assert format_app_status(page, NOW) == (
         "heldso\n"
         "data 0B · env /srv/yard/env/heldso.env\n"
+        "runs  auto (not deployed yet)\n"
         "\n"
         "containers\n"
         "  heldso  down\n"
@@ -289,9 +292,9 @@ def test_format_record_repoless_hides_ref():
 
     from app.cli.render import format_record
 
-    body = json.dumps({"name": "db", "repo": "", "ref": "main", "trigger": "push", "image": "postgres:17"})
+    body = json.dumps({"name": "db", "repo": "", "ref": "main", "trigger": "push", "runs": "postgres:17"})
     out = format_record(body)
-    assert "image  postgres:17" in out
+    assert "runs  postgres:17 (not deployed yet)" in out
     assert "ref" not in out
 
 
@@ -299,8 +302,8 @@ def test_format_apps_repoless_shows_source(tmp_path):
     from app.cli.render import format_apps
 
     rows = [
-        {"name": "db", "repo": "", "ref": "main", "trigger": "push", "image": "postgres:17"},
-        {"name": "umami", "repo": "", "ref": "main", "trigger": "push", "recipe": "https://x.example/umami.yml"},
+        {"name": "db", "repo": "", "ref": "main", "trigger": "push", "runs": "postgres:17"},
+        {"name": "umami", "repo": "", "ref": "main", "trigger": "push", "runs": "https://x.example/umami.yml"},
         {"name": "heldso", "repo": "https://github.com/org/heldso", "ref": "main", "trigger": "push"},
     ]
     out = format_apps(rows)
@@ -311,3 +314,43 @@ def test_format_apps_repoless_shows_source(tmp_path):
     assert "main" not in lines[1]
     assert "main" not in lines[2]
     assert "main" in lines[3]
+
+
+def test_the_runs_line_renders_all_kinds():
+    from app.cli.render import format_record
+
+    """The five runs renderings: auto with a template, a path, an image, a URL, undeployed."""
+    template = {
+        "runs": "",
+        "deployed": {
+            "runs": "yard:python-uv",
+            "kind": "containerfile",
+            "reason": "stario: pyproject.toml declares stario",
+            "revision": "abc1234",
+            "template": "3f9a1c2e",
+        },
+    }
+    out = format_record(json.dumps(template))
+    assert "runs  auto → yard:python-uv @3f9a1c2e (containerfile; stario: pyproject.toml declares stario)" in out
+
+    path = {"runs": "ops/stack.yml", "deployed": {"runs": "ops/stack.yml", "kind": "compose", "revision": "abc"}}
+    assert "runs  ops/stack.yml (compose)" in format_record(json.dumps(path))
+
+    image = {
+        "runs": "postgres:17",
+        "deployed": {"runs": "postgres:17", "kind": "image", "revision": "sha256:1a2b3c4d5e6f" + "0" * 52},
+    }
+    assert "runs  postgres:17 (image @sha256:1a2b3c4d5e6f)" in format_record(json.dumps(image))
+
+    url = {
+        "runs": "https://x.example/umami.yml",
+        "deployed": {
+            "runs": "https://x.example/umami.yml",
+            "kind": "compose",
+            "revision": "sha256:9f8e7d6c5b4a" + "0" * 52,
+        },
+    }
+    assert "runs  https://x.example/umami.yml (compose @sha256:9f8e7d6c5b4a)" in format_record(json.dumps(url))
+
+    fresh = {"runs": ""}
+    assert "runs  auto (not deployed yet)" in format_record(json.dumps(fresh))

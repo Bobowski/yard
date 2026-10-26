@@ -1,4 +1,4 @@
-"""Outside sources: a registry manifest digest, or a recipe file over https."""
+"""Outside sources: a registry manifest digest, or a compose file over https."""
 
 import asyncio
 import json
@@ -14,7 +14,7 @@ _ACCEPT = (
     " application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
 )
 _TIMEOUT = 30
-_RECIPE_MAX = 256 * 1024
+_FILE_MAX = 256 * 1024
 
 
 def fetch(url: str, method: str, headers: dict[str, str], *, code: str = "source") -> tuple[int, dict[str, str], bytes]:
@@ -22,7 +22,7 @@ def fetch(url: str, method: str, headers: dict[str, str], *, code: str = "source
     req = urllib.request.Request(url, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=_TIMEOUT) as res:
-            return res.status, dict(res.headers), res.read(_RECIPE_MAX + 1)
+            return res.status, dict(res.headers), res.read(_FILE_MAX + 1)
     except urllib.error.HTTPError as exc:
         return exc.code, dict(exc.headers), exc.read()
     except (urllib.error.URLError, TimeoutError) as exc:
@@ -89,23 +89,23 @@ async def _token(headers: dict[str, str], ref: str) -> str:
     return token
 
 
-def _fetch_recipe(url: str) -> bytes:
-    """The recipe body: https only, redirects stay on https, at most 256 KiB."""
+def _fetch_file(url: str) -> bytes:
+    """A compose file over https: redirects stay on https, at most 256 KiB."""
     for _ in range(6):
-        code, headers, body = fetch(url, "GET", {}, code="recipe")
+        code, headers, body = fetch(url, "GET", {}, code="fetch")
         if code in (301, 302, 303, 307, 308):
             location = headers.get("Location") or headers.get("location") or ""
             if not location.startswith("https://"):
-                raise YardError(502, "recipe", f"{url}: redirect to {location or 'nowhere'} is not https")
+                raise YardError(502, "fetch", f"{url}: redirect to {location or 'nowhere'} is not https")
             url = location
             continue
         if code >= 300:
-            raise YardError(502, "recipe", f"{url}: HTTP {code}")
-        if len(body) > _RECIPE_MAX:
-            raise YardError(502, "recipe", "recipe is larger than 256 KiB")
+            raise YardError(502, "fetch", f"{url}: HTTP {code}")
+        if len(body) > _FILE_MAX:
+            raise YardError(502, "fetch", "the file is larger than 256 KiB")
         return body
-    raise YardError(502, "recipe", f"{url}: too many redirects")
+    raise YardError(502, "fetch", f"{url}: too many redirects")
 
 
-async def fetch_recipe(url: str) -> bytes:
-    return await asyncio.to_thread(_fetch_recipe, url)
+async def fetch_file(url: str) -> bytes:
+    return await asyncio.to_thread(_fetch_file, url)

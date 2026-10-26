@@ -1,4 +1,5 @@
-# A repo-less app that runs the image as its publisher built it. The bind names its port.
+# Every app's base compose: service app on the yard network with its data and env.
+# A build overlay adds build.compose.yml for the kinds Yard builds itself.
 services:
   app:
     image: ${IMAGE}

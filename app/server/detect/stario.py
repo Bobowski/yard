@@ -27,13 +27,7 @@ def detect(repo: Repo, name: str) -> Plan | None:
             "a Stario app needs uv.lock; run uv lock and commit it",
             help_text="uv lock && git add uv.lock && git commit && git push",
         )
-    return python.plan(
-        repo,
-        name,
-        kind="stario",
-        reason="pyproject.toml declares stario",
-        env={"STARIO_HOST": "0.0.0.0", "STARIO_PORT": "8000"},
-    )
+    return python.plan(repo, name, reason="stario: pyproject.toml declares stario")
 
 
 def settings(repo: Repo):

@@ -12,11 +12,9 @@ dc() {
 }
 
 # The repo compose has to put service app on network yard. A missing env file or
-# data mount is a warning. The default compose already meets the contract.
+# data mount is a warning. Yard's own files (YARD_FILES=1) meet the contract.
 check() {
-  case "$COMPOSE_FILE" in
-    */default.compose.yml|*/image.compose.yml) return 0 ;;
-  esac
+  [ -n "${YARD_FILES:-}" ] && return 0
   oldifs=$IFS
   IFS=:
   for file in $COMPOSE_FILE; do
@@ -45,23 +43,20 @@ check() {
 
 build() {
   echo "== build $IMAGE"
-  case "$COMPOSE_FILE" in
-    # The default contract is one image from CHECKOUT; podman-remote builds it
+  if [ -n "${YARD_FILES:-}" ]; then
+    # Yard's build files: one image from CHECKOUT; podman-remote builds it
     # in ~2s where dc build needs ~18s on the same socket.
-    */default.compose.yml)
-      # Docker format keeps HEALTHCHECK; podman-remote defaults to OCI, which drops it.
-      # An absolute DOCKERFILE is the one Yard wrote outside the checkout.
-      df="${DOCKERFILE:-Containerfile}"
-      case "$df" in
-        /*) ;;
-        *) df="$CHECKOUT/$df" ;;
-      esac
-      podman-remote build --format docker -t "$IMAGE" -f "$df" "$CHECKOUT" || exit 1
-      ;;
-    *)
-      dc build || exit 1
-      ;;
-  esac
+    # Docker format keeps HEALTHCHECK; podman-remote defaults to OCI, which drops it.
+    # An absolute DOCKERFILE is the one Yard wrote outside the checkout.
+    df="${DOCKERFILE:-Containerfile}"
+    case "$df" in
+      /*) ;;
+      *) df="$CHECKOUT/$df" ;;
+    esac
+    podman-remote build --format docker --pull=missing -t "$IMAGE" -f "$df" "$CHECKOUT" || exit 1
+  else
+    dc build || exit 1
+  fi
   echo "built $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 }
 

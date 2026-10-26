@@ -175,27 +175,6 @@ def test_app_deploy(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixtu
     assert "ready" in capsys.readouterr().out
 
 
-def test_app_deploy_a_sha_warns_on_a_push_trigger(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
-    seen: dict = {}
-
-    def fake_api_try(client, method, path, body, timeout=None):
-        seen[(method, path)] = body
-        return 200, json.dumps(
-            {
-                "app": {"name": "nightly", "trigger": "push"},
-                "deploy": {"status": "ok", "image": "localhost/app:abc", "log": "ok\n"},
-            }
-        )
-
-    monkeypatch.setattr(cli, "_api_try", fake_api_try)
-    _env(monkeypatch)
-    main(["app", "deploy", "--app", "nightly", "--sha", "abc1234", "--text"])
-    assert seen[("POST", "/api/v1/apps/nightly/deploy")] == {"sha": "abc1234"}
-    out = capsys.readouterr().out
-    assert "The trigger is push: the next check deploys the tip again." in out
-    assert "yard app set --trigger manual" in out
-
-
 class _TTY:
     """sys.stdin for the confirmation tests."""
 
@@ -1617,34 +1596,6 @@ def test_events_build_the_query(monkeypatch: pytest.MonkeyPatch, capsys: pytest.
     assert "died" in out and "heldso-app-1 abc123def456" in out and "exit 1" in out
 
 
-def test_app_detect(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
-    def fake_api_try(client, method, path, body, timeout=None):
-        if method == "GET" and path == "/api/v1/apps/heldso":
-            return 200, json.dumps({"app": {"name": "heldso", "containerfile": "yard"}})
-        if method == "PATCH":
-            return 200, json.dumps({"app": {"name": "heldso", "containerfile": "", "compose": ""}})
-        raise AssertionError(path)
-
-    monkeypatch.setattr(cli, "_api_try", fake_api_try)
-    _env(monkeypatch)
-    main(["app", "detect", "--app", "heldso", "--text"])
-    out = capsys.readouterr().out
-    assert "decides what to run again (was: containerfile yard)" in out
-    assert "Deploy now: yard app deploy --app heldso" in out
-
-
-def test_app_detect_nothing_set(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
-    def fake_api_try(client, method, path, body, timeout=None):
-        if method == "GET":
-            return 200, json.dumps({"app": {"name": "heldso"}})
-        return 200, json.dumps({"app": {"name": "heldso"}})
-
-    monkeypatch.setattr(cli, "_api_try", fake_api_try)
-    _env(monkeypatch)
-    main(["app", "detect", "--app", "heldso", "--text"])
-    assert "decides what to run.\n" in capsys.readouterr().out
-
-
 def test_app_cat(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
     def fake_api_try(client, method, path, body, timeout=None):
         if path == "/api/v1/apps/heldso/files/containerfile":
@@ -1657,16 +1608,11 @@ def test_app_cat(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture)
     assert capsys.readouterr().out == "FROM scratch\n"
 
 
-def test_app_new_build_flags_exclusive(capsys: pytest.CaptureFixture):
-    with pytest.raises(SystemExit):
-        main(["app", "new", "--repo", "https://github.com/org/x", "--containerfile", "a", "--compose", "b"])
-
-
 def test_source_name():
-    assert cli._source_name("ghcr.io/you/api:1.4", "") == "api"
-    assert cli._source_name("postgres:17", "") == "postgres"
-    assert cli._source_name("", "umami") == "umami"
-    assert cli._source_name("", "https://example.com/ops/umami.yml") == "umami"
+    assert cli._source_name("image", "ghcr.io/you/api:1.4") == "api"
+    assert cli._source_name("image", "postgres:17") == "postgres"
+    assert cli._source_name("url", "https://example.com/ops/umami.yml") == "umami"
+    assert cli._source_name("url", "https://example.com/ops/site.yaml") == "site"
 
 
 def test_app_new_image(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
@@ -1675,18 +1621,18 @@ def test_app_new_image(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFi
     def fake_api_try(client, method, path, body, timeout=None):
         sent.append((method, path, body))
         if method == "POST" and path == "/api/v1/apps":
-            return 200, json.dumps({"app": {"name": "api", "image": "ghcr.io/you/api:1.4"}})
+            return 200, json.dumps({"app": {"name": "api", "runs": "ghcr.io/you/api:1.4"}})
         if method == "POST" and path.endswith("/deploy"):
-            return 200, json.dumps({"deploy": {"status": "ok"}})
+            return 200, json.dumps({"deploy": {"status": "ok", "port": 3000}})
         return 200, "{}"
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
     _env(monkeypatch)
-    main(["app", "new", "--image", "ghcr.io/you/api:1.4", "--text"])
+    main(["app", "new", "--runs", "ghcr.io/you/api:1.4", "--text"])
     method, path, body = sent[0]
     assert body["name"] == "api"
     assert body["repo"] == ""
-    assert body["image"] == "ghcr.io/you/api:1.4"
+    assert body["runs"] == "ghcr.io/you/api:1.4"
 
 
 def test_app_new_recipe_public_port(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
@@ -1695,60 +1641,52 @@ def test_app_new_recipe_public_port(monkeypatch: pytest.MonkeyPatch, capsys: pyt
     def fake_api_try(client, method, path, body, timeout=None):
         sent.append((method, path, body))
         if method == "POST" and path == "/api/v1/apps":
-            return 200, json.dumps({"app": {"name": "umami"}, "port": 3000})
+            return 200, json.dumps({"app": {"name": "umami"}})
         if method == "PUT" and path.startswith("/api/v1/binds/"):
             return 200, "{}"
         if method == "POST" and path.endswith("/deploy"):
-            return 200, json.dumps({"deploy": {"status": "ok"}})
+            return 200, json.dumps({"deploy": {"status": "ok", "port": 3000}})
         return 200, "{}"
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
     _env(monkeypatch)
-    main(["app", "new", "--recipe", "umami", "--public", "umami.example.com", "--text"])
+    main(
+        [
+            "app",
+            "new",
+            "--runs",
+            "https://example.com/umami.yml",
+            "--public",
+            "umami.example.com",
+            "--text",
+        ]
+    )
     bind = next(call for call in sent if call[0] == "PUT")
     assert bind[2]["dial"] == "umami-app-1:3000"
 
 
-def test_app_detect_image_app(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+def test_app_set_runs_push_message(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
     def fake_api_try(client, method, path, body, timeout=None):
         if method == "GET":
-            return 200, json.dumps({"app": {"name": "db", "image": "postgres:17"}})
-        raise AssertionError("no PATCH")
+            return 200, json.dumps({"app": {"name": "db", "runs": "postgres:16", "trigger": "push"}})
+        return 200, json.dumps({"app": {"name": "db", "runs": "postgres:17", "trigger": "push"}})
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
     _env(monkeypatch)
-    main(["app", "detect", "--app", "db", "--text"])
-    assert "db runs an image (postgres:17); there is nothing to detect." in capsys.readouterr().out
-
-
-def test_app_new_source_flags_exclusive(capsys: pytest.CaptureFixture):
-    with pytest.raises(SystemExit):
-        main(["app", "new", "--image", "postgres:17", "--containerfile", "Dockerfile"])
-
-
-def test_app_set_image_push_message(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
-    def fake_api_try(client, method, path, body, timeout=None):
-        if method == "GET":
-            return 200, json.dumps({"app": {"name": "db", "image": "postgres:16", "trigger": "push"}})
-        return 200, json.dumps({"app": {"name": "db", "image": "postgres:17", "trigger": "push"}})
-
-    monkeypatch.setattr(cli, "_api_try", fake_api_try)
-    _env(monkeypatch)
-    main(["app", "set", "--app", "db", "--image", "postgres:17", "--text"])
+    main(["app", "set", "--app", "db", "--runs", "postgres:17", "--text"])
     out = capsys.readouterr().out
     assert "The next check deploys it within 5 minutes" in out
-    assert "still builds the old way" not in out
 
 
-def test_app_set_image_manual_message(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+def test_app_set_runs_manual_message(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
     def fake_api_try(client, method, path, body, timeout=None):
         if method == "GET":
-            return 200, json.dumps({"app": {"name": "db", "image": "postgres:16", "trigger": "manual"}})
-        return 200, json.dumps({"app": {"name": "db", "image": "postgres:17", "trigger": "manual"}})
+            return 200, json.dumps({"app": {"name": "db", "runs": "postgres:16", "trigger": "manual"}})
+        return 200, json.dumps({"app": {"name": "db", "runs": "postgres:17", "trigger": "manual"}})
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
     _env(monkeypatch)
-    main(["app", "set", "--app", "db", "--image", "postgres:17", "--text"])
+    main(["app", "set", "--app", "db", "--runs", "postgres:17", "--text"])
     out = capsys.readouterr().out
-    assert "still runs the old version until the next deploy" in out
+    assert "still runs the old way until the next deploy" in out
     assert "Deploy now: yard app deploy --app db" in out

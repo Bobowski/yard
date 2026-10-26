@@ -7,9 +7,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from app.server import binds, journal, podman
-from app.server.compose import app_container, read_revision
+from app.server.compose import app_container
 from app.server.podman import Container, Sample
-from app.server.store import App, Config
+from app.server.store import App, Config, Deployed, read_deployed
+from app.server.yard import Tip
 from app.shared import APP_PORT, YardError, image_sha, stamp
 
 if TYPE_CHECKING:
@@ -41,6 +42,7 @@ class Row:
     mem: str = ""
     data: int = 0
     deploy: dict[str, Any] | None = None
+    template_moved: bool = False
 
 
 @dataclass(slots=True)
@@ -72,6 +74,7 @@ class Page:
     binds: list[dict[str, str]]
     deploys: list[dict[str, Any]]
     log: str
+    template_moved: bool = False
 
 
 async def report(yard: Yard, running_only: bool = False) -> Report:
@@ -102,21 +105,22 @@ async def report(yard: Yard, running_only: bool = False) -> Report:
     rows: list[Row] = []
     for app in apps:
         items = [item for item in grouped.pop(app.name, []) if _shows(item, app)]
-        tip = yard.tips.get(app.name, "")
+        tip = yard.tips.get(app.name)
+        deployed = read_deployed(config, app.name)
         note = deploy_record(listed, app.name)
         app_binds = _binds_for(bound, app.name)
-        rows += _app_rows(config, app, items, samples, tip, note, app_binds, crashes, running_only)
+        rows += _app_rows(config, app, items, samples, tip, deployed, note, app_binds, crashes, running_only)
     for name in sorted(grouped):
         for item in sorted(grouped[name], key=_age):
             if running_only and not item.running:
                 continue
-            rows.append(_row(config, item, None, samples.get(item.name), "", None, [], crashes))
+            rows.append(_row(config, item, None, samples.get(item.name), None, None, None, [], crashes))
     for item in sorted(other, key=lambda one: one.name):
         if running_only and not item.running:
             continue
-        rows.append(_row(config, item, None, samples.get(item.name), "", None, [], crashes))
+        rows.append(_row(config, item, None, samples.get(item.name), None, None, None, [], crashes))
     if config.boot:
-        await _probe_rows(rows, {app.name for app in apps if app.image or app.recipe})
+        await _probe_rows(rows, {app.name for app in apps if not app.repo})
     shown = [samples.get(row.container) for row in rows]
     return Report(
         host=Host(
@@ -198,7 +202,8 @@ def _app_rows(
     app: App,
     items: list[Container],
     samples: dict[str, Sample],
-    tip: str,
+    tip: Tip | None,
+    deployed: Deployed | None,
     note: dict[str, Any] | None,
     binds: list[dict[str, str]],
     crashes: dict[str, tuple[bool, str]],
@@ -209,10 +214,20 @@ def _app_rows(
     rows: list[Row] = []
     for item in sorted(shown, key=_age):
         rows.append(
-            _row(config, item, app, samples.get(item.name), tip, note, binds if item.name == target else [], crashes)
+            _row(
+                config,
+                item,
+                app,
+                samples.get(item.name),
+                tip,
+                deployed,
+                note,
+                binds if item.name == target else [],
+                crashes,
+            )
         )
     if not items and not running_only:
-        rows.append(_row(config, None, app, None, tip, note, binds, crashes))
+        rows.append(_row(config, None, app, None, tip, deployed, note, binds, crashes))
     return rows
 
 
@@ -225,25 +240,27 @@ async def app_report(yard: Yard, name: str) -> Page:
         samples = podman.parse_stats(await client.run("stats", "--no-stream", "--format", "json"))
     except YardError:
         samples = {}
-    tip = yard.tips.get(app.name, "")
+    tip = yard.tips.get(app.name)
+    deployed = read_deployed(config, name)
     items = [item for item in listed.values() if item.app == name and _shows(item, app)]
     bound = _binds_for(await _binds(yard), app.name)
     note = deploy_record(listed, name)
     crashes = await _crashes(yard, listed)
-    rows = _app_rows(config, app, items, samples, tip, note, bound, crashes, False)
+    rows = _app_rows(config, app, items, samples, tip, deployed, note, bound, crashes, False)
     if config.boot:
-        await _probe_rows(rows, {app.name} if (app.image or app.recipe) else set())
+        await _probe_rows(rows, {app.name} if not app.repo else set())
     page_log = await _container_tail(yard, f"{name}-app-1")
     image = items[0].image if items else ""
     return Page(
         app=app,
         image=image,
-        sha=read_revision(config, app.name) if app and (app.image or app.recipe) else image_sha(image),
+        sha=deployed.revision if deployed else image_sha(image),
         env_file=str(config.env(name)),
         rows=rows,
         binds=bound,
         deploys=[note] if note else [],
         log=page_log,
+        template_moved=any(row.template_moved for row in rows),
     )
 
 
@@ -298,7 +315,8 @@ def _row(
     item: Container | None,
     app: App | None,
     sample: Sample | None,
-    tip: str,
+    tip: Tip | None,
+    deployed: Deployed | None,
     note: dict[str, Any] | None,
     binds: list[dict[str, str]],
     crashes: dict[str, tuple[bool, str]],
@@ -326,8 +344,9 @@ def _row(
         oom=oom,
         error=error,
         image=image,
-        sha=read_revision(config, app.name) if app and (app.image or app.recipe) else image_sha(image),
-        tip=tip,
+        sha=(deployed.revision if deployed and deployed.revision else image_sha(image)) if app else image_sha(image),
+        tip=tip.revision if tip else "",
+        template_moved=bool(tip and tip.template and tip.template != (deployed.template if deployed else "")),
         binds=binds,
         trigger=app.trigger if app else "",
         cpu=sample.cpu if sample else "",

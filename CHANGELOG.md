@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+Breaking: the app record's four fields are one `runs`.
+
+- `runs` replaces `containerfile`, `compose`, `image`, and `recipe`: `auto` (the default), a path in the repo, `yard:<template>`, an image `name:tag`, or an https URL to a compose file. A repo app runs a file from it; image and URL apps have no repo. Boot rewrites old records once.
+- Recipes are gone. A URL in `runs` fetches any compose file; it cannot `build:` (there is no checkout) and the old `recipe/` directory becomes `compose/`.
+- `yard app detect` and `deploy --sha` are gone. Roll back by changing the source: git revert, an older tag, or an older URL.
+- The `yard:` templates are `python-uv`, `python-pip`, `go`, and `node-npm`, pinned to index digests (`detect/bases.json`; `just bump-bases` refreshes). The rendered Containerfile's hash joins the deployed revision, so a template change redeploys once. One deploy path and one check loop cover every kind.
+- `POST`/`PATCH /api/v1/apps` reject unknown fields with `unknown_field`. `app_json` carries `runs` and a `deployed` object; the files route reads the deployed answer.
+- `app new --public` on an image or URL app binds after the first deploy, on the port the container exposes.
+
 ## 0.6.2
 
 - Yard mounts the host's Podman socket directory, not the socket file, so a restart of `podman.socket` (an install.sh repair run or a Podman upgrade) no longer leaves Yard unable to reach Podman until its container restarts.

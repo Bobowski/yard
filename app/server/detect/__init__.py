@@ -7,15 +7,17 @@ A detector is one module in this package for one language or framework. It expos
 - detect(repo, name) -> Plan | None: None means "not mine"; YardError means "mine but broken".
 - settings(repo) -> list[Setting], optional: the env keys the code reads.
 
-A detector imports Repo, Plan, Setting, SET_BY_YARD, and render from detect.base.
+A detector imports Repo, Plan, Setting, SET_BY_YARD, pin, and plan_template from detect.base.
 A generated Containerfile lives in templates/ next to this file and renders through render.
+Every FROM and COPY --from in a template is pinned to an index digest in bases.json.
 A detector must refuse (YardError or None) rather than guess an install or entrypoint.
 
-A PR adding a detector adds the module, its template, an entry in DETECTORS (specific
-before generic), and tests under tests/server/.
+A PR adding a detector adds the module, its template, a bases.json pin, an entry in
+DETECTORS (specific before generic), and tests under tests/server/.
 """
 
 import logging
+import re
 from pathlib import Path
 
 from app.server import git
@@ -28,7 +30,38 @@ log = logging.getLogger("yard")
 
 DETECTORS = (stario, python, go, node)
 
-__all__ = ["DETECTORS", "Plan", "Repo", "Setting", "language", "resolve", "settings"]
+__all__ = ["DETECTORS", "Plan", "Repo", "Setting", "classify", "language", "plan_for", "resolve", "settings"]
+
+_SERVICES = re.compile(r"^services:\s*(#.*)?$", re.M)
+_INSTRUCTION = re.compile(r"^(FROM|ARG)\s", re.I)
+BUILD_LINE = re.compile(r"^\s+build:", re.M)
+
+
+def classify(text: str) -> str:
+    """A file's kind by its content: compose names services, a Containerfile starts FROM or ARG."""
+    compose = bool(_SERVICES.search(text))
+    containerfile = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        containerfile = bool(_INSTRUCTION.match(stripped))
+        break
+    if compose and not containerfile:
+        return "compose"
+    if containerfile and not compose:
+        return "containerfile"
+    found = []
+    if compose:
+        found.append("a services: block")
+    if containerfile:
+        found.append("a FROM or ARG instruction")
+    raise YardError(
+        502,
+        "detect",
+        f"the file has {', '.join(found) or 'no services: block and no FROM'}",
+        help_text="A compose file starts services:; a Containerfile starts FROM.",
+    )
 
 
 def _languages(repo: Repo) -> dict[str, list[str]]:
@@ -52,6 +85,34 @@ def resolve(checkout: Path, name: str = "") -> Plan:
     return language(checkout, name)
 
 
+def plan_for(checkout: Path, name: str, runs: str) -> Plan:
+    """The deploy plan for a runs value on a repo app: yard:<t> or auto. Paths classify by content."""
+    if runs.startswith("yard:"):
+        plan = language(checkout, name)
+        if plan.answer != runs:
+            raise YardError(
+                502,
+                "detect",
+                f"{runs} does not fit this repo: Yard detects {plan.answer} ({plan.reason})",
+                help_text=f"Run yard app set --runs {plan.answer} to accept it, or add a Containerfile.",
+            )
+        return plan
+    if runs:
+        path = (checkout / runs).resolve()
+        root = checkout.resolve()
+        if root not in path.parents and path != root:
+            raise YardError(502, "detect", f"{runs} is outside the checkout")
+        if not path.is_file():
+            raise YardError(
+                502,
+                "detect",
+                f"{runs} is not a file in the checkout",
+                help_text="Add the file and push, or run yard app set --runs auto.",
+            )
+        return Plan(classify(path.read_text()), runs, "")
+    return resolve(checkout, name)
+
+
 def language(checkout: Path, name: str = "") -> Plan:
     """Which bundled Containerfile the repo's language gets. Repo compose and Containerfile files are not read."""
     repo = Repo(checkout)
@@ -62,7 +123,7 @@ def language(checkout: Path, name: str = "") -> Plan:
             502,
             "detect",
             f"found {_join(markers)}; Yard will not guess",
-            help_text="Add a Containerfile, or run yard app set --containerfile PATH.",
+            help_text="Add a Containerfile, or run yard app set --runs PATH.",
         )
     if not found:
         sha = git.head(checkout)[:12] or "the checkout"
