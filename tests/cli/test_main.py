@@ -1940,3 +1940,35 @@ def test_app_new_bad_env_fails_before_post(monkeypatch: pytest.MonkeyPatch):
     with pytest.raises(SystemExit):
         main(["app", "new", "--text", "--repo", "https://origin.cursor.com/org/x", "-e", "NOTAPAIR"])
     assert sent == []
+
+
+def test_app_new_failed_first_deploy_exits_1(monkeypatch: pytest.MonkeyPatch, capsys):
+    sent = []
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        sent.append((method, path, body))
+        if path == "/api/v1/apps":
+            return 200, json.dumps({"app": {"name": "web"}})
+        if "/binds/" in path:
+            return 200, "{}"
+        return 200, json.dumps({"deploy": {"status": "ok"}})
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    monkeypatch.setattr(cli, "_follow_deploy", lambda *a: {"status": "failed", "log": "== boom\n"})
+    _env(monkeypatch)
+    with pytest.raises(SystemExit) as caught:
+        main(
+            [
+                "app",
+                "new",
+                "--text",
+                "--repo",
+                "https://origin.cursor.com/org/web",
+                "--public",
+                "web.example.com",
+            ]
+        )
+    assert caught.value.code == 1
+    # The bind still went in so Caddy is ready after the fix.
+    assert _bind_calls(sent)[0][2]["dial"] == "web-app-1:8000"
+    assert "web was created, but the first deploy failed." in capsys.readouterr().err

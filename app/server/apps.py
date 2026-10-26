@@ -569,6 +569,9 @@ async def _apply(yard: Yard, app: App, plan: Plan, sha: str, job: Job, *, cause:
         actor=actor,
     )
 
+    line = f"== runs {plan.answer} ({plan.kind}" + (f"; {plan.reason}" if plan.reason else "") + ")"
+    job.push(line)
+
     # A deploy of a sha whose image is still local skips the build.
     if await _image_exists(yard, image):
         project.env["SKIP_BUILD"] = "1"
@@ -588,8 +591,6 @@ async def _apply(yard: Yard, app: App, plan: Plan, sha: str, job: Job, *, cause:
         on_line=job.push,
     )
     log_text = text if text.endswith("\n") or not text else text + "\n"
-    line = f"== runs {plan.answer} ({plan.kind}" + (f"; {plan.reason}" if plan.reason else "") + ")"
-    job.push(line)
     log_text = line + "\n" + log_text
     log_text, missing_env = _env_hint(yard, app, log_text, job)
     if app.name == "yard":

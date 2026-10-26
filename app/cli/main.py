@@ -454,6 +454,8 @@ def _cmd_app_new(args: argparse.Namespace) -> None:
         _print_deploy_note(note, name)
     port = args.port or int((note or {}).get("port") or 0) or (0 if repo_less else 8000)
     _maybe_bind(session, host, name, port, window)
+    if (note or {}).get("status") == "failed":
+        _die(f"{name} was created, but the first deploy failed.")
 
 
 def _new_app_env(args: argparse.Namespace) -> dict[str, str]:

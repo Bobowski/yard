@@ -16,6 +16,9 @@ if TYPE_CHECKING:
     from stario import App as StarioApp
 
 
+JOB_LINES = 5000
+
+
 @dataclass(slots=True)
 class Job:
     """One deploy, memory only. `lines` is the live log; `changed` wakes followers."""
@@ -30,10 +33,12 @@ class Job:
     outcome: dict | None = None
     lines: list[str] = field(default_factory=list)
     changed: asyncio.Event = field(default_factory=asyncio.Event)
+    pushed: int = 0
 
     def push(self, line: str) -> None:
         self.lines.append(line)
-        del self.lines[:-5000]
+        del self.lines[:-JOB_LINES]
+        self.pushed += 1
         self.changed.set()
         self.changed.clear()
 

@@ -1211,3 +1211,25 @@ async def test_apply_lines_reach_the_job(tmp_path: Path, monkeypatch: pytest.Mon
     lines = yard.deploys["heldso"].lines
     assert "== build localhost/heldso:abc" in lines
     assert lines.index("== build localhost/heldso:abc") < lines.index("== started localhost/heldso:abc")
+
+
+def test_job_lines_trim_keeps_the_offset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A follower mid-stream loses no line when the buffer trims at JOB_LINES."""
+    import app.server.yard as yard_mod
+
+    monkeypatch.setattr(yard_mod, "JOB_LINES", 5)
+    job = apps._new_job(make_yard(tmp_path), "x", "manual", "")
+    for index in range(7):
+        job.push(f"l{index}")
+    # Follower pass 1 reads every unseen line (only the last 5 are buffered).
+    seen, got = 0, []
+    start = max(0, len(job.lines) - (job.pushed - seen))
+    got += job.lines[start:]
+    seen = job.pushed
+    for index in range(7, 12):
+        job.push(f"l{index}")
+    # Pass 2 emits exactly the five new lines — no repeats, tail complete.
+    start = max(0, len(job.lines) - (job.pushed - seen))
+    got += job.lines[start:]
+    assert len(got) == len(set(got))
+    assert got == [f"l{i}" for i in range(2, 12)]

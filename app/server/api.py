@@ -525,16 +525,18 @@ def app_deploy_get(yard: Yard) -> Handler:
         w.write_headers(200)
         seen = 0
         while not c.disconnected:
-            for line in job.lines[seen:]:
+            start = max(0, len(job.lines) - (job.pushed - seen))
+            for line in job.lines[start:]:
                 w.write(json.dumps({"line": line}).encode() + b"\n")
-            seen = len(job.lines)
-            if job.status != "running" and seen == len(job.lines):
+            seen = job.pushed
+            if job.status != "running" and seen == job.pushed:
                 break
             await w.drain()
-            try:
-                await asyncio.wait_for(job.changed.wait(), 15)
-            except TimeoutError:
-                pass
+            if seen == job.pushed:
+                try:
+                    await asyncio.wait_for(job.changed.wait(), 15)
+                except TimeoutError:
+                    pass
         w.write(json.dumps({"deploy": _job_json(job)}).encode() + b"\n")
         await w.drain()
         w.end()
