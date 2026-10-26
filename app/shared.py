@@ -282,7 +282,7 @@ def check_build_path(text: str) -> str:
 
 
 # The Containerfiles Yard writes. `runs yard:<name>` names one of these.
-TEMPLATES = ("python-uv", "python-pip", "go", "node-npm")
+TEMPLATES = ("python-uv", "python-pip", "go", "node-npm", "http-nu")
 
 _TEMPLATE = re.compile(r"yard:[a-z0-9-]+$")
 

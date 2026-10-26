@@ -108,6 +108,8 @@ def test_runs_kinds(tmp_path: Path):
             store.update_app("heldso", runs=bad)
     with pytest.raises(YardError, match="unknown template"):
         store.update_app("heldso", runs="yard:rust")
+    app = store.update_app("heldso", runs="yard:http-nu")
+    assert app.runs == "yard:http-nu"
     with pytest.raises(YardError, match="runs a file from it|an app with a repo"):
         store.update_app("heldso", runs="postgres:17")
 

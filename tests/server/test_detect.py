@@ -46,13 +46,15 @@ def test_stario(tmp_path: Path):
 
 
 def test_every_from_is_pinned(tmp_path: Path):
-    """Every FROM and COPY --from in a rendered template carries @sha256:."""
-    _write(tmp_path, "pyproject.toml", PYPROJECT)
-    _write(tmp_path, "uv.lock", "lock")
-    _write(tmp_path, "app/main.py")
+    """Every FROM and COPY --from an image ref in a rendered template carries @sha256:."""
+    _write(tmp_path, "serve.nu", "{|req| 'hi'}\n")
     for line in detect.resolve(tmp_path, "heldso").generated.splitlines():
-        if line.startswith("FROM ") or line.startswith("COPY --from=gh"):
+        if line.startswith("FROM "):
             assert "@sha256:" in line, line
+        if line.startswith("COPY --from="):
+            ref = line.removeprefix("COPY --from=").split(" ", 1)[0]
+            if "/" in ref or ":" in ref:  # an image ref, not a stage name
+                assert "@sha256:" in line, line
 
 
 def test_every_base_is_used(tmp_path: Path):
@@ -66,6 +68,7 @@ def test_every_base_is_used(tmp_path: Path):
         {"pyproject.toml": '[project]\nrequires-python=">=3.12"\n', "uv.lock": "l", "app/main.py": ""},
         {"pyproject.toml": '[project]\nrequires-python=">=3.13"\n', "uv.lock": "l", "app/main.py": ""},
         {"pyproject.toml": '[project]\nrequires-python=">=3.14"\n', "uv.lock": "l", "app/main.py": ""},
+        {"serve.nu": "{|req| 'hi'}\n"},
     ]
     for files in renders:
         for rel, text in files.items():
@@ -334,3 +337,70 @@ def test_settings_empty_for_ambiguous(tmp_path: Path):
     _write(tmp_path, "main.py", 'import os\nA = os.environ["K"]\n')
     _write(tmp_path, "package.json", "{}")
     assert detect.settings(tmp_path) == []
+
+
+def test_http_nu(tmp_path: Path):
+    _write(tmp_path, "serve.nu", "{|req| 'hi'}\n")
+    resolved = detect.resolve(tmp_path, "xs-app")
+    assert (resolved.kind, resolved.answer, resolved.reason) == (
+        "containerfile",
+        "yard:http-nu",
+        "http-nu: serve.nu",
+    )
+    text = resolved.generated
+    assert "v0.18.0" in text
+    assert "0.0.0.0:8000" in text and "--store", "/data/store"
+    assert "--datastar" in text
+    assert '"http-nu", "--datastar", "--store", "/data/store", "0.0.0.0:8000", "./serve.nu"' in text
+    assert "28814093dd40cebc32cd533dde6ac10a0be67698a25c47ffd16b47d32fd65954" in text
+    assert "6714826225d66bfceb1cf029f6df3024f6f013c9e4c4e2bc62a7c660f9262f28" in text
+    assert f"alpine:3.22@{BASES['alpine:3.22']}" in text
+    assert "gcr.io/distroless/static-debian12@" in text
+    assert resolved.template
+
+
+def test_http_nu_needs_a_handler(tmp_path: Path):
+    _write(tmp_path, "serve.nu", "print hello\n")
+    with pytest.raises(YardError, match="no handler closure"):
+        detect.resolve(tmp_path, "xs-app")
+
+
+def test_http_nu_subdir_only_is_not_detected(tmp_path: Path):
+    _write(tmp_path, "sub/serve.nu", "{|req| 'hi'}\n")
+    with pytest.raises(YardError, match="no compose file, Containerfile, or known language"):
+        detect.resolve(tmp_path, "xs-app")
+
+
+def test_http_nu_plus_another_language_refuses(tmp_path: Path):
+    _write(tmp_path, "serve.nu", "{|req| 'hi'}\n")
+    _write(tmp_path, "package.json", "{}")
+    with pytest.raises(YardError, match="will not guess"):
+        detect.resolve(tmp_path, "xs-app")
+
+
+def test_plan_for_http_nu(tmp_path: Path):
+    _write(tmp_path, "serve.nu", "{|req| 'hi'}\n")
+    plan = detect.plan_for(tmp_path, "xs-app", "yard:http-nu")
+    assert plan.answer == "yard:http-nu" and plan.template
+    _write(tmp_path, "pyproject.toml", PYPROJECT)
+    (tmp_path / "uv.lock").write_text("l")
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "main.py").write_text("")
+    (tmp_path / "serve.nu").unlink()
+    with pytest.raises(YardError, match="yard:http-nu does not fit this repo"):
+        detect.plan_for(tmp_path, "xs-app", "yard:http-nu")
+
+
+def test_http_nu_settings(tmp_path: Path):
+    _write(tmp_path, "serve.nu", "{|req| $env.SECRET}\n")
+    _write(
+        tmp_path,
+        "lib/util.nu",
+        "$env.OPT?\n$env.SECRET = 'x'\n# $env.COMMENTED\n$env.PATH\n$env.PROJECT_NAME\n",
+    )
+    _write(tmp_path, "store/data.nu", "$env.IN_STORE\n")
+    found = {s.key: (s.required, s.where) for s in detect.settings(tmp_path)}
+    assert found == {
+        "SECRET": (True, "serve.nu:1"),
+        "OPT": (False, "lib/util.nu:1"),
+    }

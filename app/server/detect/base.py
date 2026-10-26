@@ -9,6 +9,7 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 _TEMPLATES = _HERE / "templates"
 BASES: dict[str, str] = json.loads((_HERE / "bases.json").read_text())
+DOWNLOADS: dict[str, dict] = json.loads((_HERE / "downloads.json").read_text())
 
 SET_BY_YARD = {
     "PROJECT_NAME",
