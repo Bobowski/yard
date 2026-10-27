@@ -23,6 +23,16 @@ Breaking: the app record's four fields are one `runs`.
 - An image or URL app has an empty `ref`; setting one is a 400 `bad_ref`. The `yard app ls` column is `source`.
 - New template `yard:http-nu` runs cross.stream (xs) apps: a repo with `serve.nu` gets a static http-nu binary (sha256-checked per arch), a persistent xs store in `/data/store`, and the Datastar bundle served. The env hint reads `$env.KEY`.
 
+## 0.7.0
+
+- `yard forge setup github` creates the GitHub App with the manifest flow: one click, and GitHub sends the key and the webhook secret back. `--manual` keeps the paste flow.
+- `yard app new` deploys right away; `--no-deploy` only creates the app.
+- `yard app rm` lists what it removes and asks first; `--with-binds` removes the app's binds too, and `--yes` skips the question.
+- A daily prune removes old images that Yard built.
+- `yard status --full` warns about an app with no healthcheck.
+- `install.sh --domain` writes the bind for Yard itself.
+- CLI errors name the next command to run.
+
 ## 0.6.2
 
 - Yard mounts the host's Podman socket directory, not the socket file, so a restart of `podman.socket` (an install.sh repair run or a Podman upgrade) no longer leaves Yard unable to reach Podman until its container restarts.
