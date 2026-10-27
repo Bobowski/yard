@@ -22,7 +22,7 @@ Before you call work done, run `just check` (ruff, ruff format, pyright, pytest)
 
 - Validate every input. Malformed or forged input gets `w.text("why", status=400)` (or 404, 403, 409) and `return`.
 - In a handler: read input, validate (4xx and `return`), do the work, reply.
-- Slow work (a build, a download, a model call) runs in `c.app.create_task`. The handler records the job, replies, and the task updates the job status. A client reads that status from another route.
+- Slow work (a build, a download, a model call) runs in `c.app.create_task(self.run(job, c.span.step("job.run")))`. The handler records the job and replies. The task works inside `with span:`, updates the job status, and marks the job failed on `CancelledError` (Stario cancels it at shutdown). A client reads that status from another route.
 - A delay, a timeout, or an external client is a config field, so tests run fast and use fakes.
 
 ## Storage
@@ -31,12 +31,12 @@ Choose with the developer. Do not add a database the app does not need.
 
 - No persistence: an object built in `bootstrap`.
 - SQLite: litewriter is the recommended default. Plain `sqlite3` is fine for a small app.
-- Every `SCHEMA` statement is `IF NOT EXISTS`. The database path is a config field; tests point it at `tmp_path`.
-- A host data directory (Yard sets `PROJECT_DATA_DIR=/data`) must hold the database, or a redeploy loses it.
+- Every `SCHEMA` statement is `IF NOT EXISTS`.
+- Files live in `config.data_dir`: `$PROJECT_DATA_DIR`, or `./data` on a laptop. Yard sets `/data`, which survives every deploy. The database is `config.db_path` there. Tests set `PROJECT_DATA_DIR` to `tmp_path`.
 
 ## Code shape
 
-- A handler that needs nothing is a plain `async def health(c: Context, w: Writer)`. A factory exists only to close over dependencies: `show_app(store)` returns the handler. No handler classes.
+- Routes that share dependencies live in one class: a frozen dataclass whose fields are the dependencies, `register(app)` adds the routes, and each route is one method (`app.add(APP, self.show)`). No handler factories.
 - Code that wraps one external tool (a CLI, a socket, an HTTP API) is an adapter. Tests replace it with a fake.
 - Queries and service methods are named by verb: `list_*`, `get_*` (one or `None`), `add_*`, `set_*`, `remove_*`.
 - Fewer, fuller functions. Inline a function with one call site. No compatibility aliases, no comments that repeat the code.
