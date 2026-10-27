@@ -2,7 +2,8 @@
 
 import asyncio
 import re
-from dataclasses import asdict
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass
 from typing import Any, cast
 
 from stario import App as StarioApp
@@ -118,39 +119,6 @@ async def health(_c: Context, w: Writer) -> None:
     w.empty(200)
 
 
-def host_status(yard: Yard) -> Handler:
-    async def handler(c: Context, w: Writer) -> None:
-        report = await status.report(yard, c.req.query.get("running") == "1")
-        w.json(cast(JsonValue, asdict(report)))
-
-    return handler
-
-
-def doctor_run(yard: Yard) -> Handler:
-    async def handler(_c: Context, w: Writer) -> None:
-        w.json([asdict(check) for check in await doctor.run(yard)])
-
-    return handler
-
-
-def run_prune(yard: Yard) -> Handler:
-    async def handler(c: Context, w: Writer) -> None:
-        data = await json_object(c)
-        days = data.get("days", 7)
-        dry = data.get("dry", False)
-        if not isinstance(days, int) or isinstance(days, bool) or days < 1 or not isinstance(dry, bool):
-            raise YardError(
-                400,
-                "bad_json",
-                "bad json",
-                help_text="days is a number 1 or more. dry is true or false.",
-                example='{"days": 7, "dry": false}',
-            )
-        w.json(cast(JsonValue, asdict(await apps.prune(yard, days, dry, actor=_actor(c)))))
-
-    return handler
-
-
 async def _hook_body(c: Context, w: Writer) -> bytes | None:
     """One megabyte tops. Oversize gets a 413 and no processing."""
     raw = await c.req.body()
@@ -178,104 +146,11 @@ def _hook_received(config: Config, forge: Forge, repo: str, kind: str, c: Contex
     )
 
 
-def origin_hook(origin: Origin, yard: Yard) -> Handler:
-    async def handler(c: Context, w: Writer) -> None:
-        """An Origin event. No auth. A delivery only schedules a check.
-
-        The envelope is {"event": {"type": ..., "payload": {...}}}. Yard reads the
-        tip from the forge and never trusts the body. Always answers fast.
-        """
-        raw = await _hook_body(c, w)
-        if raw is None:
-            return
-        if not raw.strip():
-            w.empty(204)
-            return
-        try:
-            body = json.loads(raw)
-        except ValueError as exc:
-            raise YardError(400, "bad_json", "bad json", help_text="Send one JSON object.") from exc
-        origin.last_delivery = now()
-        event = body.get("event") if isinstance(body, dict) else None
-        kind = event.get("type") if isinstance(event, dict) else ""
-        payload = event.get("payload") if isinstance(event, dict) else {}
-        if kind == "repository.pushed" and isinstance(payload, dict):
-            repo = payload.get("repository")
-            if isinstance(repo, dict):
-                owner = repo.get("owner")
-                slug = owner.get("slug") if isinstance(owner, dict) else ""
-                name = repo.get("name") or ""
-                if slug and name:
-                    url = f"https://{origin.host}/{slug}/{name}"
-                    _hook_received(yard.config, origin, url, kind, c)
-                    c.app.create_task(apps.check_repo(yard, url))
-        elif isinstance(kind, str) and kind.startswith("installation."):
-            _hook_received(yard.config, origin, "", str(kind), c)
-            c.app.create_task(apps.check_installation(yard, origin))
-        w.empty(204)
-
-    return handler
-
-
-def github_hook(github: GitHub, yard: Yard) -> Handler:
-    async def handler(c: Context, w: Writer) -> None:
-        """A GitHub delivery. The signature proves it before anything runs.
-
-        X-Hub-Signature-256 is HMAC-SHA256 over the raw body with the webhook
-        secret the setup stored. A bad or missing signature gets a 401 and
-        nothing else happens.
-        """
-        raw = await _hook_body(c, w)
-        if raw is None:
-            return
-        if not github.verify(raw, c.req.headers.get("x-hub-signature-256") or ""):
-            w.json({"error": YardError(401, "unauthorized", "bad signature").payload()}, 401)
-            return
-        github.last_delivery = now()
-        if not raw.strip():
-            w.empty(204)
-            return
-        try:
-            body = json.loads(raw)
-        except ValueError as exc:
-            raise YardError(400, "bad_json", "bad json", help_text="Send one JSON object.") from exc
-        kind = c.req.headers.get("x-github-event") or ""
-        if kind == "push" and isinstance(body, dict):
-            repo = body.get("repository")
-            full = repo.get("full_name") if isinstance(repo, dict) else ""
-            if full:
-                url = f"https://{github.host}/{full}"
-                _hook_received(yard.config, github, url, kind, c)
-                c.app.create_task(apps.check_repo(yard, url))
-        elif kind in ("installation", "installation_repositories"):
-            _hook_received(yard.config, github, "", kind, c)
-            c.app.create_task(apps.check_installation(yard, github))
-        w.empty(204)
-
-    return handler
-
-
 def _named(forges: dict[str, Forge], name: str) -> Forge:
     for forge in forges.values():
         if forge.name == name:
             return forge
     raise YardError(404, "not_found", f"unknown forge {name}", help_text="The forges are origin and github.")
-
-
-def forges_list(forges: dict[str, Forge], config: Config) -> Handler:
-    async def handler(_c: Context, w: Writer) -> None:
-        """The forge summaries. A connected app with no installation gets one
-        lookup per read; a lookup failure only marks that summary."""
-        rows = []
-        for forge in forges.values():
-            error = await _install(forge, config)
-            summary = forge.summary()
-            if error:
-                summary["error"] = error
-            rows.append(summary)
-        w.json(cast(JsonValue, rows))
-
-    return handler
 
 
 async def _install(forge: Forge, config: Config) -> str:
@@ -301,190 +176,6 @@ async def _install(forge: Forge, config: Config) -> str:
     return ""
 
 
-def forge_put(forges: dict[str, Forge], config: Config) -> Handler:
-    async def handler(c: Context, w: Writer) -> None:
-        """Save a forge app once its credentials pass the forge's own check."""
-        forge = _named(forges, c.match.params["name"])
-        data = await json_object(c)
-        if isinstance(forge, Origin):
-            app_id = data.get("app_id", "")
-            if not isinstance(app_id, str) or not app_id:
-                raise YardError(
-                    400,
-                    "bad_json",
-                    "bad json",
-                    help_text="app_id is a string.",
-                    example='{"app_id": "app_..."}',
-                )
-            info = await forge.connect(app_id)
-            journal.send(
-                config,
-                "forge.connect",
-                f"{forge.name} connected",
-                forge=forge.name,
-                app_id=app_id,
-                actor=_actor(c),
-            )
-            app = {
-                "name": info.get("displayName") or info.get("name") or "",
-                "webhook_url": info.get("webhookUrl") or info.get("webhook_url") or "",
-                "events": info.get("events") or [],
-            }
-        elif isinstance(forge, GitHub):
-            app_id = data.get("app_id", "")
-            private_key = data.get("private_key", "")
-            secret = data.get("webhook_secret", "")
-            if (
-                not isinstance(app_id, str)
-                or not isinstance(private_key, str)
-                or not isinstance(secret, str)
-                or not app_id
-                or not private_key
-                or not secret
-            ):
-                raise YardError(
-                    400,
-                    "bad_json",
-                    "bad json",
-                    help_text="app_id, private_key, and webhook_secret are strings.",
-                )
-            info = await forge.connect(app_id, private_key, secret)
-            journal.send(
-                config,
-                "forge.connect",
-                f"{forge.name} connected",
-                forge=forge.name,
-                app_id=app_id,
-                actor=_actor(c),
-            )
-            app = {
-                "name": info.get("name") or "",
-                "slug": info.get("slug") or "",
-                "events": info.get("events") or [],
-            }
-        else:
-            raise YardError(
-                404, "not_found", f"unknown forge {forge.name}", help_text="The forges are origin and github."
-            )
-        w.json(cast(JsonValue, {"forge": forge.summary(), "app": app}))
-
-    return handler
-
-
-def apps_list(yard: Yard) -> Handler:
-    async def handler(_c: Context, w: Writer) -> None:
-        w.json([app_json(app, read_deployed(yard.config, app.name)) for app in yard.store.list_apps()])
-
-    return handler
-
-
-def apps_create(yard: Yard) -> Handler:
-    async def handler(c: Context, w: Writer) -> None:
-        data = await json_object(c)
-        fields = app_fields(data, {"name", "repo", "ref", "trigger", "runs"})
-        name = data.get("name", "")
-        repo = fields.pop("repo", "")
-        if not isinstance(name, str) or not isinstance(repo, str):
-            raise YardError(
-                400,
-                "bad_json",
-                "bad json",
-                help_text="name and repo are strings.",
-            )
-        if not name.strip():
-            raise YardError(
-                400,
-                "bad_json",
-                "name is required",
-                context={"field": "name"},
-                help_text="An app name uses lowercase letters, digits, and -",
-                example="staging",
-            )
-        if not repo.strip() and not fields.get("runs", "").strip():
-            raise YardError(
-                400,
-                "bad_json",
-                "repo is required",
-                context={"field": "repo"},
-                help_text="The repo as a full https URL; for a repo-less app pass an image or a URL in runs.",
-                example="https://github.com/org/heldso",
-            )
-        app = apps.create(yard, name, repo, actor=_actor(c), **cast(dict[str, Any], fields))
-        w.json(cast(JsonValue, {"app": cast(JsonValue, app_json(app))}))
-
-    return handler
-
-
-def app_page(yard: Yard) -> Handler:
-    async def handler(c: Context, w: Writer) -> None:
-        page = await status.app_report(yard, c.match.params["name"])
-        deployed = read_deployed(yard.config, page.app.name)
-        w.json(cast(JsonValue, page_json(page, deployed, yard.deploys.get(page.app.name))))
-
-    return handler
-
-
-def app_patch(yard: Yard) -> Handler:
-    async def handler(c: Context, w: Writer) -> None:
-        name = c.match.params["name"]
-        fields = app_fields(await json_object(c), {"repo", "ref", "trigger", "runs"})
-        if not fields:
-            raise YardError(
-                400,
-                "bad_json",
-                "nothing to change",
-                help_text="Set one of repo, ref, trigger, or runs.",
-            )
-        app = apps.update(yard, name, actor=_actor(c), **cast(dict[str, Any], fields))
-        w.json(cast(JsonValue, {"app": app_json(app, read_deployed(yard.config, name))}))
-
-    return handler
-
-
-def app_delete(yard: Yard) -> Handler:
-    async def handler(c: Context, w: Writer) -> None:
-        name = c.match.params["name"]
-        removed = await apps.delete(yard, name, with_binds=c.req.query.get("binds") == "1", actor=_actor(c))
-        body: dict[str, Any] = {
-            "name": removed.name,
-            "binds_removed": [{"host": host, "dial": dial} for host, dial in removed.binds_removed],
-            "binds_left": [{"host": host, "dial": dial} for host, dial in removed.binds_left],
-        }
-        if removed.binds_error:
-            body["binds_error"] = removed.binds_error
-        w.json(cast(JsonValue, body))
-
-    return handler
-
-
-def app_deploy(yard: Yard) -> Handler:
-    async def handler(c: Context, w: Writer) -> None:
-        name = c.match.params["name"]
-        yard.store.app(name)
-        data = await json_object(c)
-        if "sha" in data:
-            raise YardError(
-                400,
-                "bad_request",
-                "Yard deploys what the source says now",
-                help_text=(
-                    "To roll back, change the source: git revert and push,"
-                    " or yard app set --runs IMAGE:OLDER-TAG, or an older URL."
-                ),
-            )
-        for key in data:
-            raise YardError(
-                400,
-                "unknown_field",
-                f"unknown field {key}",
-                help_text="A deploy request takes an empty body.",
-            )
-        job = apps.start_deploy(yard, name, cause="manual", actor=_actor(c))
-        w.json(cast(JsonValue, {"deploy": _job_json(job)}), status=202)
-
-    return handler
-
-
 def _job_json(job: Job) -> dict[str, Any]:
     outcome = job.outcome or {}
     return {
@@ -503,56 +194,6 @@ def _job_json(job: Job) -> dict[str, Any]:
     }
 
 
-def app_deploy_get(yard: Yard) -> Handler:
-    async def handler(c: Context, w: Writer) -> None:
-        name = c.match.params["name"]
-        yard.store.app(name)
-        job = yard.deploys.get(name)
-        if job is None:
-            raise YardError(
-                404,
-                "not_found",
-                "no deploy since Yard started",
-                context={"app": name},
-                help_text=f"yard app logs --deploy --app {name}",
-            )
-        if c.req.query.get("follow") != "1":
-            body = _job_json(job)
-            body["lines"] = job.lines
-            w.json(cast(JsonValue, {"deploy": body}))
-            return
-        w.headers.set("content-type", "application/x-ndjson")
-        w.write_headers(200)
-        seen = 0
-        while not c.disconnected:
-            start = max(0, len(job.lines) - (job.pushed - seen))
-            for line in job.lines[start:]:
-                w.write(json.dumps({"line": line}).encode() + b"\n")
-            seen = job.pushed
-            if job.status != "running" and seen == job.pushed:
-                break
-            await w.drain()
-            if seen == job.pushed:
-                try:
-                    await asyncio.wait_for(job.changed.wait(), 15)
-                except TimeoutError:
-                    pass
-        w.write(json.dumps({"deploy": _job_json(job)}).encode() + b"\n")
-        await w.drain()
-        w.end()
-
-    return handler
-
-
-def app_file(yard: Yard) -> Handler:
-    async def handler(c: Context, w: Writer) -> None:
-        """The compose or Containerfile an app runs, as text/plain."""
-        app = yard.store.app(c.match.params["name"])
-        w.text(apps.app_file(yard.config, app, c.match.params["which"]))
-
-    return handler
-
-
 _LOG_CONTAINER = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}\Z")
 _LOG_ABSOLUTE = re.compile(r"\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?\Z")
 _LOG_RELATIVE = re.compile(r"-(\d+)(s|m|h|d)\Z")
@@ -561,34 +202,6 @@ _LOG_UNITS = {"s": "s", "m": "min", "h": "h", "d": "d"}
 # Podman writes container events with SYSLOG_IDENTIFIER=podman; Yard's own events use yard.
 _EVENT_MATCHES = ["SYSLOG_IDENTIFIER=podman", "SYSLOG_IDENTIFIER=yard"]
 _YARD_TOP = {"YARD_EVENT", "YARD_APP", "YARD_CONTAINER", "YARD_ACTOR", "YARD_SHA", "YARD_STATUS"}
-
-
-def logs_get(config: Config) -> Handler:
-    async def handler(c: Context, w: Writer) -> None:
-        """Container logs from the journal; they outlive the container.
-
-        after is a journald cursor: only entries after it are returned, first
-        `lines` of them, so a poller resumes where it left off. An Accept
-        header that names application/json answers
-        {"entries": [...], "cursor": ...} instead of text lines.
-        """
-        query = c.req.query
-        lines = _log_lines(str(query.get("lines") or ""))
-        since = _log_time(str(query.get("since") or ""))
-        until = _log_time(str(query.get("until") or ""))
-        after = str(query.get("after") or "")
-        match = _container_match(str(query.get("container") or ""))
-        if query.get("follow") == "1":
-            await _stream_journal(config, c, w, [match], lines)
-            return
-        if "application/json" in (c.req.headers.get("accept") or ""):
-            entries = await journal.read_entries(config, [match], lines=lines, since=since, until=until, after=after)
-            w.json(cast(JsonValue, _logs_page(entries)))
-            return
-        text = await journal.read(config, [match], lines=lines, since=since, until=until, after=after)
-        w.text(text if text.endswith("\n") or not text else text + "\n")
-
-    return handler
 
 
 def _logs_page(entries: list[dict]) -> dict[str, Any]:
@@ -619,35 +232,6 @@ def _container_match(given: str) -> str:
         "bad container",
         help_text="A container name, a 12-char id, or a full id.",
     )
-
-
-def events_get(config: Config) -> Handler:
-    async def handler(c: Context, w: Writer) -> None:
-        """One merged timeline of Podman and Yard events."""
-        query = c.req.query
-        lines = _event_lines(str(query.get("lines") or ""))
-        since = _log_time(str(query.get("since") or "")) or "-1d"
-        until = _log_time(str(query.get("until") or ""))
-        want = (
-            str(query.get("app") or ""),
-            str(query.get("container") or ""),
-            str(query.get("source") or ""),
-            str(query.get("event") or ""),
-        )
-        if query.get("follow") == "1":
-            await _stream_events(config, c, w, lines, since, want)
-            return
-        entries = await journal.read_entries(
-            config,
-            _EVENT_MATCHES,
-            lines=50_000,
-            since=since,
-            until=until,
-        )
-        rows = [row for entry in entries if (row := _event_row(entry)) and _event_keeps(row, *want)]
-        w.json(cast(JsonValue, rows[-lines:]))
-
-    return handler
 
 
 def _event_lines(value: str) -> int:
@@ -808,15 +392,6 @@ async def _stream_events(
     w.end()
 
 
-def env_show(store: Store) -> Handler:
-    async def handler(c: Context, w: Writer) -> None:
-        name = c.match.params["name"]
-        store.app(name)
-        w.json(cast(JsonValue, store.read_env(name)))
-
-    return handler
-
-
 def _env_set_event(config: Config, c: Context, name: str, keys: list[str], removed: list[str]) -> None:
     # Key names only; a value never reaches the journal.
     journal.send(
@@ -828,123 +403,6 @@ def _env_set_event(config: Config, c: Context, name: str, keys: list[str], remov
         removed=",".join(removed),
         actor=_actor(c),
     )
-
-
-def env_patch(store: Store, config: Config) -> Handler:
-    async def handler(c: Context, w: Writer) -> None:
-        name = c.match.params["name"]
-        store.app(name)
-        body = await json_object(c)
-        patch: dict[str, str | None] = {}
-        for key, value in body.items():
-            if not isinstance(key, str) or (value is not None and not isinstance(value, str)):
-                raise YardError(
-                    400,
-                    "bad_json",
-                    "bad json",
-                    help_text="env is an object of strings or null.",
-                    example='{"KEY": null}',
-                )
-            patch[key] = value
-        keys = store.patch_env(name, patch)
-        _env_set_event(
-            config,
-            c,
-            name,
-            sorted(key for key, value in patch.items() if value is not None),
-            sorted(key for key, value in patch.items() if value is None),
-        )
-        w.json({"keys": keys})
-
-    return handler
-
-
-def env_put(store: Store, config: Config) -> Handler:
-    async def handler(c: Context, w: Writer) -> None:
-        name = c.match.params["name"]
-        store.app(name)
-        body = await json_object(c)
-        env: dict[str, str] = {}
-        for key, value in body.items():
-            if not isinstance(key, str) or not isinstance(value, str):
-                raise YardError(
-                    400,
-                    "bad_json",
-                    "bad json",
-                    help_text="env is an object of strings.",
-                    example='{"KEY": "value"}',
-                )
-            env[key] = value
-        removed = sorted(set(store.read_env(name)) - set(env))
-        keys = store.write_env(name, env)
-        _env_set_event(config, c, name, sorted(env), removed)
-        w.json({"keys": keys})
-
-    return handler
-
-
-def binds_list(yard: Yard) -> Handler:
-    async def handler(_c: Context, w: Writer) -> None:
-        w.json(cast(JsonValue, [bind_json(bind) for bind in await binds.list_binds(yard)]))
-
-    return handler
-
-
-def binds_put(yard: Yard) -> Handler:
-    async def handler(c: Context, w: Writer) -> None:
-        data = await json_object(c)
-        dial, window = data.get("dial", ""), data.get("try", "10s")
-        if not isinstance(dial, str) or not isinstance(window, str):
-            raise YardError(
-                400,
-                "bad_json",
-                "bad json",
-                help_text="dial is a string. try is a duration.",
-                example='{"dial": "heldso-app-1"}',
-            )
-        host = c.match.params["host"]
-        w.json(cast(JsonValue, bind_json(await binds.put_bind(yard, host, dial, window, actor=_actor(c)))))
-
-    return handler
-
-
-def binds_delete(yard: Yard) -> Handler:
-    async def handler(c: Context, w: Writer) -> None:
-        host = await binds.delete_bind(yard, c.match.params["host"], actor=_actor(c))
-        w.json({"host": host})
-
-    return handler
-
-
-def tokens_list(store: Store) -> Handler:
-    async def handler(_c: Context, w: Writer) -> None:
-        w.json([asdict(token) for token in store.list_tokens()])
-
-    return handler
-
-
-def tokens_create(store: Store, config: Config) -> Handler:
-    async def handler(c: Context, w: Writer) -> None:
-        data = await json_object(c)
-        name = data.get("name", "")
-        if not isinstance(name, str) or not name:
-            raise YardError(400, "bad_json", "bad json", help_text="name is a string.")
-        plain = store.create_token(name)
-        journal.send(config, "token.create", f"token {name}", name=name, actor=_actor(c))
-        w.json({"name": name, "token": plain})
-
-    return handler
-
-
-def tokens_delete(store: Store, config: Config) -> Handler:
-    async def handler(c: Context, w: Writer) -> None:
-        name = c.match.params["name"]
-        actor = _actor(c)
-        store.delete_token(name, actor=actor)
-        journal.send(config, "token.delete", f"token {name}", name=name, actor=actor)
-        w.json({"name": name})
-
-    return handler
 
 
 async def _error_body(_c: Context, w: Writer, exc: BaseException) -> None:
@@ -980,37 +438,520 @@ def bearer(store: Store) -> Middleware:
     return middleware
 
 
+@dataclass(frozen=True, slots=True)
+class HooksPage:
+    """Hooks routes."""
+
+    yard: Yard
+    origin: Origin
+    github: GitHub
+
+    def register(self, app: StarioApp, middleware: Sequence[Middleware] = ()) -> None:
+        app.add(HOOK_ORIGIN, self.origin_hook, middleware=middleware)
+        app.add(HOOK_GITHUB, self.github_hook, middleware=middleware)
+
+    async def origin_hook(self, c: Context, w: Writer) -> None:
+        """An Origin event. No auth. A delivery only schedules a check.
+
+        The envelope is {"event": {"type": ..., "payload": {...}}}. Yard reads the
+        tip from the forge and never trusts the body. Always answers fast.
+        """
+        raw = await _hook_body(c, w)
+        if raw is None:
+            return
+        if not raw.strip():
+            w.empty(204)
+            return
+        try:
+            body = json.loads(raw)
+        except ValueError as exc:
+            raise YardError(400, "bad_json", "bad json", help_text="Send one JSON object.") from exc
+        self.origin.last_delivery = now()
+        event = body.get("event") if isinstance(body, dict) else None
+        kind = event.get("type") if isinstance(event, dict) else ""
+        payload = event.get("payload") if isinstance(event, dict) else {}
+        if kind == "repository.pushed" and isinstance(payload, dict):
+            repo = payload.get("repository")
+            if isinstance(repo, dict):
+                owner = repo.get("owner")
+                slug = owner.get("slug") if isinstance(owner, dict) else ""
+                name = repo.get("name") or ""
+                if slug and name:
+                    url = f"https://{self.origin.host}/{slug}/{name}"
+                    _hook_received(self.yard.config, self.origin, url, kind, c)
+                    c.app.create_task(apps.check_repo(self.yard, url))
+        elif isinstance(kind, str) and kind.startswith("installation."):
+            _hook_received(self.yard.config, self.origin, "", str(kind), c)
+            c.app.create_task(apps.check_installation(self.yard, self.origin))
+        w.empty(204)
+
+    async def github_hook(self, c: Context, w: Writer) -> None:
+        """A GitHub delivery. The signature proves it before anything runs.
+
+        X-Hub-Signature-256 is HMAC-SHA256 over the raw body with the webhook
+        secret the setup stored. A bad or missing signature gets a 401 and
+        nothing else happens.
+        """
+        raw = await _hook_body(c, w)
+        if raw is None:
+            return
+        if not self.github.verify(raw, c.req.headers.get("x-hub-signature-256") or ""):
+            w.json({"error": YardError(401, "unauthorized", "bad signature").payload()}, 401)
+            return
+        self.github.last_delivery = now()
+        if not raw.strip():
+            w.empty(204)
+            return
+        try:
+            body = json.loads(raw)
+        except ValueError as exc:
+            raise YardError(400, "bad_json", "bad json", help_text="Send one JSON object.") from exc
+        kind = c.req.headers.get("x-github-event") or ""
+        if kind == "push" and isinstance(body, dict):
+            repo = body.get("repository")
+            full = repo.get("full_name") if isinstance(repo, dict) else ""
+            if full:
+                url = f"https://{self.github.host}/{full}"
+                _hook_received(self.yard.config, self.github, url, kind, c)
+                c.app.create_task(apps.check_repo(self.yard, url))
+        elif kind in ("installation", "installation_repositories"):
+            _hook_received(self.yard.config, self.github, "", kind, c)
+            c.app.create_task(apps.check_installation(self.yard, self.github))
+        w.empty(204)
+
+
+@dataclass(frozen=True, slots=True)
+class HostPage:
+    """Host routes."""
+
+    yard: Yard
+
+    def register(self, app: StarioApp, middleware: Sequence[Middleware] = ()) -> None:
+        app.add(STATUS, self.host_status, middleware=middleware)
+        app.add(LOGS, self.logs_get, middleware=middleware)
+        app.add(EVENTS, self.events_get, middleware=middleware)
+        app.add(DOCTOR, self.doctor_run, middleware=middleware)
+        app.add(PRUNE, self.run_prune, middleware=middleware)
+        app.add(FORGES, self.forges_list, middleware=middleware)
+        app.add(FORGE_PUT, self.forge_put, middleware=middleware)
+
+    async def host_status(self, c: Context, w: Writer) -> None:
+        report = await status.report(self.yard, c.req.query.get("running") == "1")
+        w.json(cast(JsonValue, asdict(report)))
+
+    async def doctor_run(self, _c: Context, w: Writer) -> None:
+        w.json([asdict(check) for check in await doctor.run(self.yard)])
+
+    async def run_prune(self, c: Context, w: Writer) -> None:
+        data = await json_object(c)
+        days = data.get("days", 7)
+        dry = data.get("dry", False)
+        if not isinstance(days, int) or isinstance(days, bool) or days < 1 or not isinstance(dry, bool):
+            raise YardError(
+                400,
+                "bad_json",
+                "bad json",
+                help_text="days is a number 1 or more. dry is true or false.",
+                example='{"days": 7, "dry": false}',
+            )
+        w.json(cast(JsonValue, asdict(await apps.prune(self.yard, days, dry, actor=_actor(c)))))
+
+    async def forges_list(self, _c: Context, w: Writer) -> None:
+        """The forge summaries. A connected app with no installation gets one
+        lookup per read; a lookup failure only marks that summary."""
+        rows = []
+        for forge in self.yard.forges.values():
+            error = await _install(forge, self.yard.config)
+            summary = forge.summary()
+            if error:
+                summary["error"] = error
+            rows.append(summary)
+        w.json(cast(JsonValue, rows))
+
+    async def forge_put(self, c: Context, w: Writer) -> None:
+        """Save a forge app once its credentials pass the forge's own check."""
+        forge = _named(self.yard.forges, c.match.params["name"])
+        data = await json_object(c)
+        if isinstance(forge, Origin):
+            app_id = data.get("app_id", "")
+            if not isinstance(app_id, str) or not app_id:
+                raise YardError(
+                    400,
+                    "bad_json",
+                    "bad json",
+                    help_text="app_id is a string.",
+                    example='{"app_id": "app_..."}',
+                )
+            info = await forge.connect(app_id)
+            journal.send(
+                self.yard.config,
+                "forge.connect",
+                f"{forge.name} connected",
+                forge=forge.name,
+                app_id=app_id,
+                actor=_actor(c),
+            )
+            app = {
+                "name": info.get("displayName") or info.get("name") or "",
+                "webhook_url": info.get("webhookUrl") or info.get("webhook_url") or "",
+                "events": info.get("events") or [],
+            }
+        elif isinstance(forge, GitHub):
+            app_id = data.get("app_id", "")
+            private_key = data.get("private_key", "")
+            secret = data.get("webhook_secret", "")
+            if (
+                not isinstance(app_id, str)
+                or not isinstance(private_key, str)
+                or not isinstance(secret, str)
+                or not app_id
+                or not private_key
+                or not secret
+            ):
+                raise YardError(
+                    400,
+                    "bad_json",
+                    "bad json",
+                    help_text="app_id, private_key, and webhook_secret are strings.",
+                )
+            info = await forge.connect(app_id, private_key, secret)
+            journal.send(
+                self.yard.config,
+                "forge.connect",
+                f"{forge.name} connected",
+                forge=forge.name,
+                app_id=app_id,
+                actor=_actor(c),
+            )
+            app = {
+                "name": info.get("name") or "",
+                "slug": info.get("slug") or "",
+                "events": info.get("events") or [],
+            }
+        else:
+            raise YardError(
+                404, "not_found", f"unknown forge {forge.name}", help_text="The forges are origin and github."
+            )
+        w.json(cast(JsonValue, {"forge": forge.summary(), "app": app}))
+
+    async def logs_get(self, c: Context, w: Writer) -> None:
+        """Container logs from the journal; they outlive the container.
+
+        after is a journald cursor: only entries after it are returned, first
+        `lines` of them, so a poller resumes where it left off. An Accept
+        header that names application/json answers
+        {"entries": [...], "cursor": ...} instead of text lines.
+        """
+        query = c.req.query
+        lines = _log_lines(str(query.get("lines") or ""))
+        since = _log_time(str(query.get("since") or ""))
+        until = _log_time(str(query.get("until") or ""))
+        after = str(query.get("after") or "")
+        match = _container_match(str(query.get("container") or ""))
+        if query.get("follow") == "1":
+            await _stream_journal(self.yard.config, c, w, [match], lines)
+            return
+        if "application/json" in (c.req.headers.get("accept") or ""):
+            entries = await journal.read_entries(
+                self.yard.config, [match], lines=lines, since=since, until=until, after=after
+            )
+            w.json(cast(JsonValue, _logs_page(entries)))
+            return
+        text = await journal.read(self.yard.config, [match], lines=lines, since=since, until=until, after=after)
+        w.text(text if text.endswith("\n") or not text else text + "\n")
+
+    async def events_get(self, c: Context, w: Writer) -> None:
+        """One merged timeline of Podman and Yard events."""
+        query = c.req.query
+        lines = _event_lines(str(query.get("lines") or ""))
+        since = _log_time(str(query.get("since") or "")) or "-1d"
+        until = _log_time(str(query.get("until") or ""))
+        want = (
+            str(query.get("app") or ""),
+            str(query.get("container") or ""),
+            str(query.get("source") or ""),
+            str(query.get("event") or ""),
+        )
+        if query.get("follow") == "1":
+            await _stream_events(self.yard.config, c, w, lines, since, want)
+            return
+        entries = await journal.read_entries(
+            self.yard.config,
+            _EVENT_MATCHES,
+            lines=50_000,
+            since=since,
+            until=until,
+        )
+        rows = [row for entry in entries if (row := _event_row(entry)) and _event_keeps(row, *want)]
+        w.json(cast(JsonValue, rows[-lines:]))
+
+
+@dataclass(frozen=True, slots=True)
+class AppsPage:
+    """Apps routes."""
+
+    yard: Yard
+
+    def register(self, app: StarioApp, middleware: Sequence[Middleware] = ()) -> None:
+        app.add(APPS, self.apps_list, middleware=middleware)
+        app.add(APP_CREATE, self.apps_create, middleware=middleware)
+        app.add(APP, self.app_page, middleware=middleware)
+        app.add(APP_PATCH, self.app_patch, middleware=middleware)
+        app.add(APP_DELETE, self.app_delete, middleware=middleware)
+        app.add(APP_DEPLOY, self.app_deploy, middleware=middleware)
+        app.add(APP_DEPLOY_GET, self.app_deploy_get, middleware=middleware)
+        app.add(APP_FILE, self.app_file, middleware=middleware)
+        app.add(ENV, self.env_show, middleware=middleware)
+        app.add(ENV_PATCH, self.env_patch, middleware=middleware)
+        app.add(ENV_PUT, self.env_put, middleware=middleware)
+
+    async def apps_list(self, _c: Context, w: Writer) -> None:
+        w.json([app_json(app, read_deployed(self.yard.config, app.name)) for app in self.yard.store.list_apps()])
+
+    async def apps_create(self, c: Context, w: Writer) -> None:
+        data = await json_object(c)
+        fields = app_fields(data, {"name", "repo", "ref", "trigger", "runs"})
+        name = data.get("name", "")
+        repo = fields.pop("repo", "")
+        if not isinstance(name, str) or not isinstance(repo, str):
+            raise YardError(
+                400,
+                "bad_json",
+                "bad json",
+                help_text="name and repo are strings.",
+            )
+        if not name.strip():
+            raise YardError(
+                400,
+                "bad_json",
+                "name is required",
+                context={"field": "name"},
+                help_text="An app name uses lowercase letters, digits, and -",
+                example="staging",
+            )
+        if not repo.strip() and not fields.get("runs", "").strip():
+            raise YardError(
+                400,
+                "bad_json",
+                "repo is required",
+                context={"field": "repo"},
+                help_text="The repo as a full https URL; for a repo-less app pass an image or a URL in runs.",
+                example="https://github.com/org/heldso",
+            )
+        app = apps.create(self.yard, name, repo, actor=_actor(c), **cast(dict[str, Any], fields))
+        w.json(cast(JsonValue, {"app": cast(JsonValue, app_json(app))}))
+
+    async def app_page(self, c: Context, w: Writer) -> None:
+        page = await status.app_report(self.yard, c.match.params["name"])
+        deployed = read_deployed(self.yard.config, page.app.name)
+        w.json(cast(JsonValue, page_json(page, deployed, self.yard.deploys.get(page.app.name))))
+
+    async def app_patch(self, c: Context, w: Writer) -> None:
+        name = c.match.params["name"]
+        fields = app_fields(await json_object(c), {"repo", "ref", "trigger", "runs"})
+        if not fields:
+            raise YardError(
+                400,
+                "bad_json",
+                "nothing to change",
+                help_text="Set one of repo, ref, trigger, or runs.",
+            )
+        app = apps.update(self.yard, name, actor=_actor(c), **cast(dict[str, Any], fields))
+        w.json(cast(JsonValue, {"app": app_json(app, read_deployed(self.yard.config, name))}))
+
+    async def app_delete(self, c: Context, w: Writer) -> None:
+        name = c.match.params["name"]
+        removed = await apps.delete(self.yard, name, with_binds=c.req.query.get("binds") == "1", actor=_actor(c))
+        body: dict[str, Any] = {
+            "name": removed.name,
+            "binds_removed": [{"host": host, "dial": dial} for host, dial in removed.binds_removed],
+            "binds_left": [{"host": host, "dial": dial} for host, dial in removed.binds_left],
+        }
+        if removed.binds_error:
+            body["binds_error"] = removed.binds_error
+        w.json(cast(JsonValue, body))
+
+    async def app_deploy(self, c: Context, w: Writer) -> None:
+        name = c.match.params["name"]
+        self.yard.store.app(name)
+        data = await json_object(c)
+        if "sha" in data:
+            raise YardError(
+                400,
+                "bad_request",
+                "Yard deploys what the source says now",
+                help_text=(
+                    "To roll back, change the source: git revert and push,"
+                    " or yard app set --runs IMAGE:OLDER-TAG, or an older URL."
+                ),
+            )
+        for key in data:
+            raise YardError(
+                400,
+                "unknown_field",
+                f"unknown field {key}",
+                help_text="A deploy request takes an empty body.",
+            )
+        job = apps.start_deploy(self.yard, name, cause="manual", actor=_actor(c))
+        w.json(cast(JsonValue, {"deploy": _job_json(job)}), status=202)
+
+    async def app_deploy_get(self, c: Context, w: Writer) -> None:
+        name = c.match.params["name"]
+        self.yard.store.app(name)
+        job = self.yard.deploys.get(name)
+        if job is None:
+            raise YardError(
+                404,
+                "not_found",
+                "no deploy since Yard started",
+                context={"app": name},
+                help_text=f"yard app logs --deploy --app {name}",
+            )
+        if c.req.query.get("follow") != "1":
+            body = _job_json(job)
+            body["lines"] = job.lines
+            w.json(cast(JsonValue, {"deploy": body}))
+            return
+        w.headers.set("content-type", "application/x-ndjson")
+        w.write_headers(200)
+        seen = 0
+        while not c.disconnected:
+            start = max(0, len(job.lines) - (job.pushed - seen))
+            for line in job.lines[start:]:
+                w.write(json.dumps({"line": line}).encode() + b"\n")
+            seen = job.pushed
+            if job.status != "running" and seen == job.pushed:
+                break
+            await w.drain()
+            if seen == job.pushed:
+                try:
+                    await asyncio.wait_for(job.changed.wait(), 15)
+                except TimeoutError:
+                    pass
+        w.write(json.dumps({"deploy": _job_json(job)}).encode() + b"\n")
+        await w.drain()
+        w.end()
+
+    async def app_file(self, c: Context, w: Writer) -> None:
+        """The compose or Containerfile an app runs, as text/plain."""
+        app = self.yard.store.app(c.match.params["name"])
+        w.text(apps.app_file(self.yard.config, app, c.match.params["which"]))
+
+    async def env_show(self, c: Context, w: Writer) -> None:
+        name = c.match.params["name"]
+        self.yard.store.app(name)
+        w.json(cast(JsonValue, self.yard.store.read_env(name)))
+
+    async def env_patch(self, c: Context, w: Writer) -> None:
+        name = c.match.params["name"]
+        self.yard.store.app(name)
+        body = await json_object(c)
+        patch: dict[str, str | None] = {}
+        for key, value in body.items():
+            if not isinstance(key, str) or (value is not None and not isinstance(value, str)):
+                raise YardError(
+                    400,
+                    "bad_json",
+                    "bad json",
+                    help_text="env is an object of strings or null.",
+                    example='{"KEY": null}',
+                )
+            patch[key] = value
+        keys = self.yard.store.patch_env(name, patch)
+        _env_set_event(
+            self.yard.config,
+            c,
+            name,
+            sorted(key for key, value in patch.items() if value is not None),
+            sorted(key for key, value in patch.items() if value is None),
+        )
+        w.json({"keys": keys})
+
+    async def env_put(self, c: Context, w: Writer) -> None:
+        name = c.match.params["name"]
+        self.yard.store.app(name)
+        body = await json_object(c)
+        env: dict[str, str] = {}
+        for key, value in body.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise YardError(
+                    400,
+                    "bad_json",
+                    "bad json",
+                    help_text="env is an object of strings.",
+                    example='{"KEY": "value"}',
+                )
+            env[key] = value
+        removed = sorted(set(self.yard.store.read_env(name)) - set(env))
+        keys = self.yard.store.write_env(name, env)
+        _env_set_event(self.yard.config, c, name, sorted(env), removed)
+        w.json({"keys": keys})
+
+
+@dataclass(frozen=True, slots=True)
+class AccessPage:
+    """Access routes."""
+
+    yard: Yard
+
+    def register(self, app: StarioApp, middleware: Sequence[Middleware] = ()) -> None:
+        app.add(BINDS, self.binds_list, middleware=middleware)
+        app.add(BIND_PUT, self.binds_put, middleware=middleware)
+        app.add(BIND_DELETE, self.binds_delete, middleware=middleware)
+        app.add(TOKENS, self.tokens_list, middleware=middleware)
+        app.add(TOKEN_CREATE, self.tokens_create, middleware=middleware)
+        app.add(TOKEN_DELETE, self.tokens_delete, middleware=middleware)
+
+    async def binds_list(self, _c: Context, w: Writer) -> None:
+        w.json(cast(JsonValue, [bind_json(bind) for bind in await binds.list_binds(self.yard)]))
+
+    async def binds_put(self, c: Context, w: Writer) -> None:
+        data = await json_object(c)
+        dial, window = data.get("dial", ""), data.get("try", "10s")
+        if not isinstance(dial, str) or not isinstance(window, str):
+            raise YardError(
+                400,
+                "bad_json",
+                "bad json",
+                help_text="dial is a string. try is a duration.",
+                example='{"dial": "heldso-app-1"}',
+            )
+        host = c.match.params["host"]
+        w.json(cast(JsonValue, bind_json(await binds.put_bind(self.yard, host, dial, window, actor=_actor(c)))))
+
+    async def binds_delete(self, c: Context, w: Writer) -> None:
+        host = await binds.delete_bind(self.yard, c.match.params["host"], actor=_actor(c))
+        w.json({"host": host})
+
+    async def tokens_list(self, _c: Context, w: Writer) -> None:
+        w.json([asdict(token) for token in self.yard.store.list_tokens()])
+
+    async def tokens_create(self, c: Context, w: Writer) -> None:
+        data = await json_object(c)
+        name = data.get("name", "")
+        if not isinstance(name, str) or not name:
+            raise YardError(400, "bad_json", "bad json", help_text="name is a string.")
+        plain = self.yard.store.create_token(name)
+        journal.send(self.yard.config, "token.create", f"token {name}", name=name, actor=_actor(c))
+        w.json({"name": name, "token": plain})
+
+    async def tokens_delete(self, c: Context, w: Writer) -> None:
+        name = c.match.params["name"]
+        actor = _actor(c)
+        self.yard.store.delete_token(name, actor=actor)
+        journal.send(self.yard.config, "token.delete", f"token {name}", name=name, actor=actor)
+        w.json({"name": name})
+
+
 def register(app: StarioApp, yard: Yard) -> None:
     auth = (bearer(yard.store),)
     # YardError is the API's failure shape on every route. Uncaught exceptions
     # fall through to the framework's own 500.
     app.use("/", catch_errors(YardError, respond=_error_body))
+    app.add(HEALTH, health)
     origin = next(forge for forge in yard.forges.values() if isinstance(forge, Origin))
     github = next(forge for forge in yard.forges.values() if isinstance(forge, GitHub))
-    app.add(HEALTH, health)
-    app.add(HOOK_ORIGIN, origin_hook(origin, yard))
-    app.add(HOOK_GITHUB, github_hook(github, yard))
-    app.add(STATUS, host_status(yard), middleware=auth)
-    app.add(LOGS, logs_get(yard.config), middleware=auth)
-    app.add(EVENTS, events_get(yard.config), middleware=auth)
-    app.add(DOCTOR, doctor_run(yard), middleware=auth)
-    app.add(FORGES, forges_list(yard.forges, yard.config), middleware=auth)
-    app.add(FORGE_PUT, forge_put(yard.forges, yard.config), middleware=auth)
-    app.add(APPS, apps_list(yard), middleware=auth)
-    app.add(APP_CREATE, apps_create(yard), middleware=auth)
-    app.add(APP, app_page(yard), middleware=auth)
-    app.add(APP_PATCH, app_patch(yard), middleware=auth)
-    app.add(APP_DELETE, app_delete(yard), middleware=auth)
-    app.add(APP_DEPLOY, app_deploy(yard), middleware=auth)
-    app.add(APP_DEPLOY_GET, app_deploy_get(yard), middleware=auth)
-    app.add(APP_FILE, app_file(yard), middleware=auth)
-    app.add(ENV, env_show(yard.store), middleware=auth)
-    app.add(ENV_PATCH, env_patch(yard.store, yard.config), middleware=auth)
-    app.add(ENV_PUT, env_put(yard.store, yard.config), middleware=auth)
-    app.add(BINDS, binds_list(yard), middleware=auth)
-    app.add(BIND_PUT, binds_put(yard), middleware=auth)
-    app.add(BIND_DELETE, binds_delete(yard), middleware=auth)
-    app.add(PRUNE, run_prune(yard), middleware=auth)
-    app.add(TOKENS, tokens_list(yard.store), middleware=auth)
-    app.add(TOKEN_CREATE, tokens_create(yard.store, yard.config), middleware=auth)
-    app.add(TOKEN_DELETE, tokens_delete(yard.store, yard.config), middleware=auth)
+    HooksPage(yard, origin, github).register(app)
+    HostPage(yard).register(app, middleware=auth)
+    AppsPage(yard).register(app, middleware=auth)
+    AccessPage(yard).register(app, middleware=auth)

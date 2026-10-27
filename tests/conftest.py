@@ -17,7 +17,7 @@ async def yard(tmp_path, monkeypatch):
     monkeypatch.setenv("YARD_JOURNAL_DIR", str(tmp_path / "no-journal"))
     monkeypatch.setenv("YARD_JOURNAL_SOCKET", str(tmp_path / "no-journal.sock"))
     monkeypatch.setenv("YARD_JOURNALCTL_BIN", "journalctl-missing")
-    async with TestClient(bootstrap) as client:
+    async with TestClient(bootstrap, request_timeout=5) as client:
         token = (tmp_path / "tokens" / "admin.token").read_text().strip()
         yield client, token, tmp_path
 
