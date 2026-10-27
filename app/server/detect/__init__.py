@@ -130,8 +130,8 @@ def language(checkout: Path, name: str = "") -> Plan:
         raise YardError(
             502,
             "detect",
-            f"no compose file, Containerfile, or known language (Python, Go, Node) in {sha}",
-            help_text="Add a Containerfile: stario.dev/yard/first-app",
+            f"no compose file, Containerfile, or known language (Python, Go, Node, Nushell) in {sha}",
+            help_text="Add a Containerfile: stario.dev/yard/what-runs#when-yard-refuses",
         )
     lang = next(iter(found))
     for mod in DETECTORS:

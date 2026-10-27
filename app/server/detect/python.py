@@ -50,7 +50,7 @@ def plan(repo: Repo, name: str, *, reason: str) -> Plan:
             raise YardError(
                 502,
                 "detect",
-                f"found {reason.split(':', 1)[-1].strip()} but no app/main.py, main.py, or app.py",
+                f"found a {reason.split(':', 1)[0].strip().capitalize()} app but no app/main.py, main.py, or app.py",
                 help_text="Add one of those files, or add a Containerfile.",
             )
     if repo.exists("uv.lock"):

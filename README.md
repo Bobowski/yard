@@ -35,7 +35,7 @@ The command is `yard`. The PyPI name is `staryard`, because `yard` is taken. Pyt
 - Settings from the environment. `yard env set KEY=VALUE` writes them.
 - Persistent files in `/data`. That directory survives every deploy.
 
-Yard is built for [Stario](https://stario.dev) apps. A Stario app needs no Containerfile. Yard sees `stario` in `pyproject.toml`, installs from `uv.lock`, starts `python -m app.main`, and sets `STARIO_HOST=0.0.0.0`. The deploy log names what Yard chose and why. When Yard is not sure, it stops and says what to add. [How Yard reads a repo](https://stario.dev/yard/what-runs#how-yard-reads-a-repo) lists each file it reads. Any other app in a container works too, and so does software that someone else publishes: [Self-host a service](https://stario.dev/yard/self-host) runs Vaultwarden from an image and Umami from a compose file, with no repo and no forge.
+Yard runs any app in a container. A [Stario](https://stario.dev) app needs the least setup: no Containerfile. Yard sees `stario` in `pyproject.toml`, installs from `uv.lock`, starts `python -m app.main`, and sets `STARIO_HOST=0.0.0.0`. The deploy log names what Yard chose and why. When Yard is not sure, it stops and says what to add. [How Yard reads a repo](https://stario.dev/yard/what-runs#how-yard-reads-a-repo) lists each file it reads. Any other app in a container works too, and so does software that someone else publishes: [Self-host a service](https://stario.dev/yard/self-host) runs Vaultwarden from an image and Umami from a compose file, with no repo and no forge.
 
 ## Docs
 
