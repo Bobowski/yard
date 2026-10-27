@@ -90,6 +90,14 @@ def test_stario_needs_uv_lock(tmp_path: Path):
         detect.resolve(tmp_path, "heldso")
 
 
+def test_stario_no_entrypoint(tmp_path: Path):
+    _write(tmp_path, "pyproject.toml", PYPROJECT)
+    _write(tmp_path, "uv.lock", "lock")
+    with pytest.raises(YardError) as caught:
+        detect.resolve(tmp_path, "heldso")
+    assert caught.value.message == "found a Stario app but no app/main.py, main.py, or app.py"
+
+
 def test_python_requirements(tmp_path: Path):
     _write(tmp_path, "requirements.txt", "flask\n")
     _write(tmp_path, "app.py")
@@ -122,8 +130,9 @@ def test_python_pyproject_without_lock_or_requirements(tmp_path: Path):
 
 def test_python_no_entrypoint(tmp_path: Path):
     _write(tmp_path, "requirements.txt", "flask\n")
-    with pytest.raises(YardError, match="no app/main.py, main.py, or app.py"):
+    with pytest.raises(YardError) as caught:
         detect.resolve(tmp_path, "heldso")
+    assert caught.value.message == "found a Python app but no app/main.py, main.py, or app.py"
 
 
 def test_go_root_main(tmp_path: Path):
@@ -205,8 +214,13 @@ def test_ambiguous_fails(tmp_path: Path):
 
 
 def test_nothing_fails(tmp_path: Path):
-    with pytest.raises(YardError, match="no compose file, Containerfile, or known language"):
+    with pytest.raises(YardError) as caught:
         detect.resolve(tmp_path, "heldso")
+    assert (
+        caught.value.message
+        == "no compose file, Containerfile, or known language (Python, Go, Node, Nushell) in the checkout"
+    )
+    assert caught.value.help_text == "Add a Containerfile: stario.dev/yard/what-runs#when-yard-refuses"
 
 
 def test_python_version_sources(tmp_path: Path):
@@ -367,7 +381,10 @@ def test_http_nu_needs_a_handler(tmp_path: Path):
 
 def test_http_nu_subdir_only_is_not_detected(tmp_path: Path):
     _write(tmp_path, "sub/serve.nu", "{|req| 'hi'}\n")
-    with pytest.raises(YardError, match="no compose file, Containerfile, or known language"):
+    with pytest.raises(
+        YardError,
+        match=r"no compose file, Containerfile, or known language \(Python, Go, Node, Nushell\)",
+    ):
         detect.resolve(tmp_path, "xs-app")
 
 
