@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `yard app new --runs https://…/uptime-kuma.compose.yml` names the app `uptime-kuma`. Before, the name kept `.compose` and the command stopped with "name must be a short lowercase word", so the documented example failed without `--app`.
+
 ## 0.9.0
 
 - Deploys are jobs. `POST /api/v1/apps/{name}/deploy` answers 202 with the job, `GET` on the same route returns it (`?follow=1` streams the log as `x-ndjson`, ending with the deploy object), and the app page gains a `job` field. Breaking for API callers that expected the deploy body back in the POST.
