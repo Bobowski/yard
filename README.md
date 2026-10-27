@@ -35,7 +35,7 @@ The command is `yard`. The PyPI name is `staryard`, because `yard` is taken. Pyt
 - Settings from the environment. `yard env set KEY=VALUE` writes them.
 - Persistent files in `/data`. That directory survives every deploy.
 
-Yard is built for [Stario](https://stario.dev) apps. A Stario app needs no Containerfile. Yard sees `stario` in `pyproject.toml`, installs from `uv.lock`, starts `python -m app.main`, and sets `STARIO_HOST=0.0.0.0`. The deploy log names what Yard chose and why. When Yard is not sure, it stops and says what to add. [How Yard reads a repo](https://stario.dev/yard/what-runs#how-yard-reads-a-repo) lists each file it reads. Any other app in a container works too.
+Yard is built for [Stario](https://stario.dev) apps. A Stario app needs no Containerfile. Yard sees `stario` in `pyproject.toml`, installs from `uv.lock`, starts `python -m app.main`, and sets `STARIO_HOST=0.0.0.0`. The deploy log names what Yard chose and why. When Yard is not sure, it stops and says what to add. [How Yard reads a repo](https://stario.dev/yard/what-runs#how-yard-reads-a-repo) lists each file it reads. Any other app in a container works too, and so does software that someone else publishes: [Self-host a service](https://stario.dev/yard/self-host) runs Vaultwarden from an image and Umami from a compose file, with no repo and no forge.
 
 ## Docs
 
@@ -45,6 +45,7 @@ The docs at [stario.dev/yard](https://stario.dev/yard) read as a short book:
 - [One push, start to finish](https://stario.dev/yard/one-push) — follow a single commit from your laptop to a live container.
 - [Set up a host](https://stario.dev/yard/install) — a fresh VM to a working Yard in one script and a few commands.
 - [Your first app](https://stario.dev/yard/first-app) — the four rules an app follows, then one push.
+- [Self-host a service](https://stario.dev/yard/self-host) — run someone else's software from an image or a compose file, and what Yard does not do.
 - [What an app runs](https://stario.dev/yard/what-runs) — how Yard reads a repo, the Containerfile it writes for a Stario app, what it refuses, and how an app runs an image or a compose URL instead.
 - [Day to day](https://stario.dev/yard/day-to-day) — logs, settings, domains, rollbacks, and cleanup.
 - [Your own compose file](https://stario.dev/yard/compose) — workers, sidecars, healthchecks, and apps in any language.
