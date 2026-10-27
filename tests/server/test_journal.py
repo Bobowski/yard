@@ -249,7 +249,7 @@ async def yard_journal(tmp_path, monkeypatch):
     monkeypatch.setenv("YARD_PODMAN_BIN", "yard-podman-missing")
     monkeypatch.setenv("YARD_JOURNAL_DIR", str(tmp_path / "journal"))
     monkeypatch.setenv("YARD_JOURNALCTL_BIN", str(script))
-    async with TestClient(bootstrap) as client:
+    async with TestClient(bootstrap, request_timeout=5) as client:
         token = (tmp_path / "tokens" / "admin.token").read_text().strip()
         yield client, token, argv_log, tmp_path / "out"
 
@@ -375,7 +375,7 @@ async def yard_cursor(tmp_path, monkeypatch):
     monkeypatch.setenv("YARD_PODMAN_BIN", "yard-podman-missing")
     monkeypatch.setenv("YARD_JOURNAL_DIR", str(tmp_path / "journal"))
     monkeypatch.setenv("YARD_JOURNALCTL_BIN", str(script))
-    async with TestClient(bootstrap) as client:
+    async with TestClient(bootstrap, request_timeout=5) as client:
         token = (tmp_path / "tokens" / "admin.token").read_text().strip()
         yield client, token, argv_log
 

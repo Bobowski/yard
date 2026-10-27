@@ -19,13 +19,15 @@ classifiers = [
     "Programming Language :: Python :: 3 :: Only",
     "Topic :: System :: Systems Administration",
 ]
-dependencies = []
+dependencies = [
+    "stario>=5.2,<6",
+]
 
 [project.optional-dependencies]
 server = [
     "cryptography>=50.0.2",
     "orjson>=3.13.0",
-    "stario>=5.1,<6",
+    "stario>=5.2,<6",
     "uvloop>=0.21.0",
 ]
 
@@ -54,7 +56,7 @@ dev = [
     "pytest>=8.4.0",
     "pytest-asyncio>=1.3.0",
     "ruff>=0.12.8",
-    "stario>=5.1,<6",
+    "stario>=5.2,<6",
     "uvloop>=0.21.0",
     "watchfiles>=1.1.1",
 ]
