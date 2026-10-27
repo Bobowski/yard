@@ -12,6 +12,7 @@ Before you call work done, run `just check` (ruff, ruff format, pyright, pytest)
 - `bootstrap(app: App, span: Span)` is an async generator with one `yield`: build shared objects, register routes, `yield`, clean up. Routes are fixed after `bootstrap`.
 - A handler is `async def handler(c: Context, w: Writer) -> None`. It answers once: `w.json`, `w.text`, `w.empty`, or `w.redirect`.
 - `Route("GET /apps/{name}")` is one method on one path. `app.add(ROUTE, handler)` registers it; `ROUTE.href(name)` builds the path. No `url_for`, no `app.get`.
+- A literal segment beats a parameter, in any order: `/rooms/live` and `/rooms/{room_id}` both work.
 - `c.match.params`, `c.req.query`, `c.req.cookies`; `c.state` is filled by middleware. Middleware is `(inner: Handler) -> Handler`, added with `app.use("/prefix", mw)`.
 - A long loop iterates `c.alive(source)`. Background work is `c.app.create_task(coro)`, never bare `asyncio.create_task`.
 - JSON goes through `stario.json` (`w.json`), not `json.dumps`.
