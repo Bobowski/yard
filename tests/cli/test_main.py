@@ -1628,6 +1628,7 @@ def test_source_name():
     assert cli._source_name("image", "postgres:17") == "postgres"
     assert cli._source_name("url", "https://example.com/ops/umami.yml") == "umami"
     assert cli._source_name("url", "https://example.com/ops/site.yaml") == "site"
+    assert cli._source_name("url", "https://example.com/examples/uptime-kuma.compose.yml") == "uptime-kuma"
 
 
 def test_app_new_image(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):

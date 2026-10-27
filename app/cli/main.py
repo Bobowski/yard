@@ -244,7 +244,7 @@ def _source_name(kind: str, runs: str) -> str:
     if kind == "image":
         return runs.split("@", 1)[0].rsplit(":", 1)[0].rsplit("/", 1)[-1]
     tail = runs.rsplit("/", 1)[-1]
-    return tail.removesuffix(".yml").removesuffix(".yaml")
+    return tail.removesuffix(".yml").removesuffix(".yaml").removesuffix(".compose")
 
 
 def _default_name(repo: str, ref: str) -> str:
