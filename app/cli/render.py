@@ -331,8 +331,14 @@ def format_forges(rows: list, *, color: bool = False) -> str:
             str(row.get("name") or ""),
             "yes" if row.get("connected") else "no",
             str(row.get("app_id") or ""),
-            str(row.get("installation_id") or ""),
-            str(row.get("selection") or ""),
+            ", ".join(
+                f"{entry.get('account')}:{entry.get('id')}"
+                for entry in row.get("installations") or []
+                if isinstance(entry, dict)
+            ),
+            ", ".join(
+                str(entry.get("selection") or "") for entry in row.get("installations") or [] if isinstance(entry, dict)
+            ),
             _when(str(row.get("last_delivery") or "")),
         ]
         for row in rows

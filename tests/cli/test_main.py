@@ -897,7 +897,7 @@ def test_forge_ls(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
             "host": "origin.cursor.com",
             "connected": False,
             "app_id": "",
-            "installation_id": "",
+            "installations": [],
             "last_delivery": "",
             "last_check": "",
         },
@@ -906,8 +906,10 @@ def test_forge_ls(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
             "host": "github.com",
             "connected": True,
             "app_id": "42",
-            "installation_id": "101",
-            "selection": "all",
+            "installations": [
+                {"id": "101", "account": "org", "selection": "all"},
+                {"id": "202", "account": "other", "selection": "all"},
+            ],
             "last_delivery": "",
             "last_check": "",
         },
@@ -918,6 +920,7 @@ def test_forge_ls(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
     out = capsys.readouterr().out
     assert "origin" in out and "github" in out and "yes" in out
     assert "selection" in out and "all" in out
+    assert "org:101, other:202" in out
 
 
 def _fake_setup_api(calls: list):
@@ -929,10 +932,9 @@ def _fake_setup_api(calls: list):
                     {
                         "name": "origin",
                         "public_key": "-----BEGIN PUBLIC KEY-----\nPUB\n-----END PUBLIC KEY-----\n",
-                        "installation_id": "ins_1",
-                        "selection": "all",
+                        "installations": [{"id": "ins_1", "account": "org", "selection": "all"}],
                     },
-                    {"name": "github", "installation_id": "101", "selection": "all"},
+                    {"name": "github", "installations": [{"id": "101", "account": "org", "selection": "all"}]},
                 ]
             )
         if path == "/api/v1/forges/origin" and method == "PUT":
@@ -1016,8 +1018,9 @@ def test_forge_setup_polls_and_warns(monkeypatch: pytest.MonkeyPatch, capsys: py
                     {
                         "name": "origin",
                         "public_key": "PUB\n",
-                        "installation_id": "ins_1" if count > 2 else "",
-                        "selection": "selected" if count > 2 else "",
+                        "installations": (
+                            [{"id": "ins_1", "account": "org", "selection": "selected"}] if count > 2 else []
+                        ),
                         "error": "origin GET /app/installations: refused" if count == 2 else "",
                     }
                 ]
@@ -1044,7 +1047,7 @@ def test_forge_setup_polls_and_warns(monkeypatch: pytest.MonkeyPatch, capsys: py
     assert "Done." in captured.out
     assert len(reads) >= 3
     assert "warning: origin GET /app/installations: refused" in captured.err
-    assert "the installation covers selected repos only" in captured.err
+    assert "installation covers selected repos only" in captured.err
 
 
 def test_forge_setup_origin_reprompts_a_bad_app_id(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
@@ -1170,7 +1173,9 @@ def test_forge_setup_github_retries_after_a_client_error(
         nonlocal attempts
         calls.append((method, path, body))
         if path == "/api/v1/forges":
-            return 200, json.dumps([{"name": "github", "installation_id": "101", "selection": "all"}])
+            return 200, json.dumps(
+                [{"name": "github", "installations": [{"id": "101", "account": "org", "selection": "all"}]}]
+            )
         if path == "/api/v1/forges/github" and method == "PUT":
             attempts += 1
             if attempts == 1:
@@ -1271,8 +1276,7 @@ def test_forge_setup_github_continues_to_the_install(
                 "name": "github",
                 "app_id": "42",
                 "slug": "yard-host",
-                "installation_id": "" if reads == 1 else "101",
-                "selection": "all",
+                "installations": [] if reads == 1 else [{"id": "101", "account": "org", "selection": "all"}],
             }
             return 200, json.dumps([row])
         raise AssertionError(path)
@@ -1296,7 +1300,17 @@ def test_forge_setup_github_already_connected(
     def fake_api_try(client, method, path, body, timeout=None):
         calls.append((method, path, body))
         if path == "/api/v1/forges":
-            return 200, json.dumps([{"name": "github", "connected": True, "app_id": "42", "installation_id": "101"}])
+            return 200, json.dumps(
+                [
+                    {
+                        "name": "github",
+                        "connected": True,
+                        "app_id": "42",
+                        "slug": "yard-host",
+                        "installations": [{"id": "101", "account": "Bobowski", "selection": "all"}],
+                    }
+                ]
+            )
         raise AssertionError(path)
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
@@ -1304,6 +1318,8 @@ def test_forge_setup_github_already_connected(
     main(["forge", "setup", "github", "--no-browser", "--text"])
     out = capsys.readouterr().out
     assert "already connected" in out
+    assert "Bobowski (101)" in out
+    assert "Add another account: https://github.com/apps/yard-host/installations/new" in out
     assert "--new" in out
     assert calls == [("GET", "/api/v1/forges", None)]
 
@@ -1319,7 +1335,16 @@ def test_forge_setup_github_new_ignores_a_connected_forge(
     def fake_api_try(client, method, path, body, timeout=None):
         calls.append((method, path, body))
         if path == "/api/v1/forges":
-            return 200, json.dumps([{"name": "github", "connected": True, "app_id": "42", "installation_id": "101"}])
+            return 200, json.dumps(
+                [
+                    {
+                        "name": "github",
+                        "connected": True,
+                        "app_id": "42",
+                        "installations": [{"id": "101", "account": "org", "selection": "all"}],
+                    }
+                ]
+            )
         if path == "/api/v1/forges/github" and method == "PUT":
             return 200, json.dumps({"forge": {"name": "github"}, "app": {"slug": "yard-host"}})
         raise AssertionError(path)
@@ -1506,7 +1531,9 @@ def test_forge_setup_github_manifest_keeps_a_failed_put(
         nonlocal puts
         calls.append((method, path, body))
         if path == "/api/v1/forges":
-            return 200, json.dumps([{"name": "github", "installation_id": "101", "selection": "all"}])
+            return 200, json.dumps(
+                [{"name": "github", "installations": [{"id": "101", "account": "org", "selection": "all"}]}]
+            )
         if path == "/api/v1/forges/github" and method == "PUT":
             puts += 1
             if puts == 1:

@@ -978,12 +978,20 @@ def _setup_github(session: Client, args: argparse.Namespace) -> None:
         _die("refusing to send the private key over http; log in with an https url")
     forge = {} if args.new else _forge_row(session, "github")
     if forge.get("connected"):
+        listed = ", ".join(
+            f"{entry.get('account')} ({entry.get('id')})"
+            for entry in forge.get("installations") or []
+            if isinstance(entry, dict)
+        )
         print(
             f"GitHub is already connected: app {forge.get('app_id')},"
-            f" installation {forge.get('installation_id')}. Run with --new to replace it."
+            f" installation{'s' if ',' in listed else ''} {listed}. Run with --new to replace it."
         )
+        slug = str(forge.get("slug") or "")
+        if slug:
+            print(f"Add another account: https://github.com/apps/{slug}/installations/new")
         return
-    if forge.get("app_id") and not forge.get("installation_id"):
+    if forge.get("app_id") and not forge.get("installations"):
         print(f"App {forge['app_id']} is already set up. Install it and select all repositories.")
         slug = str(forge.get("slug") or "")
         if slug:
@@ -1302,13 +1310,18 @@ def _poll_installation(session: Client, name: str) -> None:
         if error and error != seen_error:
             print(f"warning: {error}", file=sys.stderr)
             seen_error = error
-        if forge.get("installation_id"):
-            selection = str(forge.get("selection") or "")
-            if selection and selection != "all":
-                print(
-                    "warning: the installation covers selected repos only; new repos need a grant",
-                    file=sys.stderr,
-                )
+        installations = forge.get("installations")
+        if installations:
+            for entry in installations:
+                if isinstance(entry, dict):
+                    selection = str(entry.get("selection") or "")
+                    if selection and selection != "all":
+                        account = str(entry.get("account") or "")
+                        print(
+                            f"warning: the {account + ' ' if account else ''}installation covers "
+                            "selected repos only; new repos need a grant",
+                            file=sys.stderr,
+                        )
             return
         time.sleep(SETUP_POLL)
     _die("No installation showed up in ten minutes.")

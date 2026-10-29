@@ -154,24 +154,22 @@ def _named(forges: dict[str, Forge], name: str) -> Forge:
 
 
 async def _install(forge: Forge, config: Config) -> str:
-    """One find_installation for an app that has none. Returns the error text."""
-    if not forge.app_id or forge.installation_id:
+    """One find_installations for an app that has none. Returns the error text."""
+    if not forge.app_id or forge.installations:
         return ""
     try:
-        installation = await forge.find_installation()
+        installations = await forge.find_installations()
     except Exception as exc:
         return str(exc)
-    if installation is None:
+    if not installations:
         return ""
-    selection = forge.selection(installation)
-    forge.save(selection=selection)
     journal.send(
         config,
         "forge.installation",
         f"{forge.name} installation",
         forge=forge.name,
-        installation_id=forge.installation_id,
-        selection=selection,
+        accounts=",".join(str(entry.get("account") or "") for entry in installations),
+        installations=",".join(str(entry.get("id") or "") for entry in installations),
     )
     return ""
 

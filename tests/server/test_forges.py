@@ -49,6 +49,14 @@ class _Box:
         self.calls: list[tuple[str, str, str]] = []
         self.token_seconds = 3600.0
         self.fail_app = False
+        self.installations: list[dict] = [
+            {
+                "id": "ins_1",
+                "appId": "app_1",
+                "target": {"slug": "org"},
+                "repoSelectionMode": "all",
+            }
+        ]
 
 
 def _handler(box: _Box):
@@ -64,21 +72,8 @@ def _handler(box: _Box):
             if method == "GET" and self.path == "/app":
                 _send(self, 200, {"displayName": "yard", "webhookUrl": "https://yard.example.com/hooks/origin"})
                 return
-            if method == "GET" and self.path == "/app/installations":
-                _send(
-                    self,
-                    200,
-                    {
-                        "installations": [
-                            {
-                                "id": "ins_1",
-                                "appId": "app_1",
-                                "target": {"slug": "org"},
-                                "repoSelectionMode": "all",
-                            }
-                        ]
-                    },
-                )
+            if method == "GET" and self.path.startswith("/app/installations"):
+                _send(self, 200, {"installations": box.installations})
                 return
             if method == "POST" and self.path.endswith("/access_tokens"):
                 expires = datetime.now(UTC) + timedelta(seconds=box.token_seconds)
@@ -111,7 +106,7 @@ def api(tmp_path):
 
 
 def _wire(origin: Origin) -> None:
-    origin.save(app_id="app_1", installation_id="ins_1")
+    origin.save(app_id="app_1", installations=[{"id": "ins_1", "account": "org", "selection": "all"}])
 
 
 def test_public_key_is_idempotent_and_private(tmp_path):
@@ -159,16 +154,36 @@ async def test_token_caches_and_refreshes(api):
     assert len(posts) == 3
 
 
-async def test_find_installation_saves_the_id(api, tmp_path):
-    origin, _box = api
+async def test_find_installations_saves_every_account(api, tmp_path):
+    origin, box = api
+    box.installations = [
+        {"id": "ins_1", "appId": "app_1", "target": {"slug": "org"}, "repoSelectionMode": "all"},
+        {"id": "ins_2", "appId": "app_1", "target": {"slug": "other"}, "repoSelectionMode": "selected"},
+    ]
     origin.save(app_id="app_1")
-    found = await origin.find_installation()
-    assert found is not None and found["id"] == "ins_1"
-    assert origin.installation_id == "ins_1"
+    found = await origin.find_installations()
+    assert found == [
+        {"id": "ins_1", "account": "org", "selection": "all"},
+        {"id": "ins_2", "account": "other", "selection": "selected"},
+    ]
     # Origin's target.slug is the account.
-    assert origin.account == "org"
     state = json.loads((tmp_path / "origin" / "state.json").read_text())
-    assert state == {"app_id": "app_1", "account": "org", "installation_id": "ins_1"}
+    assert state == {
+        "app_id": "app_1",
+        "installations": [
+            {"id": "ins_1", "account": "org", "selection": "all"},
+            {"id": "ins_2", "account": "other", "selection": "selected"},
+        ],
+    }
+
+
+async def test_find_installations_an_empty_answer_saves_an_empty_list(api, tmp_path):
+    origin, box = api
+    box.installations = []
+    origin.save(app_id="app_1", installation_id="ins_1", account="org")
+    assert await origin.find_installations() == []
+    state = json.loads((tmp_path / "origin" / "state.json").read_text())
+    assert state == {"app_id": "app_1", "installations": []}
 
 
 async def test_repos_follows_the_page_token(api):
@@ -191,24 +206,24 @@ async def test_a_bad_status_is_a_yard_error(api):
 
 async def test_origin_connect_saves_after_the_check(api, tmp_path):
     origin, _box = api
-    origin.save(app_id="app_old", installation_id="ins_old")
+    origin.save(app_id="app_old", installations=[{"id": "ins_old", "account": "org", "selection": "all"}])
     info = await origin.connect("app_1")
     assert info["displayName"] == "yard"
     assert origin.app_id == "app_1"
-    # A new app drops the old installation.
-    assert origin.installation_id == ""
+    # A new app drops the old installations.
+    assert origin.installations == []
     state = json.loads((tmp_path / "origin" / "state.json").read_text())
-    assert "installation_id" not in state
+    assert "installations" not in state
 
 
 async def test_origin_connect_failure_saves_nothing(api):
     origin, box = api
-    origin.save(app_id="app_old", installation_id="ins_old")
+    origin.save(app_id="app_old", installations=[{"id": "ins_old", "account": "org", "selection": "all"}])
     box.fail_app = True
     with pytest.raises(YardError):
         await origin.connect("app_new")
     assert origin.app_id == "app_old"
-    assert origin.installation_id == "ins_old"
+    assert origin.installations == [{"id": "ins_old", "account": "org", "selection": "all"}]
 
 
 def test_connected_needs_all_three(tmp_path):
@@ -218,17 +233,17 @@ def test_connected_needs_all_three(tmp_path):
     assert not origin.connected()
     origin.save(app_id="app_1")
     assert not origin.connected()
-    origin.save(installation_id="ins_1")
+    origin.save(installations=[{"id": "ins_1", "account": "org", "selection": "all"}])
     assert origin.connected()
 
 
 def test_state_is_read_every_time(tmp_path):
     one = Origin(tmp_path / "origin")
     other = Origin(tmp_path / "origin")
-    other.save(app_id="app_2", installation_id="ins_2")
+    other.save(app_id="app_2", installations=[{"id": "ins_2", "account": "org", "selection": "all"}])
     # A setup run wrote state.json while this Origin was already live.
     assert one.app_id == "app_2"
-    assert one.installation_id == "ins_2"
+    assert one.installations == [{"id": "ins_2", "account": "org", "selection": "all"}]
     assert not (tmp_path / "origin" / "key.pem").exists()
 
 
@@ -243,15 +258,14 @@ def test_jwt_expires_soon(tmp_path):
 def test_summary_has_no_secret(tmp_path):
     origin = Origin(tmp_path / "origin")
     key = origin.public_key()
-    origin.save(app_id="app_1", installation_id="ins_1")
+    origin.save(app_id="app_1", installations=[{"id": "ins_1", "account": "org", "selection": "all"}])
     summary = origin.summary()
     assert summary == {
         "name": "origin",
         "host": "origin.cursor.com",
         "connected": True,
         "app_id": "app_1",
-        "installation_id": "ins_1",
-        "selection": "",
+        "installations": [{"id": "ins_1", "account": "org", "selection": "all"}],
         "last_delivery": "",
         "last_check": "",
         "public_key": key,
@@ -281,6 +295,9 @@ class _GhBox:
         self.bodies: list[tuple[str, dict]] = []
         self.token_seconds = 3600.0
         self.fail_app = False
+        self.installations: list[dict] = [
+            {"id": 101, "app_id": 42, "repository_selection": "all", "account": {"login": "org"}}
+        ]
 
 
 def _github_handler(box: _GhBox):
@@ -296,12 +313,8 @@ def _github_handler(box: _GhBox):
             if method == "GET" and self.path == "/app":
                 _send(self, 200, {"id": 42, "slug": "yard-host", "name": "yard-host", "events": ["push"]})
                 return
-            if method == "GET" and self.path == "/app/installations":
-                _send(
-                    self,
-                    200,
-                    [{"id": 101, "app_id": 42, "repository_selection": "all", "account": {"login": "org"}}],
-                )
+            if method == "GET" and self.path.startswith("/app/installations"):
+                _send(self, 200, box.installations)
                 return
             if method == "POST" and self.path.endswith("/access_tokens"):
                 expires = datetime.now(UTC) + timedelta(seconds=box.token_seconds)
@@ -337,7 +350,11 @@ SECRET = "w" * 64
 
 def _gh_wire(github: GitHub, tmp_path: Path) -> None:
     _write_key(tmp_path / "github", _rsa_pem())
-    github.save(app_id="42", installation_id="101", webhook_secret=SECRET)
+    github.save(
+        app_id="42",
+        installations=[{"id": "101", "account": "org", "selection": "all"}],
+        webhook_secret=SECRET,
+    )
 
 
 def test_github_jwt_is_rs256(tmp_path):
@@ -385,25 +402,28 @@ async def test_github_token_caches_and_sends_headers(gh_api, tmp_path):
         assert lower["accept"] == "application/vnd.github+json"
 
 
-async def test_github_installation_saves_the_id(gh_api):
-    github, _box = gh_api
+async def test_github_installations_save_every_account(gh_api):
+    github, box = gh_api
     github.save(app_id="42")
     _write_key(github.dir, _rsa_pem())
-    found = await github.find_installation()
-    assert found is not None and found["id"] == 101
-    assert github.installation_id == "101"
-    # GitHub's account.login is the account.
-    assert github.account == "org"
-    assert github.selection(found) == "all"
+    box.installations = [
+        {"id": 101, "app_id": 42, "repository_selection": "all", "account": {"login": "Bobowski"}},
+        {"id": 202, "app_id": 42, "repository_selection": "all", "account": {"login": "stariodev"}},
+    ]
+    found = await github.find_installations()
+    assert found == [
+        {"id": "101", "account": "Bobowski", "selection": "all"},
+        {"id": "202", "account": "stariodev", "selection": "all"},
+    ]
+    assert github.installations == found
 
 
 async def test_github_connect_saves_after_the_check(gh_api, tmp_path):
     github, _box = gh_api
     github.save(
         app_id="7",
-        installation_id="99",
+        installations=[{"id": "99", "account": "org", "selection": "all"}],
         webhook_secret="old-secret-old-secret-old-secret",
-        account="org",
     )
     pem = _rsa_pem()
     info = await github.connect("42", pem, SECRET)
@@ -413,21 +433,21 @@ async def test_github_connect_saves_after_the_check(gh_api, tmp_path):
     assert state["app_id"] == "42"
     assert state["slug"] == "yard-host"
     assert state["webhook_secret"] == SECRET
+    # A new app drops the old installations too.
+    assert "installations" not in state
     assert "installation_id" not in state
-    # A new app drops the old installation's account too.
-    assert "account" not in state
     assert github.summary()["slug"] == "yard-host"
 
 
 async def test_github_connect_failure_saves_nothing(gh_api, tmp_path):
     github, box = gh_api
-    github.save(app_id="7", installation_id="99")
+    github.save(app_id="7", installations=[{"id": "99", "account": "org", "selection": "all"}])
     box.fail_app = True
     with pytest.raises(YardError):
         await github.connect("42", _rsa_pem(), SECRET)
     assert not (tmp_path / "github" / "key.pem").exists()
     assert github.app_id == "7"
-    assert github.installation_id == "99"
+    assert github.installations == [{"id": "99", "account": "org", "selection": "all"}]
 
 
 @pytest.mark.parametrize(
@@ -486,10 +506,16 @@ def test_github_verify(tmp_path):
 
 def test_github_summary_has_no_secret(tmp_path):
     github = GitHub(tmp_path / "github")
-    github.save(app_id="42", installation_id="101", webhook_secret=SECRET, slug="yard-host")
+    github.save(
+        app_id="42",
+        installations=[{"id": "101", "account": "org", "selection": "all"}],
+        webhook_secret=SECRET,
+        slug="yard-host",
+    )
     summary = github.summary()
     assert summary["name"] == "github" and summary["host"] == "github.com"
     assert summary["app_id"] == "42"
+    assert summary["installations"] == [{"id": "101", "account": "org", "selection": "all"}]
     assert summary["slug"] == "yard-host"
     assert SECRET not in json.dumps(summary)
     assert "webhook_secret" not in summary
@@ -509,17 +535,45 @@ def test_reports_flags(tmp_path):
 
 
 def test_owns_without_a_saved_account_allows_everything(tmp_path):
-    """Hosts installed before accounts existed keep today's behavior."""
+    """A legacy install with no account keeps owning every repo."""
     github = GitHub(tmp_path / "github")
+    github.save(installation_id="101")
     assert github.owns("https://github.com/Bobowski/yard")
+
+
+def test_a_legacy_state_reads_as_one_installation(tmp_path):
+    github = GitHub(tmp_path / "github")
+    github.save(app_id="42", installation_id="101", account="Bobowski")
+    assert github.installations == [{"id": "101", "account": "Bobowski", "selection": ""}]
+    assert github.owns("https://github.com/Bobowski/x")
+    assert github.owns("https://github.com/bobowski/x")
+    assert not github.owns("https://github.com/stariodev/x")
 
 
 def test_owns_matches_the_url_owner_case_insensitively(tmp_path):
     github = GitHub(tmp_path / "github")
-    github.save(account="org")
+    github.save(installation_id="101", account="org")
     assert github.owns("https://github.com/org/yard")
     assert github.owns("https://github.com/ORG/yard.git")
     assert not github.owns("https://github.com/Bobowski/yard")
+    assert not github.owns("https://github.com/other/yard")
+
+
+def test_owns_picks_the_installation_for_the_owner(tmp_path):
+    github = GitHub(tmp_path / "github")
+    github.save(
+        installations=[
+            {"id": "101", "account": "Bobowski", "selection": "all"},
+            {"id": "202", "account": "stariodev", "selection": "all"},
+        ]
+    )
+    assert github.installation_for("https://github.com/stariodev/yard") == {
+        "id": "202",
+        "account": "stariodev",
+        "selection": "all",
+    }
+    assert github.owns("https://github.com/Bobowski/yard")
+    assert github.owns("https://github.com/stariodev/yard")
     assert not github.owns("https://github.com/other/yard")
 
 
@@ -543,6 +597,22 @@ async def test_github_report_posts_a_commit_status(gh_api, tmp_path):
     )
 
 
+async def test_github_report_uses_the_repos_own_installation(gh_api, tmp_path):
+    github, box = gh_api
+    _write_key(tmp_path / "github", _rsa_pem())
+    github.save(
+        app_id="42",
+        installations=[
+            {"id": "101", "account": "Bobowski", "selection": "all"},
+            {"id": "202", "account": "stariodev", "selection": "all"},
+        ],
+        webhook_secret=SECRET,
+    )
+    await github.report("https://github.com/stariodev/tool", "abc123", "success", "live")
+    posts = [path for method, path, _h in box.calls if method == "POST"]
+    assert posts == ["/app/installations/202/access_tokens", "/repos/stariodev/tool/statuses/abc123"]
+
+
 async def test_github_report_strips_git_truncates_and_skips_the_url(gh_api, tmp_path):
     github, box = gh_api
     _gh_wire(github, tmp_path)
@@ -560,3 +630,37 @@ async def test_origin_report_is_a_noop(api):
     _wire(origin)
     await origin.report("https://origin.cursor.com/org/heldso", "abc123", "success", "live")
     assert box.calls == []
+
+
+async def test_token_mints_per_installation_for_the_repo_owner(gh_api, tmp_path):
+    github, box = gh_api
+    _write_key(tmp_path / "github", _rsa_pem())
+    github.save(
+        app_id="42",
+        installations=[
+            {"id": "101", "account": "Bobowski", "selection": "all"},
+            {"id": "202", "account": "stariodev", "selection": "all"},
+        ],
+    )
+    one = await github.token("https://github.com/Bobowski/x")
+    two = await github.token("https://github.com/stariodev/yard")
+    assert one != two
+    posts = [path for method, path, _h in box.calls if method == "POST"]
+    assert posts == ["/app/installations/101/access_tokens", "/app/installations/202/access_tokens"]
+    # Each installation caches its own token; no new POSTs.
+    assert await github.token("https://github.com/Bobowski/x") == one
+    assert await github.token("https://github.com/stariodev/yard") == two
+    assert len([c for c in box.calls if c[0] == "POST"]) == 2
+    # No repo mints the first installation's token; an unknown owner gets "".
+    assert await github.token() == one
+    box.calls.clear()
+    assert await github.token("https://github.com/other/repo") == ""
+    assert box.calls == []
+
+
+async def test_token_without_an_installation_raises(gh_api, tmp_path):
+    github, _box = gh_api
+    _write_key(tmp_path / "github", _rsa_pem())
+    github.save(app_id="42")
+    with pytest.raises(YardError):
+        await github.token()
