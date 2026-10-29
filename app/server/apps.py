@@ -254,7 +254,7 @@ async def _deploy_repo(yard: Yard, app: App, job: Job, *, cause: str, actor: str
     head = ""
     pending: asyncio.Task[None] | None = None
     try:
-        token = await forge.token()
+        token = await forge.token(app.repo)
         head = await git.sync(yard.config.clone(app.name), clone_url(app.repo), app.ref, token)
         pending = yard.spawn(report(forge, app.repo, head, "pending", f"deploying {head[:12]}"))
         # Stamp the tried pair before the plan can fail, or the check loop retries every round.
@@ -743,16 +743,16 @@ def _moved(app: App, deployed: Deployed, current: tuple[str, str]) -> str:
 async def _check_forge(yard: Yard, forge: Forge) -> None:
     if not forge.connected():
         return
-    try:
-        token = await forge.token()
-    except YardError as exc:
-        log.warning("%s token: %s", forge.name, exc)
-        forge.last_check = now()
-        return
     prefix = f"https://{forge.host}/"
     for app in yard.store.list_apps():
-        if app.trigger == "push" and app.repo.lower().startswith(prefix):
-            await _check(yard, app, forge=forge, token=token, cause="check", actor="check")
+        if app.trigger != "push" or not app.repo.lower().startswith(prefix):
+            continue
+        try:
+            token = await forge.token(app.repo)
+        except YardError as exc:
+            log.warning("%s token: %s", forge.name, exc)
+            continue
+        await _check(yard, app, forge=forge, token=token, cause="check", actor="check")
     forge.last_check = now()
 
 
@@ -789,20 +789,18 @@ async def _trailing(yard: Yard, key: str) -> None:
 
 async def _refresh_installation(yard: Yard, forge: Forge) -> None:
     try:
-        installation = await forge.find_installation()
+        installations = await forge.find_installations()
     except YardError as exc:
         log.warning("%s installation: %s", forge.name, exc)
         return
-    if installation is not None:
-        selection = forge.selection(installation)
-        forge.save(selection=selection)
+    if installations:
         journal.send(
             yard.config,
             "forge.installation",
             f"{forge.name} installation",
             forge=forge.name,
-            installation_id=forge.installation_id,
-            selection=selection,
+            accounts=",".join(str(entry.get("account") or "") for entry in installations),
+            installations=",".join(str(entry.get("id") or "") for entry in installations),
         )
 
 
@@ -814,7 +812,7 @@ async def _check_repo(yard: Yard, repo: str) -> None:
     if not forge.connected():
         return
     try:
-        token = await forge.token()
+        token = await forge.token(repo)
     except YardError as exc:
         log.warning("%s token: %s", forge.name, exc)
         return

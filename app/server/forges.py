@@ -1,4 +1,4 @@
-"""Git forges: Cursor Origin and GitHub Apps. One app key, one installation, one token each.
+"""Git forges: Cursor Origin and GitHub Apps. One app key, one installation per account, one token per installation.
 
 state.json is the truth. The files are read on every access, so a setup run while
 the server is up takes effect without a restart. Responses never echo a key, a
@@ -44,8 +44,7 @@ class Forge:
         self.last_check = ""
         self.last_report = ""
         self.last_report_error = ""
-        self._token = ""
-        self._token_until = 0.0
+        self._tokens: dict[str, tuple[str, float]] = {}
 
     def _state(self) -> dict:
         try:
@@ -59,35 +58,52 @@ class Forge:
         return str(self._state().get("app_id") or "")
 
     @property
-    def installation_id(self) -> str:
-        return str(self._state().get("installation_id") or "")
+    def installations(self) -> list[dict]:
+        """Every installation of the app: [{"id", "account", "selection"}].
 
-    @property
-    def account(self) -> str:
-        """The owner the installation lives on: GitHub's account, Origin's target."""
-        return str(self._state().get("account") or "")
+        A legacy state with installation_id at the top level reads as one
+        installation; the next save writes the list and drops the old keys.
+        """
+        state = self._state()
+        found = state.get("installations")
+        if isinstance(found, list):
+            return [entry for entry in found if isinstance(entry, dict)]
+        if state.get("installation_id"):
+            return [
+                {
+                    "id": str(state.get("installation_id") or ""),
+                    "account": str(state.get("account") or ""),
+                    "selection": str(state.get("selection") or ""),
+                }
+            ]
+        return []
 
-    def save(self, drop: Iterable[str] = (), **fields: str) -> None:
+    def save(self, drop: Iterable[str] = (), **fields: str | list) -> None:
         """Merge fields into state.json. The write is atomic."""
-        state = {**self._state(), **{key: value for key, value in fields.items() if value}}
+        state = {**self._state(), **{key: value for key, value in fields.items() if value or isinstance(value, list)}}
         for key in drop:
             state.pop(key, None)
         atomic_write(self.dir / _STATE, json.dumps(state, indent=2, sort_keys=True) + "\n")
 
     def connected(self) -> bool:
-        return (self.dir / _KEY).is_file() and bool(self.app_id) and bool(self.installation_id)
+        return (self.dir / _KEY).is_file() and bool(self.app_id) and bool(self.installations)
+
+    def installation_for(self, repo: str) -> dict | None:
+        """The installation whose account owns the repo's owner, case-insensitively.
+
+        An entry with no account is a legacy install from before accounts were
+        saved; it owns every repo so nothing regresses.
+        """
+        owner = urlsplit(repo).path.strip("/").split("/", 1)[0]
+        for installation in self.installations:
+            account = str(installation.get("account") or "")
+            if not account or account.lower() == owner.lower():
+                return installation
+        return None
 
     def owns(self, repo: str) -> bool:
-        """True when the installation's account owns the repo's owner.
-
-        An empty account means the host installed before accounts were saved;
-        keep reporting as before so nothing regresses.
-        """
-        account = self.account
-        if not account:
-            return True
-        owner = urlsplit(repo).path.strip("/").split("/", 1)[0]
-        return owner.lower() == account.lower()
+        """True when an installation's account owns the repo's owner."""
+        return self.installation_for(repo) is not None
 
     def selection(self, installation: dict) -> str:
         """all or selected. Subclasses read their own field."""
@@ -100,8 +116,14 @@ class Forge:
             "host": self.host,
             "connected": self.connected(),
             "app_id": self.app_id,
-            "installation_id": self.installation_id,
-            "selection": str(self._state().get("selection") or ""),
+            "installations": [
+                {
+                    "id": str(entry.get("id") or ""),
+                    "account": str(entry.get("account") or ""),
+                    "selection": str(entry.get("selection") or ""),
+                }
+                for entry in self.installations
+            ],
             "last_delivery": self.last_delivery,
             "last_check": self.last_check,
         }
@@ -145,43 +167,51 @@ class Forge:
         body = await self._call("GET", "/app", self.app_jwt())
         return body if isinstance(body, dict) else {}
 
-    async def find_installation(self) -> dict | None:
-        """The first installation. Saving its id is a side effect."""
-        body = await self._call("GET", "/app/installations", self.app_jwt())
+    async def find_installations(self) -> list[dict]:
+        """Every installation of the app, saved to state.json. Returns the saved entries."""
+        body = await self._call("GET", "/app/installations?per_page=100", self.app_jwt())
         found = body.get("installations") if isinstance(body, dict) else body
-        if not isinstance(found, list) or not found or not isinstance(found[0], dict):
-            return None
-        installation = found[0]
-        account = _account(installation)
-        # A new installation can mean a new owner; a missing field clears the old one.
-        self.save(
-            installation_id=str(installation.get("id") or ""),
-            account=account,
-            drop=() if account else ("account",),
-        )
-        return installation
+        installations = [
+            {
+                "id": str(item.get("id") or ""),
+                "account": _account(item),
+                "selection": self.selection(item),
+            }
+            for item in (found if isinstance(found, list) else [])
+            if isinstance(item, dict)
+        ]
+        self.save(installations=installations, drop=("installation_id", "account", "selection"))
+        return installations
 
-    async def token(self) -> str:
-        """An installation access token. Cached until a minute before it expires."""
-        if self._token and self._token_until - 60 > time.time():
-            return self._token
-        installation = self.installation_id
-        if not installation:
+    async def token(self, repo: str = "") -> str:
+        """An installation access token for the repo's owner, or the first installation.
+
+        Cached per installation until a minute before it expires. A repo no
+        installation owns gets "": git asks for credentials only when the
+        server demands them, so a public repo still clones.
+        """
+        installation = self.installation_for(repo) if repo else next(iter(self.installations), None)
+        if installation is None:
+            if repo:
+                return ""
             raise YardError(
                 502,
                 self.name,
                 f"{self.name} has no installation",
                 help_text=f"Run yard forge setup {self.name}.",
             )
+        installation = str(installation.get("id") or "")
+        cached = self._tokens.get(installation)
+        if cached and cached[1] - 60 > time.time():
+            return cached[0]
         body = await self._call("POST", f"/app/installations/{installation}/access_tokens", self.app_jwt(), {})
         data = body if isinstance(body, dict) else {}
         token = str(data.get("token") or "")
         if not token:
             raise YardError(502, self.name, f"{self.name} returned no token")
-        self._token = token
         moment = _parse_stamp(str(data.get("expiresAt") or data.get("expires_at") or ""))
-        self._token_until = moment.timestamp() if moment else 0.0
-        return self._token
+        self._tokens[installation] = (token, moment.timestamp() if moment else 0.0)
+        return token
 
     async def report(self, repo: str, sha: str, state: str, description: str, target_url: str = "") -> None:
         """A commit status on the forge. Only a forge with reports = True posts one."""
@@ -252,9 +282,8 @@ class Origin(Forge):
     async def connect(self, app_id: str) -> dict:
         """Save the app id only when GET /app answers for it and the existing key."""
         info = await self.get_app_for(app_id)
-        self.save(app_id=app_id, drop=("installation_id", "account"))
-        self._token = ""
-        self._token_until = 0.0
+        self.save(app_id=app_id, drop=("installations", "installation_id", "account", "selection"))
+        self._tokens = {}
         return info
 
     async def get_app_for(self, app_id: str) -> dict:
@@ -380,10 +409,9 @@ class GitHub(Forge):
             app_id=app_id,
             slug=str(info.get("slug") or ""),
             webhook_secret=webhook_secret,
-            drop=("installation_id", "account"),
+            drop=("installations", "installation_id", "account", "selection"),
         )
-        self._token = ""
-        self._token_until = 0.0
+        self._tokens = {}
         return info
 
     def verify(self, body: bytes, header: str) -> bool:
@@ -404,7 +432,7 @@ class GitHub(Forge):
         }
         if target_url:
             body["target_url"] = target_url
-        await self._call("POST", f"/repos/{full}/statuses/{sha}", await self.token(), body)
+        await self._call("POST", f"/repos/{full}/statuses/{sha}", await self.token(repo), body)
 
 
 def _account(installation: dict) -> str:

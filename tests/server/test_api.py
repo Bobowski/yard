@@ -413,13 +413,13 @@ async def test_origin_hook_marks_the_delivery(yard, monkeypatch):
         return {"displayName": "yard"}
 
     async def fake_find(self):
-        return {"repoSelectionMode": "all"}
+        return [{"id": "ins_1", "account": "org", "selection": "all"}]
 
-    async def fake_token(self):
+    async def fake_token(self, repo: str = ""):
         return "tok"
 
     monkeypatch.setattr(Origin, "get_app", fake_get_app)
-    monkeypatch.setattr(Origin, "find_installation", fake_find)
+    monkeypatch.setattr(Origin, "find_installations", fake_find)
     monkeypatch.setattr(Origin, "token", fake_token)
 
     checks = {check["name"]: check for check in (await client.get("/api/v1/doctor", headers=auth(token))).json()}
@@ -573,13 +573,13 @@ async def test_github_hook_needs_a_secret(yard, monkeypatch):
         return {"name": "yard"}
 
     async def fake_find(self):
-        return {"repository_selection": "all"}
+        return [{"id": "101", "account": "org", "selection": "all"}]
 
-    async def fake_token(self):
+    async def fake_token(self, repo: str = ""):
         return "tok"
 
     monkeypatch.setattr(GitHub, "get_app", fake_get_app)
-    monkeypatch.setattr(GitHub, "find_installation", fake_find)
+    monkeypatch.setattr(GitHub, "find_installations", fake_find)
     monkeypatch.setattr(GitHub, "token", fake_token)
 
     async def row() -> dict:
@@ -617,7 +617,7 @@ async def test_forge_routes_redact_secrets(yard, monkeypatch):
     rows = {row["name"]: row for row in res.json()}
     assert list(rows) == ["origin", "github"]
     assert all(not row["connected"] for row in rows.values())
-    assert all("selection" in row for row in rows.values())
+    assert all("installations" in row for row in rows.values())
     # The public key is a summary field; first read creates the keypair.
     key = rows["origin"]["public_key"]
     assert key.startswith("-----BEGIN PUBLIC KEY-----")
@@ -675,24 +675,23 @@ async def test_forges_find_the_installation_on_read(yard, monkeypatch):
     github.save(app_id="42")
 
     async def missing(self):
-        return None
+        return []
 
-    monkeypatch.setattr(GitHub, "find_installation", missing)
+    monkeypatch.setattr(GitHub, "find_installations", missing)
     rows = (await client.get("/api/v1/forges", headers=auth(token))).json()
     found = next(row for row in rows if row["name"] == "github")
-    assert found["installation_id"] == ""
+    assert found["installations"] == []
 
     async def found_one(self):
-        self.save(installation_id="101")
-        return {"id": 101, "repository_selection": "all"}
+        self.save(installations=[{"id": "101", "account": "org", "selection": "all"}])
+        return [{"id": "101", "account": "org", "selection": "all"}]
 
-    monkeypatch.setattr(GitHub, "find_installation", found_one)
+    monkeypatch.setattr(GitHub, "find_installations", found_one)
     rows = (await client.get("/api/v1/forges", headers=auth(token))).json()
     found = next(row for row in rows if row["name"] == "github")
-    assert found["installation_id"] == "101"
-    assert found["selection"] == "all"
+    assert found["installations"] == [{"id": "101", "account": "org", "selection": "all"}]
     state = json.loads((root / "apps" / "yard" / "data" / "github" / "state.json").read_text())
-    assert state["selection"] == "all"
+    assert state["installations"] == [{"id": "101", "account": "org", "selection": "all"}]
 
 
 async def test_forges_swallow_installation_errors(yard, monkeypatch):
@@ -703,11 +702,52 @@ async def test_forges_swallow_installation_errors(yard, monkeypatch):
     async def broken(self):
         raise YardError(502, "github", "github GET /app/installations: refused")
 
-    monkeypatch.setattr(GitHub, "find_installation", broken)
+    monkeypatch.setattr(GitHub, "find_installations", broken)
     res = await client.get("/api/v1/forges", headers=auth(token))
     assert res.status_code == 200
     found = next(row for row in res.json() if row["name"] == "github")
     assert found["error"] == "github GET /app/installations: refused"
+
+
+async def test_installation_hook_keeps_every_account(yard, monkeypatch):
+    """A second installation on another account must not evict the first."""
+    client, token, root = yard
+    secret = "w" * 64
+    github = next(forge for forge in _yard_forges(root) if forge.name == "github")
+    github.save(
+        app_id="42",
+        webhook_secret=secret,
+        installations=[{"id": "101", "account": "Bobowski", "selection": "all"}],
+    )
+
+    async def fake_call(self, method, path, bearer, body=None):
+        assert path.startswith("/app/installations")
+        return [
+            {"id": 202, "account": {"login": "stariodev"}, "repository_selection": "all"},
+            {"id": 101, "account": {"login": "Bobowski"}, "repository_selection": "all"},
+        ]
+
+    monkeypatch.setattr(GitHub, "app_jwt", lambda self: "jwt")
+    monkeypatch.setattr(GitHub, "_call", fake_call)
+
+    body = json.dumps({"action": "created"})
+    digest = hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+    res = await client.post(
+        "/hooks/github",
+        content=body,
+        headers={"x-github-event": "installation", "x-hub-signature-256": f"sha256={digest}"},
+    )
+    assert res.status_code == 204
+    await client.drain_tasks()
+    state = json.loads((root / "apps" / "yard" / "data" / "github" / "state.json").read_text())
+    assert state["installations"] == [
+        {"account": "stariodev", "id": "202", "selection": "all"},
+        {"account": "Bobowski", "id": "101", "selection": "all"},
+    ]
+    assert "installation_id" not in state
+    # The Bobowski app still counts as owned.
+    assert github.owns("https://github.com/Bobowski/yard")
+    assert github.owns("https://github.com/stariodev/yard")
 
 
 def _yard_forges(root):

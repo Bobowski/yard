@@ -139,17 +139,17 @@ def test_doctor_forge_rows_when_connected(tmp_path: Path, monkeypatch: pytest.Mo
         return {"displayName": "yard"}
 
     async def fake_find(self):
-        return {"repoSelectionMode": "all", "target": {"slug": "org"}}
+        return [{"id": "ins_1", "account": "org", "selection": "all"}]
 
-    async def fake_token(self):
+    async def fake_token(self, repo: str = ""):
         return "tok"
 
     monkeypatch.setattr(Origin, "get_app", fake_app)
-    monkeypatch.setattr(Origin, "find_installation", fake_find)
+    monkeypatch.setattr(Origin, "find_installations", fake_find)
     monkeypatch.setattr(Origin, "token", fake_token)
     found = _run(yard)
     assert found["origin app"]["detail"] == "yard"
-    assert found["origin installation"]["detail"] == "org"
+    assert found["origin installation org"]["detail"] == "all repos"
     assert found["origin token"]["ok"]
     assert found["origin webhook"]["detail"] == "none since boot"
     assert found["origin check"]["ok"]
@@ -167,13 +167,13 @@ def test_doctor_github_status_row(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         return {"name": "yard"}
 
     async def fake_find(self):
-        return {"repository_selection": "all", "account": {"login": "org"}}
+        return [{"id": "101", "account": "org", "selection": "all"}]
 
-    async def fake_token(self):
+    async def fake_token(self, repo: str = ""):
         return "tok"
 
     monkeypatch.setattr(GitHub, "get_app", fake_app)
-    monkeypatch.setattr(GitHub, "find_installation", fake_find)
+    monkeypatch.setattr(GitHub, "find_installations", fake_find)
     monkeypatch.setattr(GitHub, "token", fake_token)
     github = yard.forge_named("github")
 
@@ -538,18 +538,43 @@ def test_doctor_a_selected_installation_warns(tmp_path: Path, monkeypatch: pytes
         return {"name": "yard"}
 
     async def fake_find(self):
-        return {"repository_selection": "selected", "account": {"login": "org"}}
+        return [{"id": "101", "account": "org", "selection": "selected"}]
 
-    async def fake_token(self):
+    async def fake_token(self, repo: str = ""):
         return "tok"
 
     monkeypatch.setattr(GitHub, "get_app", fake_app)
-    monkeypatch.setattr(GitHub, "find_installation", fake_find)
+    monkeypatch.setattr(GitHub, "find_installations", fake_find)
     monkeypatch.setattr(GitHub, "token", fake_token)
     found = _run(yard)
-    row = found["github installation"]
+    row = found["github installation org"]
     assert row["ok"] and row["warn"]
     assert row["detail"] == "selected repos only; grant each new repo on the installation page"
+
+
+def test_doctor_one_installation_row_per_account(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    yard = _yard(tmp_path, ps=CADDY_PS)
+    monkeypatch.setattr(GitHub, "connected", lambda self: True)
+
+    async def fake_app(self):
+        return {"name": "yard"}
+
+    async def fake_find(self):
+        return [
+            {"id": "101", "account": "Bobowski", "selection": "all"},
+            {"id": "202", "account": "stariodev", "selection": "selected"},
+        ]
+
+    async def fake_token(self, repo: str = ""):
+        return "tok"
+
+    monkeypatch.setattr(GitHub, "get_app", fake_app)
+    monkeypatch.setattr(GitHub, "find_installations", fake_find)
+    monkeypatch.setattr(GitHub, "token", fake_token)
+    found = _run(yard)
+    assert found["github installation Bobowski"]["detail"] == "all repos"
+    selected = found["github installation stariodev"]
+    assert selected["ok"] and selected["warn"]
 
 
 def test_doctor_flags_a_missing_journal(tmp_path: Path):

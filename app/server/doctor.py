@@ -91,7 +91,7 @@ async def _forge_rows(yard: Yard) -> list[Check]:
             continue
         rows += [
             _check(f"{forge.name} app", await _forge_app(forge)),
-            _check(f"{forge.name} installation", await _forge_installation(forge)),
+            *await _forge_installation_rows(forge),
             _check(f"{forge.name} token", await _forge_token(forge)),
             _check(f"{forge.name} webhook", (True, _ago(forge.last_delivery))),
             _check(f"{forge.name} check", (True, _ago(forge.last_check))),
@@ -119,24 +119,24 @@ async def _forge_app(forge: Forge) -> tuple[bool, str]:
     return True, str(name) if name else "ok"
 
 
-async def _forge_installation(forge: Forge) -> tuple[bool, str] | tuple[bool, str, bool]:
+async def _forge_installation_rows(forge: Forge) -> list[Check]:
+    """One row per installation of the app, named by account."""
     try:
-        installation = await forge.find_installation()
+        installations = await forge.find_installations()
     except YardError as exc:
-        return False, f"{exc}; check the installation on {forge.host}"
-    if installation is None:
-        return False, "no installation; reinstall it from the forge app page"
-    if forge.selection(installation) != "all":
-        # A selected-repos install is legitimate; the user grants each new repo.
-        return True, "selected repos only; grant each new repo on the installation page", True
-    target = installation.get("target")
-    account = installation.get("account")
-    slug = ""
-    if isinstance(target, dict):
-        slug = str(target.get("slug") or "")
-    if not slug and isinstance(account, dict):
-        slug = str(account.get("login") or "")
-    return True, slug if slug else "all repos"
+        return [_check(f"{forge.name} installation", (False, f"{exc}; check the installation on {forge.host}"))]
+    if not installations:
+        return [_check(f"{forge.name} installation", (False, "no installation; reinstall it from the forge app page"))]
+    rows = []
+    for installation in installations:
+        account = str(installation.get("account") or "")
+        name = f"{forge.name} installation {account}" if account else f"{forge.name} installation"
+        if str(installation.get("selection") or "") != "all":
+            # A selected-repos install is legitimate; the user grants each new repo.
+            rows.append(_check(name, (True, "selected repos only; grant each new repo on the installation page", True)))
+        else:
+            rows.append(_check(name, (True, "all repos")))
+    return rows
 
 
 async def _forge_token(forge: Forge) -> tuple[bool, str]:

@@ -58,10 +58,11 @@ class _Apply:
 
 
 def _connect(monkeypatch: pytest.MonkeyPatch, token: str = "oit_x") -> None:
-    """Every forge connected, with a canned token."""
+    """Every forge connected and owning every repo, with a canned token."""
     monkeypatch.setattr(Forge, "connected", lambda self: True)
+    monkeypatch.setattr(Forge, "owns", lambda self, repo: True)
 
-    async def fake_token(self):
+    async def fake_token(self, repo: str = ""):
         return token
 
     monkeypatch.setattr(Forge, "token", fake_token)
@@ -593,7 +594,7 @@ async def test_a_report_failure_never_fails_the_deploy(tmp_path: Path, monkeypat
 async def test_report_skips_a_repo_the_installation_does_not_own(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yard = make_yard(tmp_path)
     forge = yard.forge("https://github.com/Bobowski/yard")
-    forge.save(account="org")
+    forge.save(installation_id="101", account="org")
     calls = _reports(monkeypatch)
     await apps.report(forge, "https://github.com/Bobowski/yard", "abc123", "success", "live")
     assert calls == []
@@ -602,7 +603,7 @@ async def test_report_skips_a_repo_the_installation_does_not_own(tmp_path: Path,
 async def test_report_still_posts_for_an_owned_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yard = make_yard(tmp_path)
     forge = yard.forge("https://github.com/org/app")
-    forge.save(account="org")
+    forge.save(installation_id="101", account="org")
     calls = _reports(monkeypatch)
     await apps.report(forge, "https://github.com/org/app", "abc123", "success", "live")
     assert calls == [("https://github.com/org/app", "abc123", "success", "live", "")]
@@ -757,6 +758,46 @@ async def test_ensure_host_marks_the_boot_revision(tmp_path: Path, monkeypatch: 
     assert deployed.template == ""  # a compose answer never carries a template
 
 
+async def test_check_forge_mints_a_token_per_installation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Two accounts on one forge each get their owner's token to ls-remote."""
+    yard = make_yard(tmp_path)
+    yard.store.create_app("heldso", "https://github.com/Bobowski/app", "main", "push")
+    yard.store.create_app("other", "https://github.com/stariodev/tool", "main", "push")
+    github = yard.forge_named("github")
+    github.save(
+        app_id="42",
+        installations=[
+            {"id": "101", "account": "Bobowski", "selection": "all"},
+            {"id": "202", "account": "stariodev", "selection": "all"},
+        ],
+    )
+    minted: list[str] = []
+
+    async def fake_token(self, repo: str = ""):
+        minted.append(repo)
+        return f"tok:{repo}"
+
+    seen: list[tuple[str, str]] = []
+
+    async def fake_tip(_clone, url, ref, token=""):
+        seen.append((url, token))
+        return "same123"
+
+    async def fake_deploy(host, name, **_):
+        return apps.Outcome("ok")
+
+    monkeypatch.setattr(GitHub, "token", fake_token)
+    monkeypatch.setattr(git, "remote_tip", fake_tip)
+    monkeypatch.setattr(apps, "deploy", fake_deploy)
+    monkeypatch.setattr(Forge, "connected", lambda self: True)
+    await apps.check_all(yard)
+    assert minted == ["https://github.com/Bobowski/app", "https://github.com/stariodev/tool"]
+    assert seen == [
+        ("https://github.com/Bobowski/app.git", "tok:https://github.com/Bobowski/app"),
+        ("https://github.com/stariodev/tool.git", "tok:https://github.com/stariodev/tool"),
+    ]
+
+
 async def test_check_all_deploys_a_moved_tip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yard = make_yard(tmp_path)
     yard.store.create_app("heldso", "https://origin.cursor.com/org/app", "main", "push")
@@ -862,9 +903,9 @@ async def test_check_installation_debounces(tmp_path: Path, monkeypatch: pytest.
 
     async def fake_find(self):
         calls.append("install")
-        return None
+        return []
 
-    monkeypatch.setattr(Origin, "find_installation", fake_find)
+    monkeypatch.setattr(Origin, "find_installations", fake_find)
     for _ in range(3):
         await apps.check_installation(yard, yard.forge_named("origin"))
     assert calls == ["install"]
