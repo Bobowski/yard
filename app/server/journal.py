@@ -91,7 +91,7 @@ async def read(
 ) -> str:
     """Formatted lines, oldest first. journalctl -n already picks the tail."""
     out = await _run(config, _argv(config, matches, lines, since, until, after))
-    return "".join(line for entry in entries(out) if (line := format_line(entry)))
+    return "\n".join(line for entry in entries(out) if (line := format_line(entry)))
 
 
 async def read_entries(

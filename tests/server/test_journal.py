@@ -122,6 +122,16 @@ async def test_read_builds_the_argv(tmp_path: Path):
     assert "2025-10-05T21:00:00Z heldso-app-1 hi�" in text
 
 
+async def test_read_puts_each_entry_on_its_own_line(tmp_path: Path):
+    two = ENTRY + "\n" + ENTRY.replace("hello", "again") + "\n"
+    script, _argv_log = _journalctl(tmp_path, out=two)
+    text = await journal.read(_config(tmp_path, script), ["CONTAINER_NAME=heldso-app-1"], lines=50)
+    assert text.splitlines() == [
+        "2025-10-05T21:00:00Z heldso-app-1 hello",
+        "2025-10-05T21:00:00Z heldso-app-1 again",
+    ]
+
+
 async def test_read_after_a_cursor_starts_at_the_oldest(tmp_path: Path):
     script, argv_log = _journalctl(tmp_path, out=ENTRY + "\n")
     config = _config(tmp_path, script)
@@ -447,6 +457,16 @@ async def test_logs_text_takes_after_too(yard_cursor):
     res = await client.get("/api/v1/logs?container=heldso-app-1&json=1&after=cursor-1", headers=auth(token))
     assert res.status_code == 200
     assert "line 2" in res.text and '"entries"' not in res.text
+
+
+async def test_logs_text_is_one_line_per_entry(yard_cursor):
+    client, token, _argv_log = yard_cursor
+    res = await client.get("/api/v1/logs?container=heldso-app-1&lines=2", headers=auth(token))
+    assert res.status_code == 200
+    assert res.text.splitlines() == [
+        "2025-10-05T21:00:03Z heldso-app-1 line 3",
+        "2025-10-05T21:00:04Z heldso-app-1 line 4",
+    ]
 
 
 async def test_logs_needs_a_token(yard_journal):
