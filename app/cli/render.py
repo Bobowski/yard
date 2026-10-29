@@ -70,14 +70,8 @@ def _state_text(row: dict, now: datetime) -> str:
         return f"{word} {age}".rstrip()
     if state == "running":
         age = _ago(str(row.get("started") or ""), now)
-        # A process that already answers is up. Podman can leave "starting" set with no check.
-        if health == "unhealthy" or (health == "starting" and row.get("answers") is not True):
-            word = health
-        else:
-            word = "up"
+        word = health if health in {"unhealthy", "starting"} else "up"
         text = f"{word} {age}".rstrip()
-        if row.get("answers") is False:
-            text += " · no answer"
         restarts = int(row.get("restarts") or 0)
         if restarts:
             text += f" · {restarts} restart" + ("s" if restarts != 1 else "")
@@ -170,7 +164,7 @@ def status_hint(report: dict) -> str:
             return f"yard app logs --deploy --app {app}"
         # The state word without its age drives the hint.
         word = _state_text(row, datetime.now(UTC)).split(" ", 1)[0]
-        if not hint and (word in {"failed", "down", "unhealthy", "exit", "OOM"} or row.get("answers") is False):
+        if not hint and word in {"failed", "down", "unhealthy", "exit", "OOM"}:
             container = str(row.get("container") or "") or f"{app}-app-1"
             hint = f"yard logs {container}"
     return hint
@@ -473,8 +467,6 @@ def _paint(index: int, text: str, *, state: int = -1, deploy: int = -1) -> str:
 
 
 def _attention(state: str) -> str:
-    if "no answer" in state:
-        return "31"
     head = state.split(" ", 1)[0]
     if head in {"failed", "down", "absent"}:
         return "31"

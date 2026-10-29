@@ -58,27 +58,26 @@ def test_format_status_deploy_failed_hint():
     assert status_hint(report) == "yard logs shop-app"
 
 
-def test_state_text_marks_no_answer_and_restarts():
-    row = {"state": "running", "health": "", "started": stamp(hours=2), "answers": False, "restarts": 3}
-    assert _state_text(row, NOW) == "up 2h · no answer · 3 restarts"
+def test_state_text_marks_health_and_restarts():
+    row = {"state": "running", "health": "", "started": stamp(hours=2), "restarts": 3}
+    assert _state_text(row, NOW) == "up 2h · 3 restarts"
     row["restarts"] = 1
-    assert _state_text(row, NOW) == "up 2h · no answer · 1 restart"
-    row["answers"] = True
     assert _state_text(row, NOW) == "up 2h · 1 restart"
     row["health"] = "starting"
     row["restarts"] = 0
-    assert _state_text(row, NOW) == "up 2h"
-    row["answers"] = None
     assert _state_text(row, NOW) == "starting 2h"
+    row["health"] = "unhealthy"
+    assert _state_text(row, NOW) == "unhealthy 2h"
+    row["health"] = "healthy"
+    assert _state_text(row, NOW) == "up 2h"
 
 
-def test_status_hint_points_a_dead_probe_at_logs():
+def test_status_hint_points_an_unhealthy_container_at_logs():
     report = status_report()
     for row in report["rows"]:
         row["deploy"] = None
         row["state"] = "running"
-        row["health"] = ""
-        row["answers"] = False
+        row["health"] = "unhealthy"
     assert status_hint(report) == "yard logs heldso-app"
 
 

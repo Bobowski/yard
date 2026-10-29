@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `yard status` no longer sends `GET /` to each app; the state comes from Podman and its healthcheck. The `answers` field is gone from the status API. An app without a healthcheck that does not listen now shows `up` — add a `HEALTHCHECK` ([stario.dev/yard/compose#healthchecks](https://stario.dev/yard/compose#healthchecks)).
+
 ## 0.9.1
 
 - `yard app new --runs https://…/uptime-kuma.compose.yml` names the app `uptime-kuma`. Before, the name kept `.compose` and the command stopped with "name must be a short lowercase word", so the documented example failed without `--app`.

@@ -157,42 +157,12 @@ def test_report_running_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     assert names == ["heldso-app-1"]
 
 
-def test_report_probes_running_app_containers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    ps = [
-        _app_container("heldso", "heldso-app-1", Restarts=2),
-        _app_container("nightly", "nightly-app"),
-        _app_container("gone", "gone-app", State="exited"),
-    ]
-    yard = _yard(tmp_path, ps, sock=True)
-    yard.store.create_app("heldso", "https://origin.cursor.com/org/app", "main")
-    yard.store.create_app("nightly", "https://origin.cursor.com/org/app", "main", "manual")
-    yard.store.create_app("gone", "https://origin.cursor.com/org/app", "main")
-    answered = {"heldso-app-1": True}
-
-    async def fake_probe(host: str, port: int, timeout: float = 1.0) -> bool:
-        return answered.get(host, False)
-
-    monkeypatch.setattr(status, "probe", fake_probe)
-    yard.tips.clear()
-    report = asdict(asyncio.run(status.report(yard)))
-    rows = {row["container"]: row for row in report["rows"]}
-    assert rows["heldso-app-1"]["answers"] is True
-    assert rows["heldso-app-1"]["restarts"] == 2
-    # A running app is probed even when the trigger is manual. A stopped container is not.
-    assert rows["nightly-app"]["answers"] is False
-    assert rows["gone-app"]["answers"] is None
-
-
 def test_app_report_is_the_app_page(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     log = "2026-10-05T12:00:00Z one\n2026-10-05T12:00:01Z two\n"
     yard = _yard(tmp_path, [_app_container("heldso", "heldso-app-1")], sock=True, logs=log)
     yard.store.create_app("heldso", "https://origin.cursor.com/org/app", "main")
     _bind(yard, "heldso.example.com", "heldso:8000")
 
-    async def fake_probe(host: str, port: int, timeout: float = 1.0) -> bool:
-        return True
-
-    monkeypatch.setattr(status, "probe", fake_probe)
     from app.server.yard import Tip
 
     yard.tips["heldso"] = Tip(revision="tip9")
@@ -203,7 +173,6 @@ def test_app_report_is_the_app_page(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert found["env_file"].endswith("apps/heldso/env")
     assert found["binds"] == [{"host": "heldso.example.com", "dial": "heldso:8000"}]
     assert [row["container"] for row in found["rows"]] == ["heldso-app-1"]
-    assert found["rows"][0]["answers"] is True
     assert found["deploys"] == []
     assert "two" in found["log"]
 
@@ -274,86 +243,3 @@ def read_dep(config, name):
     from app.server.store import read_deployed
 
     return read_deployed(config, name)
-
-
-async def test_probe_uses_the_bind_port(tmp_path, monkeypatch):
-    """A bound row is probed on its dial port; an unbound repo-less row is not probed."""
-    probed = []
-
-    async def fake_probe(host, port, timeout=1.0):
-        probed.append((host, port))
-        return True
-
-    monkeypatch.setattr(status, "probe", fake_probe)
-    bound = status.Row(
-        app="u",
-        container="u-app-1",
-        service="app",
-        state="running",
-        running=True,
-        health="",
-        exit_code=0,
-        id="",
-        oom=False,
-        error="",
-        started="",
-        exited="",
-        image="x",
-        sha="",
-        tip="",
-        binds=[{"host": "u.example.com", "dial": "u-app-1:3001"}],
-        trigger="",
-        cpu="",
-        mem="",
-        data=0,
-        deploy=None,
-    )
-    loose = status.Row(
-        app="v",
-        container="v-app-1",
-        service="app",
-        state="running",
-        running=True,
-        health="",
-        exit_code=0,
-        id="",
-        oom=False,
-        error="",
-        started="",
-        exited="",
-        image="x",
-        sha="",
-        tip="",
-        binds=[],
-        trigger="",
-        cpu="",
-        mem="",
-        data=0,
-        deploy=None,
-    )
-    code = status.Row(
-        app="c",
-        container="c-app-1",
-        service="app",
-        state="running",
-        running=True,
-        health="",
-        exit_code=0,
-        id="",
-        oom=False,
-        error="",
-        started="",
-        exited="",
-        image="x",
-        sha="",
-        tip="",
-        binds=[],
-        trigger="",
-        cpu="",
-        mem="",
-        data=0,
-        deploy=None,
-    )
-    await status._probe_rows([bound, loose, code], {"u", "v"})
-    assert probed == [("u-app-1", 3001), ("c-app-1", 8000)]
-    assert bound.answers is True and loose.answers is None and code.answers is True

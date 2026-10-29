@@ -1,6 +1,5 @@
 """What the host shows: the app table, one app's page, and container logs."""
 
-import asyncio
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,7 +10,7 @@ from app.server.compose import app_container
 from app.server.podman import Container, Sample
 from app.server.store import App, Config, Deployed, read_deployed
 from app.server.yard import Tip
-from app.shared import APP_PORT, YardError, image_sha, stamp
+from app.shared import YardError, image_sha, stamp
 
 if TYPE_CHECKING:
     from app.server.yard import Yard
@@ -25,7 +24,6 @@ class Row:
     state: str = ""
     running: bool = False
     health: str = ""
-    answers: bool | None = None
     restarts: int = 0
     exit_code: int = 0
     started: str = ""
@@ -119,8 +117,6 @@ async def report(yard: Yard, running_only: bool = False) -> Report:
         if running_only and not item.running:
             continue
         rows.append(_row(config, item, None, samples.get(item.name), None, None, None, [], crashes))
-    if config.boot:
-        await _probe_rows(rows, {app.name for app in apps if not app.repo})
     shown = [samples.get(row.container) for row in rows]
     return Report(
         host=Host(
@@ -247,8 +243,6 @@ async def app_report(yard: Yard, name: str) -> Page:
     note = deploy_record(listed, name)
     crashes = await _crashes(yard, listed)
     rows = _app_rows(config, app, items, samples, tip, deployed, note, bound, crashes, False)
-    if config.boot:
-        await _probe_rows(rows, {app.name} if not app.repo else set())
     page_log = await _container_tail(yard, f"{name}-app-1")
     image = items[0].image if items else ""
     return Page(
@@ -262,40 +256,6 @@ async def app_report(yard: Yard, name: str) -> Page:
         log=page_log,
         template_moved=any(row.template_moved for row in rows),
     )
-
-
-def _dial_port(row: Row) -> int:
-    """The port to probe: the row's bind dial when it has one, else the app contract's 8000."""
-    if row.binds:
-        dial = str(row.binds[0].get("dial") or "")
-        if ":" in dial and dial.rsplit(":", 1)[1].isdigit():
-            return int(dial.rsplit(":", 1)[1])
-    return APP_PORT
-
-
-async def _probe_rows(rows: list[Row], source_apps: set[str]) -> None:
-    """An HTTP probe per running app row. A repo-less app without a bind has no known port."""
-    targets = [
-        row
-        for row in rows
-        if row.container and row.running and row.service == "app" and (row.app not in source_apps or row.binds)
-    ]
-    found = await asyncio.gather(*(probe(row.container, _dial_port(row)) for row in targets))
-    for row, up in zip(targets, found, strict=True):
-        row.answers = up
-
-
-async def probe(host: str, port: int, timeout: float = 1.0) -> bool:
-    """Any HTTP status line means the app answers; the same rule apply.sh uses."""
-    try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
-        writer.write(f"GET / HTTP/1.0\r\nHost: {host}\r\n\r\n".encode())
-        await writer.drain()
-        line = await asyncio.wait_for(reader.readline(), timeout)
-        writer.close()
-        return line.startswith(b"HTTP/")
-    except OSError, TimeoutError:
-        return False
 
 
 def _age(item: Container) -> tuple[float, str]:
