@@ -1611,6 +1611,14 @@ def test_logs_by_name_or_id(monkeypatch: pytest.MonkeyPatch, capsys: pytest.Capt
     ]
 
 
+def test_logs_sends_hide_and_only(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    calls = []
+    monkeypatch.setattr(cli, "_api_try", lambda *a, **k: calls.append(a[2]) or (200, "x\n"))
+    _env(monkeypatch)
+    main(["logs", "heldso-app-1", "--hide", "a=b", "--hide", "noise", "--only", "status=error", "--text"])
+    assert calls == ["/api/v1/logs?lines=100&container=heldso-app-1&hide=a%3Db&hide=noise&only=status%3Derror"]
+
+
 def test_events_build_the_query(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
     calls = []
 

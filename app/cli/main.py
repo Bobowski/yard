@@ -581,14 +581,16 @@ def _cmd_app_logs(args: argparse.Namespace) -> None:
 
 
 def _logs(session: Client, container: str, args: argparse.Namespace) -> None:
-    query = {"lines": str(args.tail), "container": container}
+    pairs = [("lines", str(args.tail)), ("container", container)]
     if args.since:
-        query["since"] = args.since
+        pairs.append(("since", args.since))
     if args.until:
-        query["until"] = args.until
+        pairs.append(("until", args.until))
     if args.follow:
-        query["follow"] = "1"
-    path = "/api/v1/logs?" + urlencode(query)
+        pairs.append(("follow", "1"))
+    pairs += [("hide", expr) for expr in args.hide]
+    pairs += [("only", expr) for expr in args.only]
+    path = "/api/v1/logs?" + urlencode(pairs)
     if args.follow:
         _stream_get(session, path)
         return
@@ -1428,9 +1430,23 @@ def _add_app_flag(parser: argparse.ArgumentParser, help_text: str = "the app nam
 
 def _log_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-f", "--follow", action="store_true", help="stream the log")
-    parser.add_argument("--tail", type=int, default=100, help="how many lines")
+    parser.add_argument("--tail", type=int, default=100, help="lines read before filters")
     parser.add_argument("--since", default="", help="-15m, -1h, -2d, or 2025-01-31 14:00")
     parser.add_argument("--until", default="", help="same forms as --since")
+    parser.add_argument(
+        "--hide",
+        action="append",
+        default=[],
+        metavar="EXPR",
+        help="hide lines or traces that match: key=value, key!=value, key>n, key<n, or text",
+    )
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="EXPR",
+        help="keep only lines or traces that match; same forms as --hide",
+    )
 
 
 def _app_parser(subs: argparse._SubParsersAction, common: argparse.ArgumentParser) -> None:

@@ -522,3 +522,248 @@ async def test_events_follow_streams_ndjson(yard_journal):
     row = json.loads(res.text.splitlines()[0])
     assert row["event"] == "deploy.end"
     assert "SYSLOG_IDENTIFIER=yard" in argv_log.read_text().splitlines()
+
+
+# --- hide/only filters --------------------------------------------------------
+
+
+def _filter_entries() -> list[dict]:
+    micros = int(WHEN.timestamp() * 1_000_000)
+
+    def entry(n: int, message: str) -> dict:
+        return {
+            "__CURSOR": f"cursor-{n}",
+            "__REALTIME_TIMESTAMP": str(micros + n * 1_000_000),
+            "CONTAINER_NAME": "heldso-app-1",
+            "MESSAGE": message,
+        }
+
+    health_child = {
+        "name": "render",
+        "trace_id": "t-health",
+        "span_id": "s2",
+        "parent_id": "s1",
+        "status": "ok",
+        "duration_ns": 100,
+    }
+    health_root = {
+        "name": "GET /health",
+        "trace_id": "t-health",
+        "span_id": "s1",
+        "status": "ok",
+        "duration_ns": 5000,
+        "attributes": {"request.path": "/health"},
+    }
+    notes_child = {
+        "name": "db.query",
+        "trace_id": "t-notes",
+        "span_id": "s4",
+        "parent_id": "s3",
+        "status": "error",
+        "duration_ns": 700,
+    }
+    notes_root = {
+        "name": "GET /notes",
+        "trace_id": "t-notes",
+        "span_id": "s3",
+        "status": "ok",
+        "duration_ns": 9000,
+        "attributes": {"request.path": "/notes"},
+    }
+    return [
+        entry(0, json.dumps(health_child)),
+        entry(1, json.dumps(health_root)),
+        entry(2, json.dumps(notes_child)),
+        entry(3, "boom traceback"),
+        entry(4, json.dumps(notes_root)),
+        entry(5, json.dumps({"name": "tick", "status": "ok", "duration_ns": 50})),
+    ]
+
+
+@pytest.fixture
+async def yard_filtered(tmp_path, monkeypatch):
+    """The API over a journal of two traces, a text line, and a lone JSON line."""
+    script, argv_log = _cursor_journalctl(tmp_path, _filter_entries())
+    monkeypatch.setenv("YARD_ROOT", str(tmp_path))
+    monkeypatch.setenv("YARD_SKIP_DEPLOY", "1")
+    monkeypatch.setenv("YARD_BOOT", "0")
+    monkeypatch.setenv("YARD_PODMAN_BIN", "yard-podman-missing")
+    monkeypatch.setenv("YARD_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.setenv("YARD_JOURNALCTL_BIN", str(script))
+    async with TestClient(bootstrap, request_timeout=5) as client:
+        token = (tmp_path / "tokens" / "admin.token").read_text().strip()
+        yield client, token, argv_log
+
+
+async def _page(client, token, query: str) -> dict:
+    res = await client.get(
+        f"/api/v1/logs?container=heldso-app-1&{query}",
+        headers={**auth(token), "accept": "application/json"},
+    )
+    assert res.status_code == 200
+    return res.json()
+
+
+def _messages(page: dict) -> list[str]:
+    return [entry["message"] for entry in page["entries"]]
+
+
+async def test_logs_no_filters_returns_every_line(yard_filtered):
+    client, token, _argv = yard_filtered
+    page = await _page(client, token, "lines=50")
+    assert [json.loads(m)["name"] if m.startswith("{") else m for m in _messages(page)] == [
+        "render",
+        "GET /health",
+        "db.query",
+        "boom traceback",
+        "GET /notes",
+        "tick",
+    ]
+    assert page["cursor"] == "cursor-5"
+    res = await client.get("/api/v1/logs?container=heldso-app-1", headers=auth(token))
+    assert res.status_code == 200
+    # No filter: the same six entries, joined exactly as journal.read renders.
+    assert res.text.count("heldso-app-1") == 6
+
+
+async def test_logs_hide_a_field_drops_the_whole_trace(yard_filtered):
+    client, token, _argv = yard_filtered
+    page = await _page(client, token, "hide=request.path%3D%2Fhealth")
+    # The child has no request.path; the trace hides as one group.
+    assert "t-health" not in "".join(_messages(page))
+    names = [json.loads(m)["name"] if m.startswith("{") else m for m in _messages(page)]
+    assert names == ["db.query", "boom traceback", "GET /notes", "tick"]
+
+
+async def test_logs_only_keeps_matching_traces_and_text(yard_filtered):
+    client, token, _argv = yard_filtered
+    page = await _page(client, token, "only=status%3Derror")
+    names = [json.loads(m)["name"] if m.startswith("{") else m for m in _messages(page)]
+    # The notes child's error keeps root and child; the text line is not judged
+    # by a field rule; /health and the lone status-ok JSON line are gone.
+    assert names == ["db.query", "boom traceback", "GET /notes"]
+
+
+async def test_logs_hide_a_text_rule_drops_a_plain_line(yard_filtered):
+    client, token, _argv = yard_filtered
+    res = await client.get("/api/v1/logs?container=heldso-app-1&hide=boom", headers=auth(token))
+    assert res.status_code == 200
+    assert "boom" not in res.text
+    assert "t-health" in res.text and "tick" in res.text
+
+
+async def test_logs_number_rules_read_group_lines(yard_filtered):
+    client, token, _argv = yard_filtered
+    page = await _page(client, token, "only=duration_ns%3E800")
+    names = [json.loads(m)["name"] if m.startswith("{") else m for m in _messages(page)]
+    assert names == ["render", "GET /health", "db.query", "boom traceback", "GET /notes"]
+
+
+async def test_logs_page_cursor_is_the_last_raw_entry(yard_filtered):
+    client, token, _argv = yard_filtered
+    page = await _page(client, token, "only=status%3Derror")
+    # cursor-4 and cursor-5 are hidden, but the poller must resume after them.
+    assert page["cursor"] == "cursor-5"
+
+
+async def test_logs_a_bad_filter_is_a_400_before_the_read(yard_filtered):
+    client, token, argv_log = yard_filtered
+    argv_log.unlink(missing_ok=True)
+    for query in ("hide=duration_ns%3Eslow", "hide=", "only="):
+        res = await client.get(f"/api/v1/logs?container=heldso-app-1&{query}", headers=auth(token))
+        assert res.status_code == 400, query
+        assert res.json()["error"]["code"] == "bad_filter"
+    assert not argv_log.exists()
+
+
+async def test_logs_follow_filters_with_the_same_rules(yard_filtered):
+    client, token, _argv = yard_filtered
+    res = await client.get(
+        "/api/v1/logs?container=heldso-app-1&follow=1&only=status%3Derror",
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+    names = [
+        json.loads(message)["name"] if message.startswith("{") else message
+        for message in (line.split(" ", 2)[2] for line in res.text.splitlines())
+    ]
+    # The text line decides at once and may print ahead of the held trace.
+    assert names == ["boom traceback", "db.query", "GET /notes"]
+
+
+_TRICKLE_JOURNALCTL = """\
+import json
+import sys
+import time
+
+with open({argv_log!r}, "a") as log:
+    log.write(" ".join(sys.argv[1:]) + "\\n")
+lines = open({data!r}).read().splitlines()
+print(lines[0])
+sys.stdout.flush()
+for line in lines[1:]:
+    time.sleep({delay})
+    print(line)
+    sys.stdout.flush()
+"""
+
+
+@pytest.fixture
+async def yard_trickle(tmp_path, monkeypatch):
+    """The API over a journalctl that emits entries with a delay between them."""
+    micros = int(WHEN.timestamp() * 1_000_000)
+    entries = [
+        {
+            "__CURSOR": f"cursor-{n}",
+            "__REALTIME_TIMESTAMP": str(micros + n * 1_000_000),
+            "CONTAINER_NAME": "heldso-app-1",
+            "MESSAGE": message,
+        }
+        for n, message in enumerate(
+            [
+                json.dumps({"name": "slow.child", "trace_id": "t-slow", "span_id": "c1", "parent_id": "r1"}),
+                *[json.dumps({"name": f"tick {n}"}) for n in range(1, 9)],
+            ]
+        )
+    ]
+    data = tmp_path / "journal.jsonl"
+    data.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+    argv_log = tmp_path / "argv"
+    script = tmp_path / "journalctl"
+    script.write_text(
+        f"#!{sys.executable}\n" + _TRICKLE_JOURNALCTL.format(argv_log=str(argv_log), data=str(data), delay=0.45)
+    )
+    script.chmod(0o755)
+    (tmp_path / "journal").mkdir()
+    monkeypatch.setenv("YARD_ROOT", str(tmp_path))
+    monkeypatch.setenv("YARD_SKIP_DEPLOY", "1")
+    monkeypatch.setenv("YARD_BOOT", "0")
+    monkeypatch.setenv("YARD_PODMAN_BIN", "yard-podman-missing")
+    monkeypatch.setenv("YARD_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.setenv("YARD_JOURNALCTL_BIN", str(script))
+    async with TestClient(bootstrap, request_timeout=15) as client:
+        token = (tmp_path / "tokens" / "admin.token").read_text().strip()
+        yield client, token, argv_log
+
+
+async def test_logs_filtered_text_keeps_one_entry_per_line(yard_filtered):
+    client, token, _argv = yard_filtered
+    res = await client.get("/api/v1/logs?container=heldso-app-1&hide=t-health", headers=auth(token))
+    assert res.status_code == 200
+    lines = res.text.splitlines()
+    assert len(lines) == 4
+    assert all(line.count("heldso-app-1") == 1 for line in lines)
+
+
+async def test_logs_follow_expires_a_held_trace_during_traffic(yard_trickle):
+    client, token, _argv = yard_trickle
+    res = await client.get(
+        "/api/v1/logs?container=heldso-app-1&follow=1&hide=zzz",
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+    names = [json.loads(line.split(" ", 2)[2])["name"] for line in res.text.splitlines()]
+    assert "slow.child" in names
+    # The held trace ages out mid-stream: the last line is a tick, not the
+    # child a drain would have flushed after every other line.
+    assert names[-1] == "tick 8"

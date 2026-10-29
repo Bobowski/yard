@@ -2,6 +2,7 @@
 
 import asyncio
 import re
+import time
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from typing import Any, cast
@@ -13,6 +14,7 @@ from stario.json import JsonValue
 
 from app.server import apps, binds, doctor, journal, status
 from app.server.forges import Forge, GitHub, Origin
+from app.server.logfilter import Held, LogFilter
 from app.server.store import App, Config, Deployed, Store, read_deployed
 from app.server.yard import Job, Yard
 from app.shared import YardError, now
@@ -202,8 +204,17 @@ _EVENT_MATCHES = ["SYSLOG_IDENTIFIER=podman", "SYSLOG_IDENTIFIER=yard"]
 _YARD_TOP = {"YARD_EVENT", "YARD_APP", "YARD_CONTAINER", "YARD_ACTOR", "YARD_SHA", "YARD_STATUS"}
 
 
-def _logs_page(entries: list[dict]) -> dict[str, Any]:
-    """One page of log entries and the cursor a poller passes back as after."""
+def _logs_page(entries: list[dict], log_filter: LogFilter | None) -> dict[str, Any]:
+    """One page of log entries and the cursor a poller passes back as after.
+
+    The cursor is the last raw entry read, hidden ones included, so a filtered
+    poller still advances.
+    """
+    keep = (
+        [True] * len(entries)
+        if log_filter is None
+        else log_filter.select([journal.message_text(entry) for entry in entries])
+    )
     rows = [
         {
             "cursor": str(entry.get("__CURSOR") or ""),
@@ -211,9 +222,10 @@ def _logs_page(entries: list[dict]) -> dict[str, Any]:
             "time": journal.timestamp(entry),
             "message": journal.message_text(entry),
         }
-        for entry in entries
+        for entry, shown in zip(entries, keep, strict=True)
+        if shown
     ]
-    return {"entries": rows, "cursor": rows[-1]["cursor"] if rows else ""}
+    return {"entries": rows, "cursor": str(entries[-1].get("__CURSOR") or "") if entries else ""}
 
 
 def _container_match(given: str) -> str:
@@ -342,19 +354,50 @@ def _log_time(value: str) -> str:
     )
 
 
-async def _stream_journal(config: Config, c: Context, w: Writer, matches: list[str], lines: int) -> None:
+async def _stream_journal(
+    config: Config,
+    c: Context,
+    w: Writer,
+    matches: list[str],
+    lines: int,
+    log_filter: LogFilter | None,
+) -> None:
     proc = await journal.follow(config, matches, lines=lines)
     w.headers.set("content-type", "text/plain; charset=utf-8")
     w.write_headers(200)
     assert proc.stdout is not None
     try:
-        while raw := await proc.stdout.readline():
-            if c.disconnected:
-                break
-            for entry in journal.entries(raw):
-                if line := journal.format_line(entry):
+        if log_filter is None:
+            while raw := await proc.stdout.readline():
+                if c.disconnected:
+                    break
+                for entry in journal.entries(raw):
+                    if line := journal.format_line(entry):
+                        w.write(line.encode() + b"\n")
+                        await w.drain()
+        else:
+            held: Held[str] = Held(log_filter)
+            while True:
+                try:
+                    raw = await asyncio.wait_for(proc.stdout.readline(), 0.5)
+                except TimeoutError:
+                    raw = None
+                if raw == b"" or c.disconnected:
+                    break
+                if raw:
+                    for entry in journal.entries(raw):
+                        if not (line := journal.format_line(entry)):
+                            continue
+                        for out in held.push(line, journal.message_text(entry), time.monotonic()):
+                            w.write(out.encode() + b"\n")
+                            await w.drain()
+                # Expire on every iteration: busy output must not starve a held trace.
+                for line in held.expire(time.monotonic()):
                     w.write(line.encode() + b"\n")
                     await w.drain()
+            for line in held.drain():
+                w.write(line.encode() + b"\n")
+                await w.drain()
     finally:
         if proc.returncode is None:
             proc.kill()
@@ -646,16 +689,28 @@ class HostPage:
         until = _log_time(str(query.get("until") or ""))
         after = str(query.get("after") or "")
         match = _container_match(str(query.get("container") or ""))
+        log_filter = LogFilter.parse(query.getlist("hide"), query.getlist("only"))
         if query.get("follow") == "1":
-            await _stream_journal(self.yard.config, c, w, [match], lines)
+            await _stream_journal(self.yard.config, c, w, [match], lines, log_filter)
             return
         if "application/json" in (c.req.headers.get("accept") or ""):
             entries = await journal.read_entries(
                 self.yard.config, [match], lines=lines, since=since, until=until, after=after
             )
-            w.json(cast(JsonValue, _logs_page(entries)))
+            w.json(cast(JsonValue, _logs_page(entries, log_filter)))
             return
-        text = await journal.read(self.yard.config, [match], lines=lines, since=since, until=until, after=after)
+        if log_filter is None:
+            text = await journal.read(self.yard.config, [match], lines=lines, since=since, until=until, after=after)
+        else:
+            entries = await journal.read_entries(
+                self.yard.config, [match], lines=lines, since=since, until=until, after=after
+            )
+            keep = log_filter.select([journal.message_text(entry) for entry in entries])
+            text = "\n".join(
+                line
+                for entry, shown in zip(entries, keep, strict=True)
+                if shown and (line := journal.format_line(entry))
+            )
         w.text(text if text.endswith("\n") or not text else text + "\n")
 
     async def events_get(self, c: Context, w: Writer) -> None:
