@@ -597,6 +597,22 @@ async def test_github_report_posts_a_commit_status(gh_api, tmp_path):
     )
 
 
+async def test_github_report_uses_the_repos_own_installation(gh_api, tmp_path):
+    github, box = gh_api
+    _write_key(tmp_path / "github", _rsa_pem())
+    github.save(
+        app_id="42",
+        installations=[
+            {"id": "101", "account": "Bobowski", "selection": "all"},
+            {"id": "202", "account": "stariodev", "selection": "all"},
+        ],
+        webhook_secret=SECRET,
+    )
+    await github.report("https://github.com/stariodev/tool", "abc123", "success", "live")
+    posts = [path for method, path, _h in box.calls if method == "POST"]
+    assert posts == ["/app/installations/202/access_tokens", "/repos/stariodev/tool/statuses/abc123"]
+
+
 async def test_github_report_strips_git_truncates_and_skips_the_url(gh_api, tmp_path):
     github, box = gh_api
     _gh_wire(github, tmp_path)
