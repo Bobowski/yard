@@ -94,5 +94,4 @@ Proof is evidence that a reader can check without trust in you. "Tests pass" is 
 - For a bug: the new test fails on the old code and passes on the new code. Show both runs.
 - For a route: the `TestClient` response that shows the HTML, the JSON, or the header.
 - For a security fix: the request that worked before the fix, and the status code that it gets now.
-- For a visual change: a screenshot. A test cannot prove a layout.
 - After a merge, when you can reach production: a `curl` to the production URL that shows the fix.
