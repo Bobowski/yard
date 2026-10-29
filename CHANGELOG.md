@@ -4,6 +4,7 @@
 
 - `yard status` no longer sends `GET /` to each app; the state comes from Podman and its healthcheck. The `answers` field is gone from the status API. An app without a healthcheck that does not listen now shows `up` — add a `HEALTHCHECK` ([stario.dev/yard/compose#healthchecks](https://stario.dev/yard/compose#healthchecks)).
 - `yard logs` printed every entry on one line: the text path joined the formatted entries with no separator, so `--tail 3` came back as a single glued line. Each journal entry is now its own line; the app page's log tail fixes the same way.
+- `yard logs` filters on the host with repeatable `--hide EXPR` and `--only EXPR`: `key=value` / `key!=value` globs and `key>n` / `key<n` on a JSON record (a top-level key first, then `attributes`), anything else a substring glob on the message. Lines that share a `trace_id` keep or drop as one trace; `lines`/`--tail` still count entries read before filters, and a JSON page's cursor stays the last entry read. With no flags the output is unchanged.
 
 ## 0.9.1
 
