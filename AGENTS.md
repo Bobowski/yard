@@ -86,13 +86,12 @@ The pull request body is the record of the work. The squash merge puts it into t
 - **Found**: the state before the change. For a bug, write the cause and how you reproduced it.
 - **Changed**: what you changed, and why you did it this way. Name the other options and why you did not use them.
 - **Not done**: what you did not do, and why. Write "Nothing" when that is true.
-- **Proof**: irrefutable proof that the change works.
+- **Proof**: the output that shows the change works.
 - **Questions**: the decisions that you made without the user. Write "None" when that is true.
 
-Proof is evidence that a reader can check without trust in you. "Tests pass" is not proof. For each claim in **Changed**, give the command that you ran and the part of its output that shows the result:
+Proof is output that a reader can check: the command that you ran and the lines that show the result. One proof for the change is enough:
 
-- For a bug: the new test fails on the old code and passes on the new code. Show both runs.
-- For a route: the `TestClient` response that shows the HTML, the JSON, or the header.
+- For a bug: the new test that reproduces it, now passing.
+- For a route: the test or the `TestClient` response that shows the HTML, the JSON, or the header.
 - For a security fix: the request that worked before the fix, and the status code that it gets now.
-- For a visual change: a screenshot. A test cannot prove a layout.
 - After a merge, when you can reach production: a `curl` to the production URL that shows the fix.
