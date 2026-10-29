@@ -401,9 +401,10 @@ def _create_repo(session: Client, name: str, owner: str, forge: str) -> tuple[st
         if not connected:
             _die(FORGE_HINT)
         if len(connected) > 1:
-            listing = " and ".join(name.capitalize() for name in connected)
-            flags = " or ".join(f"--forge {name}" for name in connected)
-            _die(f"{listing} are both connected; pass {flags}")
+            _die(
+                f"{' and '.join(name.capitalize() for name in connected)} are both connected;"
+                f" pass {' or '.join(f'--forge {name}' for name in connected)}"
+            )
         forge = connected[0]
     name = name or _slug(Path(top).name)
     raw = _api(
@@ -437,8 +438,7 @@ def _create_repo(session: Client, name: str, owner: str, forge: str) -> tuple[st
 
 
 def _cmd_repo_new(args: argparse.Namespace) -> None:
-    session = _load(args)
-    repo, branch = _create_repo(session, args.name.strip(), args.owner.strip(), args.forge)
+    repo, branch = _create_repo(_load(args), args.name.strip(), args.owner.strip(), args.forge)
     if _json:
         print(json.dumps({"repo": repo, "branch": branch}))
 
@@ -474,7 +474,7 @@ def _cmd_app_new(args: argparse.Namespace) -> None:
             name = name or _source_name(kind, runs)
         else:
             if not repo:
-                create = bool(args.create_repo)
+                create = args.create_repo
                 if not create and sys.stdin.isatty() and not _json:
                     branch = _git_out("branch", "--show-current") or ref
                     answer = _ask(f"No repo here. Create a private repo and push {branch}? [Y/n] ")
@@ -1049,7 +1049,7 @@ def _setup_origin(session: Client, args: argparse.Namespace) -> None:
     events = app.get("events")
     if isinstance(events, list) and "repository.pushed" not in events:
         print("warning: the app does not subscribe to repository.pushed", file=sys.stderr)
-    print("Install the app on your owner and select all repositories.")
+    print("Install the app on your account and select all repositories.")
     _open(
         args,
         "https://cursor.com/codebase/apps/install?"

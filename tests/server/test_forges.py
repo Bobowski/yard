@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
-from app.server.forges import GitHub, Origin
+from app.server.forges import Forge, GitHub, Origin
 from app.shared import YardError, clone_url
 
 
@@ -712,6 +712,15 @@ def _gh_install(github: GitHub, account: str, kind: str, ident: str = "101") -> 
     github.save(installations=[{"id": ident, "account": account, "selection": "all", "type": kind}])
 
 
+def _wire_forge(forge: Forge, tmp_path: Path) -> None:
+    """A saved app and one "all" installation on account org."""
+    if isinstance(forge, GitHub):
+        _gh_wire(forge, tmp_path)
+        _gh_install(forge, "org", "Organization")
+    elif isinstance(forge, Origin):
+        _wire(forge)
+
+
 async def test_github_create_repo_a_user_posts_to_user_repos(gh_api, tmp_path):
     github, box = gh_api
     _gh_wire(github, tmp_path)
@@ -732,26 +741,34 @@ async def test_github_create_repo_an_org_posts_to_orgs(gh_api, tmp_path):
     assert box.bodies == [("/orgs/org/repos", {"name": "heldso", "private": True, "auto_init": False})]
 
 
-async def test_github_create_repo_a_422_is_repo_exists(gh_api, tmp_path):
-    github, box = gh_api
-    _gh_wire(github, tmp_path)
-    _gh_install(github, "org", "Organization")
-    box.repo_status = 422
+@pytest.mark.parametrize(
+    "fixture, forge_status",
+    [
+        pytest.param("api", 409, id="origin-409"),
+        pytest.param("gh_api", 422, id="github-422"),
+    ],
+)
+async def test_create_repo_a_taken_name_is_repo_exists(request, fixture, forge_status, tmp_path):
+    forge, box = request.getfixturevalue(fixture)
+    _wire_forge(forge, tmp_path)
+    box.repo_status = forge_status
     with pytest.raises(YardError) as caught:
-        await github.create_repo("org", "heldso")
+        await forge.create_repo("org", "heldso")
     assert caught.value.status == 409
     assert caught.value.code == "repo_exists"
+    assert f"https://{forge.host}/org/heldso.git" in (caught.value.help_text or "")
 
 
-async def test_github_create_repo_a_403_is_repo_permission(gh_api, tmp_path):
-    github, box = gh_api
-    _gh_wire(github, tmp_path)
-    _gh_install(github, "org", "Organization")
+@pytest.mark.parametrize("fixture", ["api", "gh_api"])
+async def test_create_repo_a_403_is_repo_permission(request, fixture, tmp_path):
+    forge, box = request.getfixturevalue(fixture)
+    _wire_forge(forge, tmp_path)
     box.repo_status = 403
     with pytest.raises(YardError) as caught:
-        await github.create_repo("org", "heldso")
+        await forge.create_repo("org", "heldso")
     assert caught.value.status == 403
     assert caught.value.code == "repo_permission"
+    assert caught.value.help_text == forge.create_help
 
 
 async def test_github_create_repo_a_hidden_user_repo_names_the_grant(gh_api, tmp_path):
@@ -793,21 +810,21 @@ async def test_github_create_repo_a_legacy_state_refreshes_the_installations(gh_
     assert len(lookups) == 1
 
 
-async def test_github_create_repo_needs_an_installation(gh_api, tmp_path):
-    github, _box = gh_api
-    _gh_wire(github, tmp_path)
-    _gh_install(github, "me", "User")
+@pytest.mark.parametrize("fixture", ["api", "gh_api"])
+async def test_create_repo_needs_an_installation(request, fixture, tmp_path):
+    forge, _box = request.getfixturevalue(fixture)
+    _wire_forge(forge, tmp_path)
     with pytest.raises(YardError) as caught:
-        await github.create_repo("someone-else", "heldso")
+        await forge.create_repo("someone-else", "heldso")
     assert caught.value.status == 404
     assert caught.value.code == "no_installation"
 
 
 async def test_a_plain_forge_cannot_create_repos(tmp_path):
-    from app.server.forges import Forge
-
+    forge = Forge(tmp_path / "f")
+    forge.save(installations=[{"id": "1", "account": "org"}])
     with pytest.raises(YardError) as caught:
-        await Forge(tmp_path / "f").create_repo("org", "heldso")
+        await forge.create_repo("org", "heldso")
     assert caught.value.status == 501
     assert caught.value.code == "repo_unsupported"
 
@@ -830,32 +847,3 @@ async def test_origin_create_repo_a_selected_installation_never_calls(api):
     assert caught.value.status == 403
     assert caught.value.code == "repo_permission"
     assert box.calls == []
-
-
-async def test_origin_create_repo_a_409_is_repo_exists(api):
-    origin, box = api
-    _wire(origin)
-    box.repo_status = 409
-    with pytest.raises(YardError) as caught:
-        await origin.create_repo("org", "heldso")
-    assert caught.value.status == 409
-    assert caught.value.code == "repo_exists"
-
-
-async def test_origin_create_repo_a_403_is_repo_permission(api):
-    origin, box = api
-    _wire(origin)
-    box.repo_status = 403
-    with pytest.raises(YardError) as caught:
-        await origin.create_repo("org", "heldso")
-    assert caught.value.status == 403
-    assert caught.value.code == "repo_permission"
-
-
-async def test_origin_create_repo_needs_an_installation(api):
-    origin, _box = api
-    _wire(origin)
-    with pytest.raises(YardError) as caught:
-        await origin.create_repo("someone-else", "heldso")
-    assert caught.value.status == 404
-    assert caught.value.code == "no_installation"
