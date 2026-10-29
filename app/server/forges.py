@@ -328,6 +328,66 @@ class Origin(Forge):
             if not page:
                 return found
 
+    async def create_repo(self, owner: str, name: str) -> tuple[str, str]:
+        """A private repo under owner: POST /repos/<owner>.
+
+        Only an "all repositories" installation can create; that installation
+        covers the new repo by itself, so there is no grant URL.
+        """
+        repo_url = f"https://{self.host}/{owner}/{name}"
+        installation = self.installation_for(f"https://{self.host}/{owner}/x")
+        if installation is None:
+            raise YardError(
+                404,
+                "no_installation",
+                f"the Yard app is not installed on {owner}",
+                help_text=f"Install the Yard app on {owner}. Run yard forge setup origin for the link.",
+            )
+        if installation.get("selection") != "all":
+            raise YardError(
+                403,
+                "repo_permission",
+                "the Origin installation covers selected repos only",
+                help_text=(
+                    "Origin creates repos only for an installation on all repositories."
+                    " Install the app again on all repositories."
+                ),
+            )
+        try:
+            body = await self._call(
+                "POST",
+                f"/repos/{owner}",
+                await self.token(repo_url),
+                {"name": name, "visibility": "private"},
+            )
+        except YardError as exc:
+            status = exc.context.get("status")
+            if status == 409:
+                raise YardError(
+                    409,
+                    "repo_exists",
+                    f"{owner}/{name} exists",
+                    help_text=(
+                        "Pick another name, or use the repo:"
+                        f" git remote add origin https://origin.cursor.com/{owner}/{name}.git"
+                    ),
+                ) from exc
+            if status == 403:
+                raise YardError(
+                    403,
+                    "repo_permission",
+                    "the Yard Origin app cannot create repos",
+                    help_text=(
+                        "Approve the namespace:repositories:create scope for the Yard Origin app:"
+                        " run yard forge setup origin, or open the install link with"
+                        " include_granted_scopes=true."
+                    ),
+                ) from exc
+            raise
+        data = body if isinstance(body, dict) else {}
+        full = str(data.get("fullName") or f"{owner}/{name}")
+        return f"https://{self.host}/{full}", ""
+
 
 class GitHub(Forge):
     """api.github.com. The user supplies the RSA key and the webhook secret."""

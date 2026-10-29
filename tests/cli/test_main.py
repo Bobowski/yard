@@ -1024,7 +1024,9 @@ def test_forge_setup_origin(monkeypatch: pytest.MonkeyPatch, capsys: pytest.Capt
     assert "PUB" in out
     assert "http://127.0.0.1:8000/hooks/origin" in out
     assert "repository.pushed" in out
+    assert "scope: repository:contents:read namespace:repositories:create" in out
     assert "install?client_id=app_123" in out
+    assert "namespace%3Arepositories%3Acreate" in out
     assert "Done." in out
     assert ("PUT", "/api/v1/forges/origin", {"app_id": "app_123"}) in calls
 
@@ -2065,12 +2067,17 @@ def test_repo_new(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytes
 
     def fake_api_try(client, method, path, body, timeout=None):
         seen.append((method, path, body))
+        if path == "/api/v1/forges":
+            return 200, json.dumps([{"name": "github", "connected": True}])
         return 200, json.dumps({"repo": bare, "grant_url": ""})
 
     monkeypatch.setattr(cli, "_api_try", fake_api_try)
     _env(monkeypatch)
     main(["repo", "new", "--text"])
-    assert seen == [("POST", "/api/v1/forges/github/repos", {"name": "work"})]
+    assert seen == [
+        ("GET", "/api/v1/forges", None),
+        ("POST", "/api/v1/forges/github/repos", {"name": "work"}),
+    ]
     remote = subprocess.check_output(["git", "-C", str(repo), "remote", "get-url", "origin"], text=True).strip()
     assert remote == f"{bare}.git"
     head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
@@ -2131,7 +2138,11 @@ def test_repo_new_a_push_failure_keeps_origin(monkeypatch: pytest.MonkeyPatch, t
     monkeypatch.setattr(
         cli,
         "_api_try",
-        lambda *a, **k: (200, json.dumps({"repo": "https://github.com/org/heldso", "grant_url": ""})),
+        lambda client, method, path, body, timeout=None: (
+            (200, json.dumps([{"name": "github", "connected": True}]))
+            if path == "/api/v1/forges"
+            else (200, json.dumps({"repo": "https://github.com/org/heldso", "grant_url": ""}))
+        ),
     )
     monkeypatch.setattr(cli.subprocess, "run", _fake_push(pushes, ok=False))
     _env(monkeypatch)
@@ -2151,7 +2162,15 @@ def test_repo_new_warns_about_uncommitted_changes(monkeypatch: pytest.MonkeyPatc
     bare = _bare_repo(tmp_path / "bare")
     (repo / "dirty.txt").write_text("dirty\n")
     monkeypatch.chdir(repo)
-    monkeypatch.setattr(cli, "_api_try", lambda *a, **k: (200, json.dumps({"repo": bare, "grant_url": ""})))
+    monkeypatch.setattr(
+        cli,
+        "_api_try",
+        lambda client, method, path, body, timeout=None: (
+            (200, json.dumps([{"name": "github", "connected": True}]))
+            if path == "/api/v1/forges"
+            else (200, json.dumps({"repo": bare, "grant_url": ""}))
+        ),
+    )
     _env(monkeypatch)
     main(["repo", "new", "--text"])
     assert "warning: uncommitted changes are not pushed" in capsys.readouterr().err
@@ -2163,7 +2182,15 @@ def test_repo_new_warns_when_the_installation_cannot_see(monkeypatch: pytest.Mon
     bare = _bare_repo(tmp_path / "bare")
     monkeypatch.chdir(repo)
     grant = "https://github.com/settings/installations/101"
-    monkeypatch.setattr(cli, "_api_try", lambda *a, **k: (200, json.dumps({"repo": bare, "grant_url": grant})))
+    monkeypatch.setattr(
+        cli,
+        "_api_try",
+        lambda client, method, path, body, timeout=None: (
+            (200, json.dumps([{"name": "github", "connected": True}]))
+            if path == "/api/v1/forges"
+            else (200, json.dumps({"repo": bare, "grant_url": grant}))
+        ),
+    )
     _env(monkeypatch)
     main(["repo", "new", "--text"])
     err = capsys.readouterr().err
@@ -2180,6 +2207,8 @@ def test_app_new_create_repo(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ca
 
     def fake_api_try(client, method, path, body, timeout=None):
         seen.append((method, path, body))
+        if path == "/api/v1/forges":
+            return 200, json.dumps([{"name": "github", "connected": True}])
         if path == "/api/v1/forges/github/repos":
             return 200, json.dumps({"repo": "https://github.com/org/work", "grant_url": ""})
         if path == "/api/v1/apps":
@@ -2195,8 +2224,8 @@ def test_app_new_create_repo(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ca
     monkeypatch.setattr(cli.subprocess, "run", _fake_push(pushes))
     _env(monkeypatch)
     main(["app", "new", "--text", "--create-repo"])
-    assert seen[0] == ("POST", "/api/v1/forges/github/repos", {"name": "work"})
-    assert seen[1] == (
+    assert seen[1] == ("POST", "/api/v1/forges/github/repos", {"name": "work"})
+    assert seen[2] == (
         "POST",
         "/api/v1/apps",
         {"name": "work", "repo": "https://github.com/org/work", "ref": "main"},
@@ -2209,7 +2238,15 @@ def test_repo_new_json_prints_repo_and_branch(monkeypatch: pytest.MonkeyPatch, t
     _init_commit(repo, "main")
     bare = _bare_repo(tmp_path / "bare")
     monkeypatch.chdir(repo)
-    monkeypatch.setattr(cli, "_api_try", lambda *a, **k: (200, json.dumps({"repo": bare, "grant_url": ""})))
+    monkeypatch.setattr(
+        cli,
+        "_api_try",
+        lambda client, method, path, body, timeout=None: (
+            (200, json.dumps([{"name": "github", "connected": True}]))
+            if path == "/api/v1/forges"
+            else (200, json.dumps({"repo": bare, "grant_url": ""}))
+        ),
+    )
     _env(monkeypatch)
     main(["repo", "new", "--json"])
     assert json.loads(capsys.readouterr().out) == {"repo": bare, "branch": "main"}
@@ -2223,6 +2260,8 @@ def test_app_new_create_repo_json_is_one_document(monkeypatch: pytest.MonkeyPatc
     pushes: list = []
 
     def fake_api_try(client, method, path, body, timeout=None):
+        if path == "/api/v1/forges":
+            return 200, json.dumps([{"name": "github", "connected": True}])
         if path == "/api/v1/forges/github/repos":
             return 200, json.dumps({"repo": "https://github.com/org/work", "grant_url": ""})
         if path == "/api/v1/apps":
@@ -2269,6 +2308,8 @@ def test_app_new_asks_before_creating_a_repo(monkeypatch: pytest.MonkeyPatch, tm
 
     def fake_api_try(client, method, path, body, timeout=None):
         seen.append((method, path, body))
+        if path == "/api/v1/forges":
+            return 200, json.dumps([{"name": "github", "connected": True}])
         if path == "/api/v1/forges/github/repos":
             return 200, json.dumps({"repo": "https://github.com/org/work", "grant_url": ""})
         if path == "/api/v1/apps":
@@ -2280,7 +2321,7 @@ def test_app_new_asks_before_creating_a_repo(monkeypatch: pytest.MonkeyPatch, tm
     monkeypatch.setattr(cli.subprocess, "run", _fake_push(pushes))
     monkeypatch.setattr("builtins.input", _answers(""))
     main(["app", "new", "--text", "--app", "heldso"])
-    assert seen[0] == ("POST", "/api/v1/forges/github/repos", {"name": "heldso"})
+    assert seen[1] == ("POST", "/api/v1/forges/github/repos", {"name": "heldso"})
 
 
 def test_app_new_create_repo_rejects_the_repo_flag(monkeypatch: pytest.MonkeyPatch, capsys):
@@ -2295,3 +2336,94 @@ def test_app_new_create_repo_rejects_a_repo_less_runs(monkeypatch: pytest.Monkey
     with pytest.raises(SystemExit):
         main(["app", "new", "--text", "--runs", "postgres:17", "--create-repo"])
     assert "--create-repo" in capsys.readouterr().err
+
+
+def test_repo_new_picks_the_one_connected_forge(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys):
+    repo = tmp_path / "work"
+    _init_commit(repo, "main")
+    bare = _bare_repo(tmp_path / "bare")
+    monkeypatch.chdir(repo)
+    seen: list = []
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        seen.append((method, path, body))
+        if path == "/api/v1/forges":
+            return 200, json.dumps([{"name": "github", "connected": False}, {"name": "origin", "connected": True}])
+        return 200, json.dumps({"repo": bare, "grant_url": ""})
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    _env(monkeypatch)
+    main(["repo", "new", "--text"])
+    assert seen == [
+        ("GET", "/api/v1/forges", None),
+        ("POST", "/api/v1/forges/origin/repos", {"name": "work"}),
+    ]
+
+
+def test_repo_new_dies_when_two_forges_are_connected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys):
+    repo = tmp_path / "work"
+    _init_commit(repo, "main")
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(
+        cli,
+        "_api_try",
+        lambda *a, **k: (
+            200,
+            json.dumps([{"name": "github", "connected": True}, {"name": "origin", "connected": True}]),
+        ),
+    )
+    _env(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(["repo", "new", "--text"])
+    err = capsys.readouterr().err
+    assert "--forge" in err
+    assert "both connected" in err
+
+
+def test_repo_new_forge_flag_skips_the_lookup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys):
+    repo = tmp_path / "work"
+    _init_commit(repo, "main")
+    bare = _bare_repo(tmp_path / "bare")
+    monkeypatch.chdir(repo)
+    seen: list = []
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        seen.append((method, path, body))
+        return 200, json.dumps({"repo": bare, "grant_url": ""})
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    _env(monkeypatch)
+    main(["repo", "new", "--forge", "origin", "--text"])
+    assert seen == [("POST", "/api/v1/forges/origin/repos", {"name": "work"})]
+
+
+def test_app_new_create_repo_forge_origin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys):
+    repo = tmp_path / "work"
+    _init_commit(repo, "main")
+    monkeypatch.chdir(repo)
+    seen: list = []
+    pushes: list = []
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        seen.append((method, path, body))
+        if path == "/api/v1/forges/origin/repos":
+            return 200, json.dumps({"repo": "https://origin.cursor.com/org/work", "grant_url": ""})
+        if path == "/api/v1/apps":
+            return 200, json.dumps(
+                {"app": {"name": body["name"], "repo": body["repo"], "ref": body["ref"], "trigger": "push"}}
+            )
+        if path == "/api/v1/apps/work/deploy":
+            return 200, json.dumps({"deploy": {"status": "ok"}})
+        raise AssertionError(path)
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    monkeypatch.setattr(cli, "_follow_deploy", lambda *a: {"status": "ok"})
+    monkeypatch.setattr(cli.subprocess, "run", _fake_push(pushes))
+    _env(monkeypatch)
+    main(["app", "new", "--text", "--create-repo", "--forge", "origin"])
+    assert seen[0] == ("POST", "/api/v1/forges/origin/repos", {"name": "work"})
+    assert seen[1] == (
+        "POST",
+        "/api/v1/apps",
+        {"name": "work", "repo": "https://origin.cursor.com/org/work", "ref": "main"},
+    )

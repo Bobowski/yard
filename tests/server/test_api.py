@@ -1058,13 +1058,18 @@ async def test_repo_create_needs_an_owner_when_accounts_differ(yard, monkeypatch
     assert res.json()["error"]["code"] == "no_installation"
 
 
-async def test_repo_create_origin_is_unsupported(yard, monkeypatch):
+async def test_repo_create_origin(yard, monkeypatch):
     client, token, _root = yard
     monkeypatch.setattr(Origin, "connected", lambda self: True)
+
+    async def fake_create(self, owner, name):
+        return f"https://origin.cursor.com/{owner}/{name}", ""
+
+    monkeypatch.setattr(Origin, "create_repo", fake_create)
     res = await client.post(
         "/api/v1/forges/origin/repos",
         json={"name": "heldso", "owner": "org"},
         headers=auth(token),
     )
-    assert res.status_code == 501
-    assert res.json()["error"]["code"] == "repo_unsupported"
+    assert res.status_code == 200
+    assert res.json() == {"repo": "https://origin.cursor.com/org/heldso", "grant_url": ""}

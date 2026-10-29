@@ -375,8 +375,8 @@ def _cmd_app_ls(args: argparse.Namespace) -> None:
     print(format_apps(rows, color=_color_on()), end="")
 
 
-def _create_repo(session: Client, name: str, owner: str) -> tuple[str, str]:
-    """Make a private GitHub repo for this checkout, wire origin, push. Returns (repo, branch).
+def _create_repo(session: Client, name: str, owner: str, forge: str) -> tuple[str, str]:
+    """Make a private repo on the forge, wire origin, push. Returns (repo, branch).
 
     The checkout stays untouched: no `git add`, no `git commit` — one wrong add
     could commit an .env file.
@@ -395,11 +395,21 @@ def _create_repo(session: Client, name: str, owner: str) -> tuple[str, str]:
         if existing:
             _die(f"origin is already {existing}. yard app new uses it.")
         _die(f"origin is already {remote}. pass --repo, or remove origin.")
+    if not forge:
+        rows = _object(_api(session, "GET", "/api/v1/forges", None))
+        connected = [str(row.get("name") or "") for row in rows if isinstance(row, dict) and row.get("connected")]
+        if not connected:
+            _die(FORGE_HINT)
+        if len(connected) > 1:
+            listing = " and ".join(name.capitalize() for name in connected)
+            flags = " or ".join(f"--forge {name}" for name in connected)
+            _die(f"{listing} are both connected; pass {flags}")
+        forge = connected[0]
     name = name or _slug(Path(top).name)
     raw = _api(
         session,
         "POST",
-        "/api/v1/forges/github/repos",
+        f"/api/v1/forges/{forge}/repos",
         {"name": name, **({"owner": owner} if owner else {})},
     )
     result = _object(raw)
@@ -428,7 +438,7 @@ def _create_repo(session: Client, name: str, owner: str) -> tuple[str, str]:
 
 def _cmd_repo_new(args: argparse.Namespace) -> None:
     session = _load(args)
-    repo, branch = _create_repo(session, args.name.strip(), args.owner.strip())
+    repo, branch = _create_repo(session, args.name.strip(), args.owner.strip(), args.forge)
     if _json:
         print(json.dumps({"repo": repo, "branch": branch}))
 
@@ -467,14 +477,14 @@ def _cmd_app_new(args: argparse.Namespace) -> None:
                 create = bool(args.create_repo)
                 if not create and sys.stdin.isatty() and not _json:
                     branch = _git_out("branch", "--show-current") or ref
-                    answer = _ask(f"No repo here. Create a private GitHub repo and push {branch}? [Y/n] ")
+                    answer = _ask(f"No repo here. Create a private repo and push {branch}? [Y/n] ")
                     create = answer.lower() in {"", "y", "yes"}
                 if not create:
                     _die(
                         "no repo; pass --repo https://<host>/<owner>/<name>,"
                         " run inside a forge checkout, or pass --create-repo"
                     )
-                repo, ref = _create_repo(_load(args), name, "")
+                repo, ref = _create_repo(_load(args), name, "", args.forge)
             name = name or _default_name(repo, ref)
             repo = check_repo(repo)
         check_app_name(name)
@@ -1019,7 +1029,7 @@ def _setup_origin(session: Client, args: argparse.Namespace) -> None:
     print(str(key or ""), end="")
     print(f"webhook url: {session.url}/hooks/origin")
     print("event: repository.pushed")
-    print("scope: repository:contents:read")
+    print("scope: repository:contents:read namespace:repositories:create")
     print()
     _open(args, "https://cursor.com/codebase/settings/apps")
 
@@ -1043,7 +1053,7 @@ def _setup_origin(session: Client, args: argparse.Namespace) -> None:
     _open(
         args,
         "https://cursor.com/codebase/apps/install?"
-        + urlencode({"client_id": app_id, "scope": "repository:contents:read"}),
+        + urlencode({"client_id": app_id, "scope": "repository:contents:read namespace:repositories:create"}),
     )
     _poll_installation(session, "origin")
     print("Done.")
@@ -1540,8 +1550,9 @@ def _app_parser(subs: argparse._SubParsersAction, common: argparse.ArgumentParse
     new = subs.add_parser("new", help="create an app", parents=[common])
     new.add_argument("--repo", default="", help="the repo https URL")
     new.add_argument(
-        "--create-repo", action="store_true", help="create a private GitHub repo for this checkout and push it"
+        "--create-repo", action="store_true", help="create a private repo on the forge for this checkout and push it"
     )
+    new.add_argument("--forge", choices=["github", "origin"], default="", help="the forge for --create-repo")
     new.add_argument("--ref", default="", help="the branch to follow")
     new.add_argument("--trigger", default="", help="push or manual")
     new.add_argument("--public", metavar="HOST", default="", help="a name on the public internet")
@@ -1611,9 +1622,12 @@ def _forge_parser(subs: argparse._SubParsersAction, common: argparse.ArgumentPar
 
 
 def _repo_parser(subs: argparse._SubParsersAction, common: argparse.ArgumentParser) -> None:
-    new = subs.add_parser("new", help="create a private GitHub repo for this checkout and push it", parents=[common])
+    new = subs.add_parser(
+        "new", help="create a private repo on the forge for this checkout and push it", parents=[common]
+    )
     new.add_argument("name", nargs="?", default="", help="the repo name; the directory name is the default")
-    new.add_argument("--owner", default="", help="the GitHub account, when the app is installed on several")
+    new.add_argument("--owner", default="", help="the account on the forge, when the app is installed on several")
+    new.add_argument("--forge", choices=["github", "origin"], default="", help="the forge, when both are connected")
     new.set_defaults(func=_cmd_repo_new)
 
 

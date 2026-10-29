@@ -47,8 +47,10 @@ def _serve(handler) -> tuple[ThreadingHTTPServer, str]:
 class _Box:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, str]] = []
+        self.bodies: list[tuple[str, dict]] = []
         self.token_seconds = 3600.0
         self.fail_app = False
+        self.repo_status = 201
         self.installations: list[dict] = [
             {
                 "id": "ins_1",
@@ -78,6 +80,15 @@ def _handler(box: _Box):
             if method == "POST" and self.path.endswith("/access_tokens"):
                 expires = datetime.now(UTC) + timedelta(seconds=box.token_seconds)
                 _send(self, 200, {"token": f"oit_{len(box.calls)}", "expiresAt": _rfc(expires)})
+                return
+            if method == "POST" and self.path.startswith("/repos/"):
+                length = int(self.headers.get("content-length") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+                box.bodies.append((self.path, body))
+                if box.repo_status >= 300:
+                    _send(self, box.repo_status, {"error": "nope"})
+                    return
+                _send(self, box.repo_status, {"fullName": f"{self.path[len('/repos/') :]}/{body.get('name')}"})
                 return
             if method == "GET" and self.path.startswith("/installation/repos"):
                 if "pageToken=2" in self.path:
@@ -792,9 +803,59 @@ async def test_github_create_repo_needs_an_installation(gh_api, tmp_path):
     assert caught.value.code == "no_installation"
 
 
-async def test_origin_cannot_create_repos(api):
-    origin, _box = api
+async def test_a_plain_forge_cannot_create_repos(tmp_path):
+    from app.server.forges import Forge
+
     with pytest.raises(YardError) as caught:
-        await origin.create_repo("org", "heldso")
+        await Forge(tmp_path / "f").create_repo("org", "heldso")
     assert caught.value.status == 501
     assert caught.value.code == "repo_unsupported"
+
+
+async def test_origin_create_repo_posts_private(api):
+    origin, box = api
+    _wire(origin)
+    repo, grant = await origin.create_repo("org", "heldso")
+    assert repo == "https://origin.cursor.com/org/heldso"
+    assert grant == ""
+    assert box.bodies == [("/repos/org", {"name": "heldso", "visibility": "private"})]
+
+
+async def test_origin_create_repo_a_selected_installation_never_calls(api):
+    origin, box = api
+    _wire(origin)
+    origin.save(installations=[{"id": "ins_1", "account": "org", "selection": "selected"}])
+    with pytest.raises(YardError) as caught:
+        await origin.create_repo("org", "heldso")
+    assert caught.value.status == 403
+    assert caught.value.code == "repo_permission"
+    assert box.calls == []
+
+
+async def test_origin_create_repo_a_409_is_repo_exists(api):
+    origin, box = api
+    _wire(origin)
+    box.repo_status = 409
+    with pytest.raises(YardError) as caught:
+        await origin.create_repo("org", "heldso")
+    assert caught.value.status == 409
+    assert caught.value.code == "repo_exists"
+
+
+async def test_origin_create_repo_a_403_is_repo_permission(api):
+    origin, box = api
+    _wire(origin)
+    box.repo_status = 403
+    with pytest.raises(YardError) as caught:
+        await origin.create_repo("org", "heldso")
+    assert caught.value.status == 403
+    assert caught.value.code == "repo_permission"
+
+
+async def test_origin_create_repo_needs_an_installation(api):
+    origin, _box = api
+    _wire(origin)
+    with pytest.raises(YardError) as caught:
+        await origin.create_repo("someone-else", "heldso")
+    assert caught.value.status == 404
+    assert caught.value.code == "no_installation"
