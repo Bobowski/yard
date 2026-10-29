@@ -415,9 +415,7 @@ def _create_repo(session: Client, name: str, owner: str) -> tuple[str, str]:
         _die(
             f"{repo} was created, but the push failed. Push it, then run the command again: git push -u origin {branch}"
         )
-    if _json:
-        print(raw)
-    else:
+    if not _json:
         print(f"created {repo}")
         print(f"pushed {branch}")
     if grant_url:
@@ -430,7 +428,9 @@ def _create_repo(session: Client, name: str, owner: str) -> tuple[str, str]:
 
 def _cmd_repo_new(args: argparse.Namespace) -> None:
     session = _load(args)
-    _create_repo(session, args.name.strip(), args.owner.strip())
+    repo, branch = _create_repo(session, args.name.strip(), args.owner.strip())
+    if _json:
+        print(json.dumps({"repo": repo, "branch": branch}))
 
 
 def _cmd_app_new(args: argparse.Namespace) -> None:
@@ -468,10 +468,7 @@ def _cmd_app_new(args: argparse.Namespace) -> None:
                 if not create and sys.stdin.isatty() and not _json:
                     branch = _git_out("branch", "--show-current") or ref
                     answer = _ask(f"No repo here. Create a private GitHub repo and push {branch}? [Y/n] ")
-                    if answer.lower() in {"", "y", "yes"}:
-                        create = True
-                    else:
-                        _die("no repo; pass --repo https://<host>/<owner>/<name> or run inside a forge checkout")
+                    create = answer.lower() in {"", "y", "yes"}
                 if not create:
                     _die(
                         "no repo; pass --repo https://<host>/<owner>/<name>,"

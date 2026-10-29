@@ -2204,6 +2204,41 @@ def test_app_new_create_repo(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ca
     assert pushes == [["git", "push", "-u", "origin", "main"]]
 
 
+def test_repo_new_json_prints_repo_and_branch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys):
+    repo = tmp_path / "work"
+    _init_commit(repo, "main")
+    bare = _bare_repo(tmp_path / "bare")
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(cli, "_api_try", lambda *a, **k: (200, json.dumps({"repo": bare, "grant_url": ""})))
+    _env(monkeypatch)
+    main(["repo", "new", "--json"])
+    assert json.loads(capsys.readouterr().out) == {"repo": bare, "branch": "main"}
+
+
+def test_app_new_create_repo_json_is_one_document(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys):
+    """--json prints the app result only; the repo result never reaches stdout."""
+    repo = tmp_path / "work"
+    _init_commit(repo, "main")
+    monkeypatch.chdir(repo)
+    pushes: list = []
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        if path == "/api/v1/forges/github/repos":
+            return 200, json.dumps({"repo": "https://github.com/org/work", "grant_url": ""})
+        if path == "/api/v1/apps":
+            return 200, json.dumps({"app": {"name": body["name"], "repo": body["repo"], "ref": body["ref"]}})
+        raise AssertionError(path)
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    monkeypatch.setattr(cli.subprocess, "run", _fake_push(pushes))
+    _env(monkeypatch)
+    main(["app", "new", "--create-repo", "--no-deploy", "--json"])
+    out = capsys.readouterr().out
+    doc = json.loads(out)  # two documents would fail the parse
+    assert doc["app"]["repo"] == "https://github.com/org/work"
+    assert out.strip().startswith("{") and out.strip().endswith("}")
+
+
 def test_app_new_no_repo_names_create_repo(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys):
     repo = tmp_path / "work"
     _init_commit(repo, "main")
@@ -2226,8 +2261,8 @@ def test_app_new_asks_before_creating_a_repo(monkeypatch: pytest.MonkeyPatch, tm
     with pytest.raises(SystemExit):
         main(["app", "new", "--text"])
     err = capsys.readouterr().err
-    assert "no repo; pass --repo" in err
-    assert "--create-repo" not in err
+    assert "no repo" in err
+    assert "--create-repo" in err
 
     seen: list = []
     pushes: list = []
