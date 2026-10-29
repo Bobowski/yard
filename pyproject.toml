@@ -32,10 +32,10 @@ server = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Bobowski/yard"
-Repository = "https://github.com/Bobowski/yard"
-Issues = "https://github.com/Bobowski/yard/issues"
-Changelog = "https://github.com/Bobowski/yard/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/stariodev/yard"
+Repository = "https://github.com/stariodev/yard"
+Issues = "https://github.com/stariodev/yard/issues"
+Changelog = "https://github.com/stariodev/yard/blob/main/CHANGELOG.md"
 
 [project.scripts]
 yard = "app.cli.main:main"
