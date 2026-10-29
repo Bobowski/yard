@@ -17,7 +17,7 @@ die() {
   exit 1
 }
 
-origin="https://github.com/Bobowski/yard.git"
+origin="https://github.com/stariodev/yard.git"
 domain=""
 root="/srv/yard"
 public_port="8000"
@@ -31,7 +31,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     --remote)
-      [ $# -ge 2 ] || die "--remote needs a git url" "Hint: ./install.sh --remote https://github.com/Bobowski/yard.git"
+      [ $# -ge 2 ] || die "--remote needs a git url" "Hint: ./install.sh --remote https://github.com/stariodev/yard.git"
       origin="$2"
       shift 2
       ;;

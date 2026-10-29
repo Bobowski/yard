@@ -36,7 +36,7 @@ jobs:
           provenance: false
           sbom: false
           tags: |
-            ghcr.io/bobowski/yard:latest
-            ghcr.io/bobowski/yard:${{ github.ref_name }}
+            ghcr.io/stariodev/yard:latest
+            ghcr.io/stariodev/yard:${{ github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
