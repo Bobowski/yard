@@ -1,7 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.10.0
 
+- The repo moved to `github.com/stariodev/yard`. `install.sh` clones from there by default, and the image is `ghcr.io/stariodev/yard`.
+- The GitHub forge keeps one installation per account. Installing the Yard app on a second account no longer replaces the first: each repo gets a token from the installation that owns it, `yard status --full` shows one installation row per account, and `yard forge setup github` offers "Add another account". An older `state.json` with one installation still works and is rewritten on the next save.
+- Detect refusals say more: the nothing-found message lists Nushell and links to stario.dev/yard/what-runs#when-yard-refuses, and a Python repo with no entrypoint says `found a Stario app` or `found a Python app` instead of naming the marker file.
 - `yard status` no longer sends `GET /` to each app; the state comes from Podman and its healthcheck. The `answers` field is gone from the status API. An app without a healthcheck that does not listen now shows `up` — add a `HEALTHCHECK` ([stario.dev/yard/compose#healthchecks](https://stario.dev/yard/compose#healthchecks)).
 - `yard logs` printed every entry on one line: the text path joined the formatted entries with no separator, so `--tail 3` came back as a single glued line. Each journal entry is now its own line; the app page's log tail fixes the same way.
 - `yard logs` filters on the host with repeatable `--hide EXPR` and `--only EXPR`: `key=value` / `key!=value` globs and `key>n` / `key<n` on a JSON record (a top-level key first, then `attributes`), anything else a substring glob on the message. Lines that share a `trace_id` keep or drop as one trace; `lines`/`--tail` still count entries read before filters, and a JSON page's cursor stays the last entry read. With no flags the output is unchanged.
