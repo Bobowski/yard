@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ADAPTERS = {"caddy", "compose", "forges", "git", "journal", "podman", "store"}
 
 # Domain work. They call adapters and the store through the Yard object; never HTTP.
-SERVICES = {"apps", "binds", "doctor", "logfilter", "status"}
+SERVICES = {"apps", "binds", "doctor", "logfilter", "repos", "status"}
 
 # main is the composition root: the only file that may import the api.
 COMPOSITION = {"main", "api"}

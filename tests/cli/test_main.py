@@ -765,7 +765,7 @@ def test_login_warns_when_no_forge_is_connected(
     assert cli.FORGE_HINT in err
 
 
-def _checkout(path: Path, remote: str, branch: str = "main") -> None:
+def _init_commit(path: Path, branch: str = "main") -> None:
     env = {
         "GIT_AUTHOR_NAME": "Yard",
         "GIT_AUTHOR_EMAIL": "yard@example.com",
@@ -773,10 +773,34 @@ def _checkout(path: Path, remote: str, branch: str = "main") -> None:
         "GIT_COMMITTER_EMAIL": "yard@example.com",
     }
     subprocess.run(["git", "init", "-b", branch, str(path)], check=True, capture_output=True, env={**env})
-    subprocess.run(["git", "-C", str(path), "remote", "add", "origin", remote], check=True, capture_output=True)
     (path / "f.txt").write_text("x\n")
     subprocess.run(["git", "-C", str(path), "add", "."], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(path), "commit", "-m", "one"], check=True, capture_output=True, env=env)
+
+
+def _checkout(path: Path, remote: str, branch: str = "main") -> None:
+    _init_commit(path, branch)
+    subprocess.run(["git", "-C", str(path), "remote", "add", "origin", remote], check=True, capture_output=True)
+
+
+def _bare_repo(path: Path) -> str:
+    """A local bare repo the push can really reach. Returns the URL without .git."""
+    bare = f"{path}.git"
+    subprocess.run(["git", "init", "--bare", bare], check=True, capture_output=True)
+    return f"{path}"
+
+
+def _fake_push(calls: list, ok: bool = True):
+    """subprocess.run with the git push stubbed; every other call runs for real."""
+    real_run = subprocess.run
+
+    def fake_run(argv, *a, **k):
+        if list(argv)[:2] == ["git", "push"]:
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0 if ok else 1)
+        return real_run(argv, *a, **k)
+
+    return fake_run
 
 
 def test_remote_repo_spellings():
@@ -1440,7 +1464,12 @@ def test_forge_setup_github_manifest_page():
     }
     assert manifest["redirect_url"] == "http://127.0.0.1:9/callback"
     assert manifest["public"] is False
-    assert manifest["default_permissions"] == {"contents": "read", "statuses": "write", "metadata": "read"}
+    assert manifest["default_permissions"] == {
+        "contents": "read",
+        "statuses": "write",
+        "metadata": "read",
+        "repository_creation": "write",
+    }
     assert manifest["default_events"] == ["push"]
     assert "document.forms[0].submit()" in page
 
@@ -1464,7 +1493,7 @@ def test_forge_setup_github_manifest(monkeypatch: pytest.MonkeyPatch, capsys: py
     captured = capsys.readouterr()
     out = captured.out
     assert "Opening the GitHub App form. Keep the name or change it" in out
-    assert "Install the app on your account and pick the repos Yard may deploy." in out
+    assert "Install the app on your account and pick the repos Yard deploys." in out
     assert "https://github.com/apps/yard-127-0-0-1/installations/new" in out
     assert "Done." in out
     put = [call for call in calls if call[0] == "PUT"]
@@ -2025,3 +2054,209 @@ def test_app_new_env_put_failure_dies_cleanly(monkeypatch: pytest.MonkeyPatch, c
     err = capsys.readouterr().err
     assert "x was created, but its env was not saved" in err
     assert "yard env edit --app x" in err
+
+
+def test_repo_new(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture):
+    repo = tmp_path / "work"
+    _init_commit(repo, "main")
+    bare = _bare_repo(tmp_path / "bare")
+    monkeypatch.chdir(repo)
+    seen: list = []
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        seen.append((method, path, body))
+        return 200, json.dumps({"repo": bare, "grant_url": ""})
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    _env(monkeypatch)
+    main(["repo", "new", "--text"])
+    assert seen == [("POST", "/api/v1/forges/github/repos", {"name": "work"})]
+    remote = subprocess.check_output(["git", "-C", str(repo), "remote", "get-url", "origin"], text=True).strip()
+    assert remote == f"{bare}.git"
+    head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    pushed = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "origin/main"], text=True).strip()
+    assert pushed == head
+    out = capsys.readouterr().out
+    assert f"created {bare}" in out
+    assert "pushed main" in out
+
+
+def test_repo_new_dies_without_a_checkout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys):
+    monkeypatch.chdir(tmp_path)
+    _env(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(["repo", "new", "--text"])
+    assert "not a git checkout here" in capsys.readouterr().err
+
+
+def test_repo_new_dies_without_a_commit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys):
+    repo = tmp_path / "work"
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+    monkeypatch.chdir(repo)
+    _env(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(["repo", "new", "--text"])
+    assert "no commit yet" in capsys.readouterr().err
+
+
+def test_repo_new_dies_when_origin_exists(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys):
+    repo = tmp_path / "work"
+    _checkout(repo, "https://github.com/org/heldso.git", "main")
+    monkeypatch.chdir(repo)
+    _env(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(["repo", "new", "--text"])
+    err = capsys.readouterr().err
+    assert "origin is already https://github.com/org/heldso" in err
+    assert "yard app new uses it" in err
+
+
+def test_repo_new_dies_on_a_detached_head(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys):
+    repo = tmp_path / "work"
+    _init_commit(repo, "main")
+    sha = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    subprocess.run(["git", "-C", str(repo), "checkout", sha], check=True, capture_output=True)
+    monkeypatch.chdir(repo)
+    _env(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(["repo", "new", "--text"])
+    assert "detached HEAD" in capsys.readouterr().err
+
+
+def test_repo_new_a_push_failure_keeps_origin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys):
+    repo = tmp_path / "work"
+    _init_commit(repo, "main")
+    monkeypatch.chdir(repo)
+    pushes: list = []
+    monkeypatch.setattr(
+        cli,
+        "_api_try",
+        lambda *a, **k: (200, json.dumps({"repo": "https://github.com/org/heldso", "grant_url": ""})),
+    )
+    monkeypatch.setattr(cli.subprocess, "run", _fake_push(pushes, ok=False))
+    _env(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(["repo", "new", "--text"])
+    err = capsys.readouterr().err
+    assert "the push failed" in err
+    assert "git push -u origin main" in err
+    assert pushes == [["git", "push", "-u", "origin", "main"]]
+    remote = subprocess.check_output(["git", "-C", str(repo), "remote", "get-url", "origin"], text=True).strip()
+    assert remote == "https://github.com/org/heldso.git"
+
+
+def test_repo_new_warns_about_uncommitted_changes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys):
+    repo = tmp_path / "work"
+    _init_commit(repo, "main")
+    bare = _bare_repo(tmp_path / "bare")
+    (repo / "dirty.txt").write_text("dirty\n")
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(cli, "_api_try", lambda *a, **k: (200, json.dumps({"repo": bare, "grant_url": ""})))
+    _env(monkeypatch)
+    main(["repo", "new", "--text"])
+    assert "warning: uncommitted changes are not pushed" in capsys.readouterr().err
+
+
+def test_repo_new_warns_when_the_installation_cannot_see(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys):
+    repo = tmp_path / "work"
+    _init_commit(repo, "main")
+    bare = _bare_repo(tmp_path / "bare")
+    monkeypatch.chdir(repo)
+    grant = "https://github.com/settings/installations/101"
+    monkeypatch.setattr(cli, "_api_try", lambda *a, **k: (200, json.dumps({"repo": bare, "grant_url": grant})))
+    _env(monkeypatch)
+    main(["repo", "new", "--text"])
+    err = capsys.readouterr().err
+    assert f"warning: Yard cannot see {bare} yet" in err
+    assert grant in err
+
+
+def test_app_new_create_repo(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys):
+    repo = tmp_path / "work"
+    _init_commit(repo, "main")
+    monkeypatch.chdir(repo)
+    seen: list = []
+    pushes: list = []
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        seen.append((method, path, body))
+        if path == "/api/v1/forges/github/repos":
+            return 200, json.dumps({"repo": "https://github.com/org/work", "grant_url": ""})
+        if path == "/api/v1/apps":
+            return 200, json.dumps(
+                {"app": {"name": body["name"], "repo": body["repo"], "ref": body["ref"], "trigger": "push"}}
+            )
+        if path == "/api/v1/apps/work/deploy":
+            return 200, json.dumps({"deploy": {"status": "ok"}})
+        raise AssertionError(path)
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    monkeypatch.setattr(cli, "_follow_deploy", lambda *a: {"status": "ok"})
+    monkeypatch.setattr(cli.subprocess, "run", _fake_push(pushes))
+    _env(monkeypatch)
+    main(["app", "new", "--text", "--create-repo"])
+    assert seen[0] == ("POST", "/api/v1/forges/github/repos", {"name": "work"})
+    assert seen[1] == (
+        "POST",
+        "/api/v1/apps",
+        {"name": "work", "repo": "https://github.com/org/work", "ref": "main"},
+    )
+    assert pushes == [["git", "push", "-u", "origin", "main"]]
+
+
+def test_app_new_no_repo_names_create_repo(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys):
+    repo = tmp_path / "work"
+    _init_commit(repo, "main")
+    monkeypatch.chdir(repo)
+    _env(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(["app", "new", "--text"])
+    err = capsys.readouterr().err
+    assert "no repo" in err
+    assert "--create-repo" in err
+
+
+def test_app_new_asks_before_creating_a_repo(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys):
+    repo = tmp_path / "work"
+    _init_commit(repo, "main")
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(sys, "stdin", _TTY())
+    monkeypatch.setattr("builtins.input", _answers("n"))
+    _env(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(["app", "new", "--text"])
+    err = capsys.readouterr().err
+    assert "no repo; pass --repo" in err
+    assert "--create-repo" not in err
+
+    seen: list = []
+    pushes: list = []
+
+    def fake_api_try(client, method, path, body, timeout=None):
+        seen.append((method, path, body))
+        if path == "/api/v1/forges/github/repos":
+            return 200, json.dumps({"repo": "https://github.com/org/work", "grant_url": ""})
+        if path == "/api/v1/apps":
+            return 200, json.dumps({"app": {"name": body["name"], "repo": body["repo"], "ref": body["ref"]}})
+        return 200, json.dumps({"deploy": {"status": "ok"}})
+
+    monkeypatch.setattr(cli, "_api_try", fake_api_try)
+    monkeypatch.setattr(cli, "_follow_deploy", lambda *a: {"status": "ok"})
+    monkeypatch.setattr(cli.subprocess, "run", _fake_push(pushes))
+    monkeypatch.setattr("builtins.input", _answers(""))
+    main(["app", "new", "--text", "--app", "heldso"])
+    assert seen[0] == ("POST", "/api/v1/forges/github/repos", {"name": "heldso"})
+
+
+def test_app_new_create_repo_rejects_the_repo_flag(monkeypatch: pytest.MonkeyPatch, capsys):
+    _env(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(["app", "new", "--text", "--repo", "https://github.com/org/x", "--create-repo"])
+    assert "--create-repo and --repo do not mix" in capsys.readouterr().err
+
+
+def test_app_new_create_repo_rejects_a_repo_less_runs(monkeypatch: pytest.MonkeyPatch, capsys):
+    _env(monkeypatch)
+    with pytest.raises(SystemExit):
+        main(["app", "new", "--text", "--runs", "postgres:17", "--create-repo"])
+    assert "--create-repo" in capsys.readouterr().err

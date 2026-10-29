@@ -109,6 +109,10 @@ class Forge:
         """all or selected. Subclasses read their own field."""
         return ""
 
+    def account_type(self, installation: dict) -> str:
+        """User or Organization on GitHub. Subclasses read their own field."""
+        return ""
+
     def summary(self) -> dict:
         """What the API reports. Never a key, a secret, or a token."""
         return {
@@ -155,7 +159,12 @@ class Forge:
                 text = response.read().decode()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode(errors="replace").strip()[:400]
-            raise YardError(502, self.name, f"{self.name} {method} {path}: {exc.code} {detail}".rstrip()) from exc
+            raise YardError(
+                502,
+                self.name,
+                f"{self.name} {method} {path}: {exc.code} {detail}".rstrip(),
+                context={"status": exc.code},
+            ) from exc
         except urllib.error.URLError as exc:
             raise YardError(502, self.name, f"{self.name} {method} {path}: {exc.reason}") from exc
         try:
@@ -176,6 +185,7 @@ class Forge:
                 "id": str(item.get("id") or ""),
                 "account": _account(item),
                 "selection": self.selection(item),
+                "type": self.account_type(item),
             }
             for item in (found if isinstance(found, list) else [])
             if isinstance(item, dict)
@@ -215,6 +225,15 @@ class Forge:
 
     async def report(self, repo: str, sha: str, state: str, description: str, target_url: str = "") -> None:
         """A commit status on the forge. Only a forge with reports = True posts one."""
+
+    async def create_repo(self, owner: str, name: str) -> tuple[str, str]:
+        """(repo URL, grant URL) for a new private repo. A forge that cannot raises 501."""
+        raise YardError(
+            501,
+            "repo_unsupported",
+            f"{self.name} cannot create repos",
+            help_text="Create the repo on the forge, then run yard app new in its checkout.",
+        )
 
 
 class Origin(Forge):
@@ -371,6 +390,10 @@ class GitHub(Forge):
     def selection(self, installation: dict) -> str:
         return str(installation.get("repository_selection") or "")
 
+    def account_type(self, installation: dict) -> str:
+        account = installation.get("account")
+        return str(account.get("type") or "") if isinstance(account, dict) else ""
+
     def summary(self) -> dict:
         summary = super().summary()
         # The slug names the public app page; it is not a secret.
@@ -433,6 +456,78 @@ class GitHub(Forge):
         if target_url:
             body["target_url"] = target_url
         await self._call("POST", f"/repos/{full}/statuses/{sha}", await self.token(repo), body)
+
+    async def create_repo(self, owner: str, name: str) -> tuple[str, str]:
+        """A private repo under owner: POST /user/repos or /orgs/<owner>/repos.
+
+        The grant URL names the installation settings page when a "selected
+        repos" installation cannot see the repo it just made.
+        """
+        probe = f"https://{self.host}/{owner}/x"
+        installation = self.installation_for(probe)
+        if installation is None:
+            raise YardError(
+                404,
+                "no_installation",
+                f"the Yard app is not installed on {owner}",
+                help_text=f"Install the Yard GitHub App on {owner}.",
+            )
+        if not installation.get("type"):
+            # A state saved before types needs one refresh to learn the account kind.
+            await self.find_installations()
+            installation = self.installation_for(probe) or {}
+        path = "/user/repos" if installation.get("type") == "User" else f"/orgs/{owner}/repos"
+        repo_url = f"https://{self.host}/{owner}/{name}"
+        try:
+            body = await self._call(
+                "POST",
+                path,
+                await self.token(repo_url),
+                {"name": name, "private": True, "auto_init": False},
+            )
+        except YardError as exc:
+            status = exc.context.get("status")
+            if status == 422:
+                raise YardError(
+                    409,
+                    "repo_exists",
+                    f"{owner}/{name} exists",
+                    help_text=(
+                        "Pick another name, or use the repo:"
+                        f" git remote add origin https://github.com/{owner}/{name}.git"
+                    ),
+                ) from exc
+            if status in (403, 404):
+                raise YardError(
+                    403,
+                    "repo_permission",
+                    "the Yard GitHub App cannot create repos",
+                    help_text=(
+                        "In the app's GitHub settings, set Repository creation to Read and write,"
+                        " then accept the new permission on the installation."
+                    ),
+                ) from exc
+            raise
+        data = body if isinstance(body, dict) else {}
+        full = str(data.get("full_name") or f"{owner}/{name}")
+        repo_url = f"https://{self.host}/{full}"
+        # A repo made with repository_creation lands in the app's account set on
+        # paper; a "selected repos" installation still cannot see it. Read the
+        # repo back with a fresh token and name the grant page when it is hidden.
+        self._tokens.pop(str(installation.get("id") or ""), None)
+        try:
+            await self._call("GET", f"/repos/{full}", await self.token(repo_url))
+        except YardError as exc:
+            if exc.context.get("status") not in (403, 404):
+                raise
+            ident = str(installation.get("id") or "")
+            if installation.get("type") == "User":
+                grant_url = f"https://github.com/settings/installations/{ident}"
+            else:
+                grant_url = f"https://github.com/organizations/{owner}/settings/installations/{ident}"
+        else:
+            grant_url = ""
+        return repo_url, grant_url
 
 
 def _account(installation: dict) -> str:

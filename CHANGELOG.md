@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.11.0
+
+- `yard repo new` creates a private GitHub repo for the checkout and pushes it: a commit, no `origin`, and a connected GitHub forge are all it asks. `yard app new --create-repo` does the same inline, and on a terminal `yard app new` offers it when no repo is found.
+- New route `POST /api/v1/forges/{name}/repos` takes `{"name", "owner?"}` and answers `{"repo", "grant_url"}`; the grant URL names the installation settings page when a selected-repos installation cannot see the repo it just made.
+- New GitHub setups request `repository_creation: write`. An existing host adds it in the app's GitHub settings and accepts it on the installation; until then the route answers 403 `repo_permission`.
+- Yard never deletes a repo.
+- The GitHub install step prints one line everywhere: "Install the app on your account and pick the repos Yard deploys."
+
 ## 0.10.0
 
 - The repo moved to `github.com/stariodev/yard`. `install.sh` clones from there by default, and the image is `ghcr.io/stariodev/yard`.

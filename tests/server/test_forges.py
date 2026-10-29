@@ -163,16 +163,16 @@ async def test_find_installations_saves_every_account(api, tmp_path):
     origin.save(app_id="app_1")
     found = await origin.find_installations()
     assert found == [
-        {"id": "ins_1", "account": "org", "selection": "all"},
-        {"id": "ins_2", "account": "other", "selection": "selected"},
+        {"id": "ins_1", "account": "org", "selection": "all", "type": ""},
+        {"id": "ins_2", "account": "other", "selection": "selected", "type": ""},
     ]
     # Origin's target.slug is the account.
     state = json.loads((tmp_path / "origin" / "state.json").read_text())
     assert state == {
         "app_id": "app_1",
         "installations": [
-            {"id": "ins_1", "account": "org", "selection": "all"},
-            {"id": "ins_2", "account": "other", "selection": "selected"},
+            {"id": "ins_1", "account": "org", "selection": "all", "type": ""},
+            {"id": "ins_2", "account": "other", "selection": "selected", "type": ""},
         ],
     }
 
@@ -202,6 +202,7 @@ async def test_a_bad_status_is_a_yard_error(api):
         await origin._call("GET", "/missing", "bearer")
     assert caught.value.status == 502
     assert caught.value.code == "origin"
+    assert caught.value.context["status"] == 404
 
 
 async def test_origin_connect_saves_after_the_check(api, tmp_path):
@@ -295,6 +296,8 @@ class _GhBox:
         self.bodies: list[tuple[str, dict]] = []
         self.token_seconds = 3600.0
         self.fail_app = False
+        self.repo_status = 201
+        self.repo_visible = True
         self.installations: list[dict] = [
             {"id": 101, "app_id": 42, "repository_selection": "all", "account": {"login": "org"}}
         ]
@@ -324,6 +327,21 @@ def _github_handler(box: _GhBox):
                 length = int(self.headers.get("content-length") or 0)
                 box.bodies.append((self.path, json.loads(self.rfile.read(length) or b"{}")))
                 _send(self, 201, {"state": "created"})
+                return
+            if method == "POST" and (
+                self.path == "/user/repos" or (self.path.startswith("/orgs/") and self.path.endswith("/repos"))
+            ):
+                length = int(self.headers.get("content-length") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+                box.bodies.append((self.path, body))
+                if box.repo_status >= 300:
+                    _send(self, box.repo_status, {"message": "nope"})
+                    return
+                owner = "me" if self.path == "/user/repos" else self.path.split("/")[2]
+                _send(self, box.repo_status, {"full_name": f"{owner}/{body.get('name')}"})
+                return
+            if method == "GET" and self.path.startswith("/repos/") and "/statuses/" not in self.path:
+                _send(self, 200 if box.repo_visible else 404, {"full_name": self.path[len("/repos/") :]})
                 return
             _send(self, 404, {"message": "not found"})
 
@@ -407,13 +425,23 @@ async def test_github_installations_save_every_account(gh_api):
     github.save(app_id="42")
     _write_key(github.dir, _rsa_pem())
     box.installations = [
-        {"id": 101, "app_id": 42, "repository_selection": "all", "account": {"login": "Bobowski"}},
-        {"id": 202, "app_id": 42, "repository_selection": "all", "account": {"login": "stariodev"}},
+        {
+            "id": 101,
+            "app_id": 42,
+            "repository_selection": "all",
+            "account": {"login": "Bobowski", "type": "User"},
+        },
+        {
+            "id": 202,
+            "app_id": 42,
+            "repository_selection": "all",
+            "account": {"login": "stariodev", "type": "Organization"},
+        },
     ]
     found = await github.find_installations()
     assert found == [
-        {"id": "101", "account": "Bobowski", "selection": "all"},
-        {"id": "202", "account": "stariodev", "selection": "all"},
+        {"id": "101", "account": "Bobowski", "selection": "all", "type": "User"},
+        {"id": "202", "account": "stariodev", "selection": "all", "type": "Organization"},
     ]
     assert github.installations == found
 
@@ -664,3 +692,109 @@ async def test_token_without_an_installation_raises(gh_api, tmp_path):
     github.save(app_id="42")
     with pytest.raises(YardError):
         await github.token()
+
+
+# --- GitHub.create_repo ------------------------------------------------------
+
+
+def _gh_install(github: GitHub, account: str, kind: str, ident: str = "101") -> None:
+    github.save(installations=[{"id": ident, "account": account, "selection": "all", "type": kind}])
+
+
+async def test_github_create_repo_a_user_posts_to_user_repos(gh_api, tmp_path):
+    github, box = gh_api
+    _gh_wire(github, tmp_path)
+    _gh_install(github, "me", "User")
+    repo, grant = await github.create_repo("me", "heldso")
+    assert repo == "https://github.com/me/heldso"
+    assert grant == ""
+    assert box.bodies == [("/user/repos", {"name": "heldso", "private": True, "auto_init": False})]
+
+
+async def test_github_create_repo_an_org_posts_to_orgs(gh_api, tmp_path):
+    github, box = gh_api
+    _gh_wire(github, tmp_path)
+    _gh_install(github, "org", "Organization")
+    repo, grant = await github.create_repo("org", "heldso")
+    assert repo == "https://github.com/org/heldso"
+    assert grant == ""
+    assert box.bodies == [("/orgs/org/repos", {"name": "heldso", "private": True, "auto_init": False})]
+
+
+async def test_github_create_repo_a_422_is_repo_exists(gh_api, tmp_path):
+    github, box = gh_api
+    _gh_wire(github, tmp_path)
+    _gh_install(github, "org", "Organization")
+    box.repo_status = 422
+    with pytest.raises(YardError) as caught:
+        await github.create_repo("org", "heldso")
+    assert caught.value.status == 409
+    assert caught.value.code == "repo_exists"
+
+
+async def test_github_create_repo_a_403_is_repo_permission(gh_api, tmp_path):
+    github, box = gh_api
+    _gh_wire(github, tmp_path)
+    _gh_install(github, "org", "Organization")
+    box.repo_status = 403
+    with pytest.raises(YardError) as caught:
+        await github.create_repo("org", "heldso")
+    assert caught.value.status == 403
+    assert caught.value.code == "repo_permission"
+
+
+async def test_github_create_repo_a_hidden_user_repo_names_the_grant(gh_api, tmp_path):
+    github, box = gh_api
+    _gh_wire(github, tmp_path)
+    _gh_install(github, "me", "User")
+    box.repo_visible = False
+    repo, grant = await github.create_repo("me", "heldso")
+    assert repo == "https://github.com/me/heldso"
+    assert grant == "https://github.com/settings/installations/101"
+
+
+async def test_github_create_repo_a_hidden_org_repo_names_the_grant(gh_api, tmp_path):
+    github, box = gh_api
+    _gh_wire(github, tmp_path)
+    _gh_install(github, "org", "Organization")
+    box.repo_visible = False
+    repo, grant = await github.create_repo("org", "heldso")
+    assert repo == "https://github.com/org/heldso"
+    assert grant == "https://github.com/organizations/org/settings/installations/101"
+
+
+async def test_github_create_repo_a_legacy_state_refreshes_the_installations(gh_api, tmp_path):
+    """A saved entry with no type triggers one find_installations before the POST."""
+    github, box = gh_api
+    _gh_wire(github, tmp_path)  # the saved entry has no type
+    box.installations = [
+        {
+            "id": 101,
+            "app_id": 42,
+            "repository_selection": "all",
+            "account": {"login": "org", "type": "Organization"},
+        }
+    ]
+    repo, _grant = await github.create_repo("org", "heldso")
+    assert repo == "https://github.com/org/heldso"
+    assert box.bodies == [("/orgs/org/repos", {"name": "heldso", "private": True, "auto_init": False})]
+    lookups = [call for call in box.calls if call[0] == "GET" and call[1].startswith("/app/installations")]
+    assert len(lookups) == 1
+
+
+async def test_github_create_repo_needs_an_installation(gh_api, tmp_path):
+    github, _box = gh_api
+    _gh_wire(github, tmp_path)
+    _gh_install(github, "me", "User")
+    with pytest.raises(YardError) as caught:
+        await github.create_repo("someone-else", "heldso")
+    assert caught.value.status == 404
+    assert caught.value.code == "no_installation"
+
+
+async def test_origin_cannot_create_repos(api):
+    origin, _box = api
+    with pytest.raises(YardError) as caught:
+        await origin.create_repo("org", "heldso")
+    assert caught.value.status == 501
+    assert caught.value.code == "repo_unsupported"
