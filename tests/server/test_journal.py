@@ -689,3 +689,81 @@ async def test_logs_follow_filters_with_the_same_rules(yard_filtered):
     ]
     # The text line decides at once and may print ahead of the held trace.
     assert names == ["boom traceback", "db.query", "GET /notes"]
+
+
+_TRICKLE_JOURNALCTL = """\
+import json
+import sys
+import time
+
+with open({argv_log!r}, "a") as log:
+    log.write(" ".join(sys.argv[1:]) + "\\n")
+lines = open({data!r}).read().splitlines()
+print(lines[0])
+sys.stdout.flush()
+for line in lines[1:]:
+    time.sleep({delay})
+    print(line)
+    sys.stdout.flush()
+"""
+
+
+@pytest.fixture
+async def yard_trickle(tmp_path, monkeypatch):
+    """The API over a journalctl that emits entries with a delay between them."""
+    micros = int(WHEN.timestamp() * 1_000_000)
+    entries = [
+        {
+            "__CURSOR": f"cursor-{n}",
+            "__REALTIME_TIMESTAMP": str(micros + n * 1_000_000),
+            "CONTAINER_NAME": "heldso-app-1",
+            "MESSAGE": message,
+        }
+        for n, message in enumerate(
+            [
+                json.dumps({"name": "slow.child", "trace_id": "t-slow", "span_id": "c1", "parent_id": "r1"}),
+                *[json.dumps({"name": f"tick {n}"}) for n in range(1, 9)],
+            ]
+        )
+    ]
+    data = tmp_path / "journal.jsonl"
+    data.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+    argv_log = tmp_path / "argv"
+    script = tmp_path / "journalctl"
+    script.write_text(
+        f"#!{sys.executable}\n" + _TRICKLE_JOURNALCTL.format(argv_log=str(argv_log), data=str(data), delay=0.45)
+    )
+    script.chmod(0o755)
+    (tmp_path / "journal").mkdir()
+    monkeypatch.setenv("YARD_ROOT", str(tmp_path))
+    monkeypatch.setenv("YARD_SKIP_DEPLOY", "1")
+    monkeypatch.setenv("YARD_BOOT", "0")
+    monkeypatch.setenv("YARD_PODMAN_BIN", "yard-podman-missing")
+    monkeypatch.setenv("YARD_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.setenv("YARD_JOURNALCTL_BIN", str(script))
+    async with TestClient(bootstrap, request_timeout=15) as client:
+        token = (tmp_path / "tokens" / "admin.token").read_text().strip()
+        yield client, token, argv_log
+
+
+async def test_logs_filtered_text_keeps_one_entry_per_line(yard_filtered):
+    client, token, _argv = yard_filtered
+    res = await client.get("/api/v1/logs?container=heldso-app-1&hide=t-health", headers=auth(token))
+    assert res.status_code == 200
+    lines = res.text.splitlines()
+    assert len(lines) == 4
+    assert all(line.count("heldso-app-1") == 1 for line in lines)
+
+
+async def test_logs_follow_expires_a_held_trace_during_traffic(yard_trickle):
+    client, token, _argv = yard_trickle
+    res = await client.get(
+        "/api/v1/logs?container=heldso-app-1&follow=1&hide=zzz",
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+    names = [json.loads(line.split(" ", 2)[2])["name"] for line in res.text.splitlines()]
+    assert "slow.child" in names
+    # The held trace ages out mid-stream: the last line is a tick, not the
+    # child a drain would have flushed after every other line.
+    assert names[-1] == "tick 8"

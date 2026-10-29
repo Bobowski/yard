@@ -381,18 +381,20 @@ async def _stream_journal(
                 try:
                     raw = await asyncio.wait_for(proc.stdout.readline(), 0.5)
                 except TimeoutError:
-                    for line in held.expire(time.monotonic()):
-                        w.write(line.encode() + b"\n")
-                        await w.drain()
-                    continue
-                if not raw or c.disconnected:
+                    raw = None
+                if raw == b"" or c.disconnected:
                     break
-                for entry in journal.entries(raw):
-                    if not (line := journal.format_line(entry)):
-                        continue
-                    for out in held.push(line, journal.message_text(entry), time.monotonic()):
-                        w.write(out.encode() + b"\n")
-                        await w.drain()
+                if raw:
+                    for entry in journal.entries(raw):
+                        if not (line := journal.format_line(entry)):
+                            continue
+                        for out in held.push(line, journal.message_text(entry), time.monotonic()):
+                            w.write(out.encode() + b"\n")
+                            await w.drain()
+                # Expire on every iteration: busy output must not starve a held trace.
+                for line in held.expire(time.monotonic()):
+                    w.write(line.encode() + b"\n")
+                    await w.drain()
             for line in held.drain():
                 w.write(line.encode() + b"\n")
                 await w.drain()
@@ -704,7 +706,7 @@ class HostPage:
                 self.yard.config, [match], lines=lines, since=since, until=until, after=after
             )
             keep = log_filter.select([journal.message_text(entry) for entry in entries])
-            text = "".join(
+            text = "\n".join(
                 line
                 for entry, shown in zip(entries, keep, strict=True)
                 if shown and (line := journal.format_line(entry))
