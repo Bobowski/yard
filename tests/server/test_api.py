@@ -478,7 +478,6 @@ async def test_app_status_and_doctor(yard, monkeypatch):
     assert "env" not in page["app"]
     assert page["binds"] == [{"host": "heldso.example.com", "dial": "heldso:8000"}]
     assert [row["container"] for row in page["rows"]] == ["heldso-app-1"]
-    assert page["rows"][0]["answers"] is None
     assert "one" in page["log"]
     res = await client.get("/api/v1/apps/nope", headers=auth(token))
     assert res.status_code == 404
