@@ -1073,7 +1073,7 @@ def test_forge_setup_polls_and_warns(monkeypatch: pytest.MonkeyPatch, capsys: py
     assert "Done." in captured.out
     assert len(reads) >= 3
     assert "warning: origin GET /app/installations: refused" in captured.err
-    assert "installation covers selected repos only" in captured.err
+    assert "installation covers selected repos only; yard repo new needs all repositories" in captured.err
 
 
 def test_forge_setup_origin_reprompts_a_bad_app_id(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
