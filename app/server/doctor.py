@@ -96,18 +96,7 @@ async def _forge_rows(yard: Yard) -> list[Check]:
             _check(f"{forge.name} webhook", (True, _ago(forge.last_delivery))),
             _check(f"{forge.name} check", (True, _ago(forge.last_check))),
         ]
-        if forge.reports:
-            rows.append(_check(f"{forge.name} status", _forge_report(forge)))
     return rows
-
-
-def _forge_report(forge: Forge) -> tuple[bool, str]:
-    """The last commit status report, or its error. A 403 wants the grant."""
-    error = forge.last_report_error
-    if error:
-        hint = "; grant Commit statuses: Read and write" if " 403" in error else ""
-        return False, f"{error}{hint}"
-    return True, _ago(forge.last_report)
 
 
 async def _forge_app(forge: Forge) -> tuple[bool, str]:

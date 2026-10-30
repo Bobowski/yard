@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from app.server import apps, binds, compose, git, journal, main, sources
+from app.server import apps, binds, compose, git, journal, sources
 from app.server.forges import Forge, GitHub, Origin
 from app.server.podman import Podman
 from app.server.store import Config, Deployed, Store, read_deployed
@@ -490,23 +490,6 @@ class _Podman(Podman):
         return "[]"
 
 
-def _reports(monkeypatch: pytest.MonkeyPatch, error: Exception | None = None) -> list[tuple]:
-    calls: list[tuple] = []
-
-    async def fake_report(self, repo, sha, state, description, target_url=""):
-        if error is not None:
-            raise error
-        calls.append((repo, sha, state, description, target_url))
-
-    monkeypatch.setattr(GitHub, "report", fake_report)
-    return calls
-
-
-async def _drain() -> None:
-    others = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
-    await asyncio.gather(*others, return_exceptions=True)
-
-
 def _deploy_github(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str = "heldso", apply: _Apply | None = None, **kw
 ) -> tuple[Yard, _Apply]:
@@ -525,116 +508,10 @@ def _deploy_github(
     return yard, recorder
 
 
-async def test_deploy_reports_pending_then_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    yard, _recorder = _deploy_github(tmp_path, monkeypatch)
-    calls = _reports(monkeypatch)
-    head = git.head(yard.config.clone("heldso"))
-    outcome = await apps.deploy(yard, "heldso")
-    await _drain()
-    assert outcome.status == "ok"
-    assert calls == [
-        ("https://github.com/org/app", head, "pending", f"deploying {head[:12]}", ""),
-        ("https://github.com/org/app", head, "success", "live", ""),
-    ]
-
-
-async def test_deploy_report_links_the_public_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    yard, _recorder = _deploy_github(tmp_path, monkeypatch)
-    calls = _reports(monkeypatch)
-    yard.caddy = FakeCaddy([_route("heldso.example.com", "heldso-app-1:8000")])
-    outcome = await apps.deploy(yard, "heldso")
-    await _drain()
-    assert outcome.status == "ok"
-    assert calls[-1][2:] == ("success", "live on heldso.example.com", "https://heldso.example.com")
-
-
-async def test_deploy_reports_pending_then_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    yard, _recorder = _deploy_github(tmp_path, monkeypatch, apply=_Apply(code=1, text="build failed\n"))
-    calls = _reports(monkeypatch)
-    outcome = await apps.deploy(yard, "heldso")
-    await _drain()
-    assert outcome.status == "failed"
-    assert [call[2] for call in calls] == ["pending", "failure"]
-
-
-async def test_a_skipped_deploy_reports_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    yard = make_yard(tmp_path, skip=True)
-    yard.store.create_app("heldso", "https://github.com/org/app")
-    calls = _reports(monkeypatch)
-    outcome = await apps.deploy(yard, "heldso")
-    await _drain()
-    assert outcome.status == "skipped"
-    assert calls == []
-
-
-async def test_a_sync_failure_reports_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    yard, _recorder = _deploy_github(tmp_path, monkeypatch)
-    calls = _reports(monkeypatch)
-
-    async def broken_sync(_clone, url, ref, token=""):
-        raise YardError(502, "git", "git fetch: the remote is down")
-
-    monkeypatch.setattr(git, "sync", broken_sync)
-    outcome = await apps.deploy(yard, "heldso")
-    await _drain()
-    assert outcome.status == "failed"
-    assert calls == []
-
-
-async def test_a_report_failure_never_fails_the_deploy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    yard, _recorder = _deploy_github(tmp_path, monkeypatch)
-    _reports(monkeypatch, error=YardError(502, "github", "github POST /repos/org/app/statuses/x: 403"))
-    outcome = await apps.deploy(yard, "heldso")
-    await _drain()
-    assert outcome.status == "ok"
-    forge = yard.forge("https://github.com/org/app")
-    assert "403" in forge.last_report_error
-
-
-async def test_report_skips_a_repo_the_installation_does_not_own(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    yard = make_yard(tmp_path)
-    forge = yard.forge("https://github.com/Bobowski/yard")
-    forge.save(installation_id="101", account="org")
-    calls = _reports(monkeypatch)
-    await apps.report(forge, "https://github.com/Bobowski/yard", "abc123", "success", "live")
-    assert calls == []
-
-
-async def test_report_still_posts_for_an_owned_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    yard = make_yard(tmp_path)
-    forge = yard.forge("https://github.com/org/app")
-    forge.save(installation_id="101", account="org")
-    calls = _reports(monkeypatch)
-    await apps.report(forge, "https://github.com/org/app", "abc123", "success", "live")
-    assert calls == [("https://github.com/org/app", "abc123", "success", "live", "")]
-
-
 async def test_a_yard_self_deploy_stays_pending(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yard, _recorder = _deploy_github(tmp_path, monkeypatch, name="yard")
-    calls = _reports(monkeypatch)
     outcome = await apps.deploy(yard, "yard")
-    await _drain()
     assert outcome.status == "pending"
-    assert [call[2] for call in calls] == ["pending"]
-
-
-async def test_boot_report_marks_the_running_sha_live(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    yard = make_yard(tmp_path)
-    yard.store.create_app("yard", "https://github.com/org/yard")
-    _connect(monkeypatch)
-    calls = _reports(monkeypatch)
-    yard.config = replace(yard.config, sha="c" * 40)
-    await main._boot_report(yard)
-    assert calls == [("https://github.com/org/yard", "c" * 40, "success", "live", "")]
-
-
-async def test_boot_report_says_nothing_without_a_sha_or_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    yard = make_yard(tmp_path)
-    yard.store.create_app("yard", "")
-    _connect(monkeypatch)
-    calls = _reports(monkeypatch)
-    await main._boot_report(yard)
-    assert calls == []
 
 
 async def test_deploy_reuses_a_local_image(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

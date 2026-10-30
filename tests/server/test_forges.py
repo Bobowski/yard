@@ -308,7 +308,7 @@ class _GhBox:
         self.token_seconds = 3600.0
         self.fail_app = False
         self.repo_status = 201
-        self.repo_visible = True
+        self.token_status = 200
         self.installations: list[dict] = [
             {"id": 101, "app_id": 42, "repository_selection": "all", "account": {"login": "org"}}
         ]
@@ -331,13 +331,15 @@ def _github_handler(box: _GhBox):
                 _send(self, 200, box.installations)
                 return
             if method == "POST" and self.path.endswith("/access_tokens"):
+                length = int(self.headers.get("content-length") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+                if body:
+                    box.bodies.append((self.path, body))
+                if body and box.token_status >= 300:
+                    _send(self, box.token_status, {"message": "nope"})
+                    return
                 expires = datetime.now(UTC) + timedelta(seconds=box.token_seconds)
                 _send(self, 200, {"token": f"ghs_{len(box.calls)}", "expires_at": _rfc(expires)})
-                return
-            if method == "POST" and self.path.startswith("/repos/") and "/statuses/" in self.path:
-                length = int(self.headers.get("content-length") or 0)
-                box.bodies.append((self.path, json.loads(self.rfile.read(length) or b"{}")))
-                _send(self, 201, {"state": "created"})
                 return
             if method == "POST" and (
                 self.path == "/user/repos" or (self.path.startswith("/orgs/") and self.path.endswith("/repos"))
@@ -350,9 +352,6 @@ def _github_handler(box: _GhBox):
                     return
                 owner = "me" if self.path == "/user/repos" else self.path.split("/")[2]
                 _send(self, box.repo_status, {"full_name": f"{owner}/{body.get('name')}"})
-                return
-            if method == "GET" and self.path.startswith("/repos/") and "/statuses/" not in self.path:
-                _send(self, 200 if box.repo_visible else 404, {"full_name": self.path[len("/repos/") :]})
                 return
             _send(self, 404, {"message": "not found"})
 
@@ -565,14 +564,6 @@ async def test_github_url():
     assert clone_url("https://github.com/org/heldso") == "https://github.com/org/heldso.git"
 
 
-def test_reports_flags(tmp_path):
-    from app.server.forges import Forge
-
-    assert Forge.reports is False
-    assert Origin.reports is False
-    assert GitHub.reports is True
-
-
 def test_owns_without_a_saved_account_allows_everything(tmp_path):
     """A legacy install with no account keeps owning every repo."""
     github = GitHub(tmp_path / "github")
@@ -616,61 +607,6 @@ def test_owns_picks_the_installation_for_the_owner(tmp_path):
     assert not github.owns("https://github.com/other/yard")
 
 
-async def test_github_report_posts_a_commit_status(gh_api, tmp_path):
-    github, box = gh_api
-    _gh_wire(github, tmp_path)
-    sha = "d" * 40
-    await github.report("https://github.com/org/heldso", sha, "success", "live", "https://heldso.example.com")
-    method, path, headers = box.calls[-1]
-    assert method == "POST"
-    assert path == f"/repos/org/heldso/statuses/{sha}"
-    assert {key.lower(): value for key, value in headers.items()}["authorization"].startswith("Bearer ghs_")
-    assert box.bodies[-1] == (
-        path,
-        {
-            "state": "success",
-            "description": "live",
-            "context": "yard",
-            "target_url": "https://heldso.example.com",
-        },
-    )
-
-
-async def test_github_report_uses_the_repos_own_installation(gh_api, tmp_path):
-    github, box = gh_api
-    _write_key(tmp_path / "github", _rsa_pem())
-    github.save(
-        app_id="42",
-        installations=[
-            {"id": "101", "account": "Bobowski", "selection": "all"},
-            {"id": "202", "account": "stariodev", "selection": "all"},
-        ],
-        webhook_secret=SECRET,
-    )
-    await github.report("https://github.com/stariodev/tool", "abc123", "success", "live")
-    posts = [path for method, path, _h in box.calls if method == "POST"]
-    assert posts == ["/app/installations/202/access_tokens", "/repos/stariodev/tool/statuses/abc123"]
-
-
-async def test_github_report_strips_git_truncates_and_skips_the_url(gh_api, tmp_path):
-    github, box = gh_api
-    _gh_wire(github, tmp_path)
-    await github.report("https://github.com/org/heldso.git", "abc123", "pending", "x" * 200)
-    _method, path, _headers = box.calls[-1]
-    assert path == "/repos/org/heldso/statuses/abc123"
-    body = box.bodies[-1][1]
-    assert body["description"] == "x" * 140
-    assert body["context"] == "yard"
-    assert "target_url" not in body
-
-
-async def test_origin_report_is_a_noop(api):
-    origin, box = api
-    _wire(origin)
-    await origin.report("https://origin.cursor.com/org/heldso", "abc123", "success", "live")
-    assert box.calls == []
-
-
 async def test_token_mints_per_installation_for_the_repo_owner(gh_api, tmp_path):
     github, box = gh_api
     _write_key(tmp_path / "github", _rsa_pem())
@@ -705,40 +641,46 @@ async def test_token_without_an_installation_raises(gh_api, tmp_path):
         await github.token()
 
 
-# --- GitHub.create_repo ------------------------------------------------------
+# --- create_repo and push_token -----------------------------------------------
 
 
-def _gh_install(github: GitHub, account: str, kind: str, ident: str = "101") -> None:
-    github.save(installations=[{"id": ident, "account": account, "selection": "all", "type": kind}])
+def _gh_install(box: _GhBox, account: str, kind: str, selection: str = "all") -> None:
+    """The installation that the next find_installations reads from the fake GitHub."""
+    box.installations = [
+        {"id": 101, "app_id": 42, "repository_selection": selection, "account": {"login": account, "type": kind}}
+    ]
 
 
-def _wire_forge(forge: Forge, tmp_path: Path) -> None:
+def _wire_forge(forge: Forge, box: object, tmp_path: Path) -> None:
     """A saved app and one "all" installation on account org."""
-    if isinstance(forge, GitHub):
+    if isinstance(forge, GitHub) and isinstance(box, _GhBox):
         _gh_wire(forge, tmp_path)
-        _gh_install(forge, "org", "Organization")
+        _gh_install(box, "org", "Organization")
     elif isinstance(forge, Origin):
         _wire(forge)
 
 
-async def test_github_create_repo_a_user_posts_to_user_repos(gh_api, tmp_path):
+@pytest.mark.parametrize(
+    "account, kind, path",
+    [
+        pytest.param("me", "User", "/user/repos", id="user"),
+        pytest.param("org", "Organization", "/orgs/org/repos", id="org"),
+    ],
+)
+async def test_github_create_repo_posts_for_the_account_kind(gh_api, tmp_path, account, kind, path):
     github, box = gh_api
     _gh_wire(github, tmp_path)
-    _gh_install(github, "me", "User")
-    repo, grant = await github.create_repo("me", "heldso")
-    assert repo == "https://github.com/me/heldso"
-    assert grant == ""
-    assert box.bodies == [("/user/repos", {"name": "heldso", "private": True, "auto_init": False})]
+    _gh_install(box, account, kind)
+    assert await github.create_repo(account, "heldso") == f"https://github.com/{account}/heldso"
+    assert box.bodies == [(path, {"name": "heldso", "private": True, "auto_init": False})]
 
 
-async def test_github_create_repo_an_org_posts_to_orgs(gh_api, tmp_path):
+async def test_github_create_repo_finds_a_new_installation(gh_api, tmp_path):
+    """The saved state knows only org; the refresh finds the account installed a minute ago."""
     github, box = gh_api
     _gh_wire(github, tmp_path)
-    _gh_install(github, "org", "Organization")
-    repo, grant = await github.create_repo("org", "heldso")
-    assert repo == "https://github.com/org/heldso"
-    assert grant == ""
-    assert box.bodies == [("/orgs/org/repos", {"name": "heldso", "private": True, "auto_init": False})]
+    _gh_install(box, "fresh", "Organization")
+    assert await github.create_repo("fresh", "heldso") == "https://github.com/fresh/heldso"
 
 
 @pytest.mark.parametrize(
@@ -750,7 +692,7 @@ async def test_github_create_repo_an_org_posts_to_orgs(gh_api, tmp_path):
 )
 async def test_create_repo_a_taken_name_is_repo_exists(request, fixture, forge_status, tmp_path):
     forge, box = request.getfixturevalue(fixture)
-    _wire_forge(forge, tmp_path)
+    _wire_forge(forge, box, tmp_path)
     box.repo_status = forge_status
     with pytest.raises(YardError) as caught:
         await forge.create_repo("org", "heldso")
@@ -762,7 +704,7 @@ async def test_create_repo_a_taken_name_is_repo_exists(request, fixture, forge_s
 @pytest.mark.parametrize("fixture", ["api", "gh_api"])
 async def test_create_repo_a_403_is_repo_permission(request, fixture, tmp_path):
     forge, box = request.getfixturevalue(fixture)
-    _wire_forge(forge, tmp_path)
+    _wire_forge(forge, box, tmp_path)
     box.repo_status = 403
     with pytest.raises(YardError) as caught:
         await forge.create_repo("org", "heldso")
@@ -771,79 +713,82 @@ async def test_create_repo_a_403_is_repo_permission(request, fixture, tmp_path):
     assert caught.value.help_text == forge.create_help
 
 
-async def test_github_create_repo_a_hidden_user_repo_names_the_grant(gh_api, tmp_path):
-    github, box = gh_api
-    _gh_wire(github, tmp_path)
-    _gh_install(github, "me", "User")
-    box.repo_visible = False
-    repo, grant = await github.create_repo("me", "heldso")
-    assert repo == "https://github.com/me/heldso"
-    assert grant == "https://github.com/settings/installations/101"
-
-
-async def test_github_create_repo_a_hidden_org_repo_names_the_grant(gh_api, tmp_path):
-    github, box = gh_api
-    _gh_wire(github, tmp_path)
-    _gh_install(github, "org", "Organization")
-    box.repo_visible = False
-    repo, grant = await github.create_repo("org", "heldso")
-    assert repo == "https://github.com/org/heldso"
-    assert grant == "https://github.com/organizations/org/settings/installations/101"
-
-
-async def test_github_create_repo_a_legacy_state_refreshes_the_installations(gh_api, tmp_path):
-    """A saved entry with no type triggers one find_installations before the POST."""
-    github, box = gh_api
-    _gh_wire(github, tmp_path)  # the saved entry has no type
-    box.installations = [
-        {
-            "id": 101,
-            "app_id": 42,
-            "repository_selection": "all",
-            "account": {"login": "org", "type": "Organization"},
-        }
-    ]
-    repo, _grant = await github.create_repo("org", "heldso")
-    assert repo == "https://github.com/org/heldso"
-    assert box.bodies == [("/orgs/org/repos", {"name": "heldso", "private": True, "auto_init": False})]
-    lookups = [call for call in box.calls if call[0] == "GET" and call[1].startswith("/app/installations")]
-    assert len(lookups) == 1
-
-
 @pytest.mark.parametrize("fixture", ["api", "gh_api"])
 async def test_create_repo_needs_an_installation(request, fixture, tmp_path):
-    forge, _box = request.getfixturevalue(fixture)
-    _wire_forge(forge, tmp_path)
+    forge, box = request.getfixturevalue(fixture)
+    _wire_forge(forge, box, tmp_path)
     with pytest.raises(YardError) as caught:
         await forge.create_repo("someone-else", "heldso")
     assert caught.value.status == 404
     assert caught.value.code == "no_installation"
 
 
-async def test_a_plain_forge_cannot_create_repos(tmp_path):
-    forge = Forge(tmp_path / "f")
-    forge.save(installations=[{"id": "1", "account": "org"}])
+@pytest.mark.parametrize("fixture", ["api", "gh_api"])
+async def test_create_repo_needs_all_repositories(request, fixture, tmp_path):
+    """A "selected" installation could not see the new repo; no repo POST is sent."""
+    forge, box = request.getfixturevalue(fixture)
+    _wire_forge(forge, box, tmp_path)
+    if isinstance(box, _GhBox):
+        _gh_install(box, "org", "Organization", selection="selected")
+    else:
+        box.installations[0]["repoSelectionMode"] = "selected"
     with pytest.raises(YardError) as caught:
         await forge.create_repo("org", "heldso")
-    assert caught.value.status == 501
-    assert caught.value.code == "repo_unsupported"
+    assert caught.value.status == 403
+    assert caught.value.code == "repo_permission"
+    assert "all repositories" in (caught.value.help_text or "")
+    assert box.bodies == []
 
 
 async def test_origin_create_repo_posts_private(api):
     origin, box = api
     _wire(origin)
-    repo, grant = await origin.create_repo("org", "heldso")
-    assert repo == "https://origin.cursor.com/org/heldso"
-    assert grant == ""
+    assert await origin.create_repo("org", "heldso") == "https://origin.cursor.com/org/heldso"
     assert box.bodies == [("/repos/org", {"name": "heldso", "visibility": "private"})]
 
 
-async def test_origin_create_repo_a_selected_installation_never_calls(api):
+async def test_github_push_token_is_narrowed_to_one_repo(gh_api, tmp_path):
+    github, box = gh_api
+    _gh_wire(github, tmp_path)
+    token, expires_at = await github.push_token("https://github.com/org/heldso")
+    assert token.startswith("ghs_")
+    assert expires_at
+    assert box.bodies == [
+        (
+            "/app/installations/101/access_tokens",
+            {"repositories": ["heldso"], "permissions": {"contents": "write"}},
+        )
+    ]
+    # Never cached: a second call asks GitHub again, and the deploy token stays apart.
+    await github.push_token("https://github.com/org/heldso")
+    assert len(box.bodies) == 2
+    assert github._tokens == {}
+
+
+@pytest.mark.parametrize("status", [403, 422])
+async def test_github_push_token_without_the_grant_is_push_permission(gh_api, tmp_path, status):
+    github, box = gh_api
+    _gh_wire(github, tmp_path)
+    box.token_status = status
+    with pytest.raises(YardError) as caught:
+        await github.push_token("https://github.com/org/heldso")
+    assert caught.value.status == 403
+    assert caught.value.code == "push_permission"
+    assert "Contents to Read and write" in (caught.value.help_text or "")
+
+
+async def test_github_push_token_needs_an_installation(gh_api, tmp_path):
+    github, _box = gh_api
+    _gh_wire(github, tmp_path)
+    with pytest.raises(YardError) as caught:
+        await github.push_token("https://github.com/someone-else/heldso")
+    assert caught.value.code == "no_installation"
+
+
+async def test_origin_cannot_make_a_push_token(api):
     origin, box = api
     _wire(origin)
-    origin.save(installations=[{"id": "ins_1", "account": "org", "selection": "selected"}])
     with pytest.raises(YardError) as caught:
-        await origin.create_repo("org", "heldso")
-    assert caught.value.status == 403
-    assert caught.value.code == "repo_permission"
+        await origin.push_token("https://origin.cursor.com/org/heldso")
+    assert caught.value.status == 501
     assert box.calls == []

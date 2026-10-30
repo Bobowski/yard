@@ -153,47 +153,6 @@ def test_doctor_forge_rows_when_connected(tmp_path: Path, monkeypatch: pytest.Mo
     assert found["origin token"]["ok"]
     assert found["origin webhook"]["detail"] == "none since boot"
     assert found["origin check"]["ok"]
-    # Origin does not report commit statuses.
-    assert "origin status" not in found
-
-
-def test_doctor_github_status_row(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    yard = _yard(tmp_path, ps=CADDY_PS)
-    usage = collections.namedtuple("usage", "total used free")(200, 100, 100)
-    monkeypatch.setattr(shutil, "disk_usage", lambda path: usage)
-    monkeypatch.setattr(GitHub, "connected", lambda self: True)
-
-    async def fake_app(self):
-        return {"name": "yard"}
-
-    async def fake_find(self):
-        return [{"id": "101", "account": "org", "selection": "all"}]
-
-    async def fake_token(self, repo: str = ""):
-        return "tok"
-
-    monkeypatch.setattr(GitHub, "get_app", fake_app)
-    monkeypatch.setattr(GitHub, "find_installations", fake_find)
-    monkeypatch.setattr(GitHub, "token", fake_token)
-    github = yard.forge_named("github")
-
-    found = _run(yard)
-    assert found["github status"] == {"name": "github status", "ok": True, "detail": "none since boot", "warn": False}
-
-    github.last_report = now()
-    found = _run(yard)
-    assert found["github status"]["ok"]
-    assert found["github status"]["detail"] == "just now"
-
-    github.last_report_error = "github POST /repos/org/app/statuses/abc: 403 write access denied"
-    found = _run(yard)
-    assert found["github status"]["ok"] is False
-    assert "403" in found["github status"]["detail"]
-    assert "Commit statuses: Read and write" in found["github status"]["detail"]
-
-    github.last_report_error = "github POST /repos/org/app/statuses/abc: 502 boom"
-    found = _run(yard)
-    assert "Commit statuses" not in found["github status"]["detail"]
 
 
 def test_doctor_disk_says_where_the_space_went(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

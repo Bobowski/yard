@@ -54,24 +54,8 @@ async def boot(yard: Yard, app: App) -> None:
     # The apply image build pulls a base image. The server answers while that build runs.
     yard.tasks.append(app.create_task(_apply_image(yard), name="apply-image"))
     yard.tasks.append(app.create_task(apps.loop(yard), name="checks"))
-    yard.tasks.append(app.create_task(_boot_report(yard), name="boot-report"))
     if config.prune_days > 0:
         yard.tasks.append(app.create_task(apps.prune_loop(yard), name="prune"))
-
-
-async def _boot_report(yard: Yard) -> None:
-    """This process is the last yard deploy's commit; mark it live on the forge."""
-    sha = yard.config.sha
-    if not sha:
-        return
-    try:
-        repo = yard.store.app("yard").repo
-        forge = yard.forge(repo)
-    except YardError:
-        return
-    if not repo or not forge.connected():
-        return
-    await apps.report(forge, repo, sha, "success", "live")
 
 
 async def _network(yard: Yard) -> None:

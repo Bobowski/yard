@@ -35,8 +35,7 @@ class Forge:
     name = "forge"
     host = ""
     api = ""
-    reports = False
-    # The repo_permission help text; subclasses set it.
+    # The repo_permission help text for a create; subclasses set it.
     create_help = ""
 
     def __init__(self, dir: Path, api: str = "") -> None:
@@ -44,8 +43,6 @@ class Forge:
         self.api = (api or self.api).rstrip("/")
         self.last_delivery = ""
         self.last_check = ""
-        self.last_report = ""
-        self.last_report_error = ""
         self._tokens: dict[str, tuple[str, float]] = {}
 
     def _state(self) -> dict:
@@ -225,19 +222,34 @@ class Forge:
         self._tokens[installation] = (token, moment.timestamp() if moment else 0.0)
         return token
 
-    async def report(self, repo: str, sha: str, state: str, description: str, target_url: str = "") -> None:
-        """A commit status on the forge. Only a forge with reports = True posts one."""
-
-    async def create_repo(self, owner: str, name: str) -> tuple[str, str]:
-        """(repo URL, grant URL) for a new private repo under owner."""
-        probe = f"https://{self.host}/{owner}/x"
-        installation = self.installation_for(probe)
+    def _installation(self, owner: str) -> dict:
+        installation = self.installation_for(f"https://{self.host}/{owner}/x")
         if installation is None:
             raise YardError(
                 404,
                 "no_installation",
                 f"the Yard app is not installed on {owner}",
                 help_text=f"Install the Yard app on {owner}. yard forge setup {self.name} prints the link.",
+            )
+        return installation
+
+    async def create_repo(self, owner: str, name: str) -> str:
+        """A new private repo under owner. Returns its https URL.
+
+        The installation must cover all repositories: a "selected" one cannot see
+        the repo it makes, so the first push would wait on a grant by hand.
+        """
+        await self.find_installations()
+        installation = self._installation(owner)
+        if installation.get("selection") != "all":
+            raise YardError(
+                403,
+                "repo_permission",
+                f"the Yard {self.name} app on {owner} covers selected repos only",
+                help_text=(
+                    f"Install the app on {owner} for all repositories."
+                    " A separate account for generated apps keeps your other repos out."
+                ),
             )
         try:
             full = await self._make_repo(installation, owner, name)
@@ -261,21 +273,20 @@ class Forge:
                     help_text=self.create_help,
                 ) from exc
             raise
-        # _make_repo may have refreshed the installation (a legacy state gains a type).
-        installation = self.installation_for(probe) or installation
-        return f"https://{self.host}/{full}", await self._grant_url(installation, owner, full)
+        return f"https://{self.host}/{full}"
 
     async def _make_repo(self, installation: dict, owner: str, name: str) -> str:
-        """POST the repo; return its owner/name. A forge that cannot raises 501."""
+        """POST the repo; return its owner/name. Subclasses implement it."""
+        raise NotImplementedError
+
+    async def push_token(self, repo: str) -> tuple[str, str]:
+        """(token, expires_at) that can push to this one repo. Only GitHub makes one."""
         raise YardError(
             501,
-            "repo_unsupported",
-            f"{self.name} cannot create repos",
-            help_text="Create the repo on the forge, then run yard app new in its checkout.",
+            "push_unsupported",
+            f"{self.name} cannot make a push token",
+            help_text="Push with your own git credentials.",
         )
-
-    async def _grant_url(self, installation: dict, owner: str, full: str) -> str:
-        return ""
 
 
 class Origin(Forge):
@@ -375,16 +386,6 @@ class Origin(Forge):
                 return found
 
     async def _make_repo(self, installation: dict, owner: str, name: str) -> str:
-        if installation.get("selection") != "all":
-            raise YardError(
-                403,
-                "repo_permission",
-                "the Origin installation covers selected repos only",
-                help_text=(
-                    "Origin creates repos only for an installation on all repositories."
-                    " Install the app again on all repositories."
-                ),
-            )
         body = await self._call(
             "POST",
             f"/repos/{owner}",
@@ -401,7 +402,6 @@ class GitHub(Forge):
     name = "github"
     host = "github.com"
     api = "https://api.github.com"
-    reports = True
     create_help = (
         "In the app's GitHub settings, set Repository creation to Read and write,"
         " then accept the new permission on the installation."
@@ -515,24 +515,8 @@ class GitHub(Forge):
         digest = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
         return hmac.compare_digest(f"sha256={digest}", header)
 
-    async def report(self, repo: str, sha: str, state: str, description: str, target_url: str = "") -> None:
-        """POST /repos/<owner>/<name>/statuses/<sha> with the installation token."""
-        full = urlsplit(repo).path.strip("/").removesuffix(".git")
-        body: dict[str, str] = {
-            "state": state,
-            "description": description[:140],
-            "context": "yard",
-        }
-        if target_url:
-            body["target_url"] = target_url
-        await self._call("POST", f"/repos/{full}/statuses/{sha}", await self.token(repo), body)
-
     async def _make_repo(self, installation: dict, owner: str, name: str) -> str:
         """POST /user/repos or /orgs/<owner>/repos; return the new owner/name."""
-        if not installation.get("type"):
-            # A state saved before types needs one refresh to learn the account kind.
-            await self.find_installations()
-            installation = self.installation_for(f"https://{self.host}/{owner}/x") or {}
         path = "/user/repos" if installation.get("type") == "User" else f"/orgs/{owner}/repos"
         body = await self._call(
             "POST",
@@ -543,20 +527,35 @@ class GitHub(Forge):
         data = body if isinstance(body, dict) else {}
         return str(data.get("full_name") or f"{owner}/{name}")
 
-    async def _grant_url(self, installation: dict, owner: str, full: str) -> str:
-        """ "" for a visible repo; the installation settings page for a hidden one."""
-        # A "selected repos" installation cannot see the repo it just made.
-        self._tokens.pop(str(installation.get("id") or ""), None)
+    async def push_token(self, repo: str) -> tuple[str, str]:
+        """An installation token narrowed to contents write on one repo. Never cached."""
+        owner, _, name = urlsplit(repo).path.strip("/").removesuffix(".git").partition("/")
+        installation = self._installation(owner)
         try:
-            await self._call("GET", f"/repos/{full}", await self.token(f"https://{self.host}/{full}"))
+            body = await self._call(
+                "POST",
+                f"/app/installations/{installation.get('id')}/access_tokens",
+                self.app_jwt(),
+                {"repositories": [name], "permissions": {"contents": "write"}},
+            )
         except YardError as exc:
-            if exc.context.get("status") not in (403, 404):
+            # GitHub answers 422 for a repo the installation cannot see or a permission it lacks.
+            if exc.context.get("status") not in (403, 404, 422):
                 raise
-            ident = str(installation.get("id") or "")
-            if installation.get("type") == "User":
-                return f"https://github.com/settings/installations/{ident}"
-            return f"https://github.com/organizations/{owner}/settings/installations/{ident}"
-        return ""
+            raise YardError(
+                403,
+                "push_permission",
+                f"the Yard github app cannot push to {owner}/{name}",
+                help_text=(
+                    "In the app's GitHub settings, set Contents to Read and write,"
+                    f" accept the new permission, and install the app on {owner} for all repositories."
+                ),
+            ) from exc
+        data = body if isinstance(body, dict) else {}
+        token = str(data.get("token") or "")
+        if not token:
+            raise YardError(502, self.name, f"{self.name} returned no token")
+        return token, str(data.get("expires_at") or "")
 
 
 def _account(installation: dict) -> str:
