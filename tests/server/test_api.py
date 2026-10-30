@@ -1079,11 +1079,11 @@ async def test_repo_token(yard, monkeypatch, capsys):
     monkeypatch.setattr(GitHub, "connected", lambda self: True)
     asked: list[str] = []
 
-    async def fake_push_token(self, repo):
+    async def fake_repo_token(self, repo):
         asked.append(repo)
         return "ghs_secret", "2026-10-30T13:00:00Z"
 
-    monkeypatch.setattr(GitHub, "push_token", fake_push_token)
+    monkeypatch.setattr(GitHub, "repo_token", fake_repo_token)
     res = await client.post(
         "/api/v1/repos/token",
         json={"repo": "https://github.com/org/heldso.git"},
@@ -1093,7 +1093,7 @@ async def test_repo_token(yard, monkeypatch, capsys):
     assert res.json() == {"username": "x-access-token", "token": "ghs_secret", "expires_at": "2026-10-30T13:00:00Z"}
     assert asked == ["https://github.com/org/heldso"]
     out = capsys.readouterr().out
-    event = _journal_event(out, "repo.push_token")
+    event = _journal_event(out, "repo.token")
     assert event["repo"] == "https://github.com/org/heldso"
     assert event["actor"] == "admin"
     # The journal never carries the token.

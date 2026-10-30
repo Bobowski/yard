@@ -641,7 +641,7 @@ async def test_token_without_an_installation_raises(gh_api, tmp_path):
         await github.token()
 
 
-# --- create_repo and push_token -----------------------------------------------
+# --- create_repo and repo_token -----------------------------------------------
 
 
 def _gh_install(box: _GhBox, account: str, kind: str, selection: str = "all") -> None:
@@ -747,10 +747,10 @@ async def test_origin_create_repo_posts_private(api):
     assert box.bodies == [("/repos/org", {"name": "heldso", "visibility": "private"})]
 
 
-async def test_github_push_token_is_narrowed_to_one_repo(gh_api, tmp_path):
+async def test_github_repo_token_is_narrowed_to_one_repo(gh_api, tmp_path):
     github, box = gh_api
     _gh_wire(github, tmp_path)
-    token, expires_at = await github.push_token("https://github.com/org/heldso")
+    token, expires_at = await github.repo_token("https://github.com/org/heldso")
     assert token.startswith("ghs_")
     assert expires_at
     assert box.bodies == [
@@ -760,35 +760,35 @@ async def test_github_push_token_is_narrowed_to_one_repo(gh_api, tmp_path):
         )
     ]
     # Never cached: a second call asks GitHub again, and the deploy token stays apart.
-    await github.push_token("https://github.com/org/heldso")
+    await github.repo_token("https://github.com/org/heldso")
     assert len(box.bodies) == 2
     assert github._tokens == {}
 
 
 @pytest.mark.parametrize("status", [403, 422])
-async def test_github_push_token_without_the_grant_is_push_permission(gh_api, tmp_path, status):
+async def test_github_repo_token_without_the_grant_is_token_permission(gh_api, tmp_path, status):
     github, box = gh_api
     _gh_wire(github, tmp_path)
     box.token_status = status
     with pytest.raises(YardError) as caught:
-        await github.push_token("https://github.com/org/heldso")
+        await github.repo_token("https://github.com/org/heldso")
     assert caught.value.status == 403
-    assert caught.value.code == "push_permission"
+    assert caught.value.code == "token_permission"
     assert "Contents to Read and write" in (caught.value.help_text or "")
 
 
-async def test_github_push_token_needs_an_installation(gh_api, tmp_path):
+async def test_github_repo_token_needs_an_installation(gh_api, tmp_path):
     github, _box = gh_api
     _gh_wire(github, tmp_path)
     with pytest.raises(YardError) as caught:
-        await github.push_token("https://github.com/someone-else/heldso")
+        await github.repo_token("https://github.com/someone-else/heldso")
     assert caught.value.code == "no_installation"
 
 
-async def test_origin_cannot_make_a_push_token(api):
+async def test_origin_cannot_make_a_repo_token(api):
     origin, box = api
     _wire(origin)
     with pytest.raises(YardError) as caught:
-        await origin.push_token("https://origin.cursor.com/org/heldso")
+        await origin.repo_token("https://origin.cursor.com/org/heldso")
     assert caught.value.status == 501
     assert box.calls == []

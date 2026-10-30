@@ -279,13 +279,13 @@ class Forge:
         """POST the repo; return its owner/name. Subclasses implement it."""
         raise NotImplementedError
 
-    async def push_token(self, repo: str) -> tuple[str, str]:
-        """(token, expires_at) that can push to this one repo. Only GitHub makes one."""
+    async def repo_token(self, repo: str) -> tuple[str, str]:
+        """(token, expires_at) for git on this one repo: clone, fetch, and push. Only GitHub makes one."""
         raise YardError(
             501,
-            "push_unsupported",
-            f"{self.name} cannot make a push token",
-            help_text="Push with your own git credentials.",
+            "token_unsupported",
+            f"{self.name} cannot make a repo token",
+            help_text="Use your own git credentials.",
         )
 
 
@@ -527,7 +527,7 @@ class GitHub(Forge):
         data = body if isinstance(body, dict) else {}
         return str(data.get("full_name") or f"{owner}/{name}")
 
-    async def push_token(self, repo: str) -> tuple[str, str]:
+    async def repo_token(self, repo: str) -> tuple[str, str]:
         """An installation token narrowed to contents write on one repo. Never cached."""
         owner, _, name = urlsplit(repo).path.strip("/").removesuffix(".git").partition("/")
         installation = self._installation(owner)
@@ -544,8 +544,8 @@ class GitHub(Forge):
                 raise
             raise YardError(
                 403,
-                "push_permission",
-                f"the Yard github app cannot push to {owner}/{name}",
+                "token_permission",
+                f"the Yard github app cannot make a token for {owner}/{name}",
                 help_text=(
                     "In the app's GitHub settings, set Contents to Read and write,"
                     f" accept the new permission, and install the app on {owner} for all repositories."

@@ -694,7 +694,7 @@ class HostPage:
         w.json(cast(JsonValue, await repos.create_repo(self.yard, name, owner, forge, actor=_actor(c))))
 
     async def repo_token(self, c: Context, w: Writer) -> None:
-        """A token that can push to one repo for an hour."""
+        """A token that can clone, fetch, and push one repo for an hour."""
         repo = (await json_object(c)).get("repo", "")
         if not isinstance(repo, str):
             raise YardError(
@@ -704,7 +704,7 @@ class HostPage:
                 help_text="repo is a string.",
                 example='{"repo": "https://github.com/org/heldso"}',
             )
-        w.json(cast(JsonValue, await repos.push_token(self.yard, repo, actor=_actor(c))))
+        w.json(cast(JsonValue, await repos.repo_token(self.yard, repo, actor=_actor(c))))
 
     async def logs_get(self, c: Context, w: Writer) -> None:
         """Container logs from the journal; they outlive the container.

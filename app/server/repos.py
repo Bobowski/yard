@@ -26,14 +26,14 @@ async def create_repo(yard: Yard, name: str, owner: str = "", forge_name: str = 
     return {"repo": repo}
 
 
-async def push_token(yard: Yard, repo: str, *, actor: str) -> dict:
-    """A token that can push to one repo for an hour. The journal names the repo, never the token."""
+async def repo_token(yard: Yard, repo: str, *, actor: str) -> dict:
+    """A token that can clone, fetch, and push one repo for an hour. The journal names the repo, never the token."""
     repo = check_repo(repo)
     forge = yard.forge(repo)
     if not forge.connected():
         raise YardError(502, forge.name, f"{forge.name} is not connected. Run yard forge setup {forge.name}.")
-    token, expires_at = await forge.push_token(repo)
-    journal.send(yard.config, "repo.push_token", f"push token for {repo}", forge=forge.name, repo=repo, actor=actor)
+    token, expires_at = await forge.repo_token(repo)
+    journal.send(yard.config, "repo.token", f"token for {repo}", forge=forge.name, repo=repo, actor=actor)
     # Plain git takes it as the password for the user x-access-token; no gh is needed.
     return {"username": "x-access-token", "token": token, "expires_at": expires_at}
 
