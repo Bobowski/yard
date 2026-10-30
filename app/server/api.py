@@ -12,7 +12,7 @@ from stario import Context, Handler, Middleware, Route, Writer, json
 from stario.http.middleware import catch_errors
 from stario.json import JsonValue
 
-from app.server import apps, binds, doctor, journal, status
+from app.server import apps, binds, doctor, journal, repos, status
 from app.server.forges import Forge, GitHub, Origin
 from app.server.logfilter import Held, LogFilter
 from app.server.store import App, Config, Deployed, Store, read_deployed
@@ -28,6 +28,8 @@ EVENTS = Route("GET /api/v1/events")
 DOCTOR = Route("GET /api/v1/doctor")
 FORGES = Route("GET /api/v1/forges")
 FORGE_PUT = Route("PUT /api/v1/forges/{name}")
+REPOS = Route("POST /api/v1/repos")
+REPO_TOKEN = Route("POST /api/v1/repos/token")
 APPS = Route("GET /api/v1/apps")
 APP_CREATE = Route("POST /api/v1/apps")
 APP = Route("GET /api/v1/apps/{name}")
@@ -575,6 +577,8 @@ class HostPage:
         app.add(PRUNE, self.run_prune, middleware=middleware)
         app.add(FORGES, self.forges_list, middleware=middleware)
         app.add(FORGE_PUT, self.forge_put, middleware=middleware)
+        app.add(REPOS, self.repo_create, middleware=middleware)
+        app.add(REPO_TOKEN, self.repo_token, middleware=middleware)
 
     async def host_status(self, c: Context, w: Writer) -> None:
         report = await status.report(self.yard, c.req.query.get("running") == "1")
@@ -674,6 +678,33 @@ class HostPage:
                 404, "not_found", f"unknown forge {forge.name}", help_text="The forges are origin and github."
             )
         w.json(cast(JsonValue, {"forge": forge.summary(), "app": app}))
+
+    async def repo_create(self, c: Context, w: Writer) -> None:
+        """A private repo on a forge."""
+        data = await json_object(c)
+        name, owner, forge = data.get("name", ""), data.get("owner", ""), data.get("forge", "")
+        if not isinstance(name, str) or not isinstance(owner, str) or not isinstance(forge, str):
+            raise YardError(
+                400,
+                "bad_json",
+                "bad json",
+                help_text="name, owner, and forge are strings.",
+                example='{"name": "heldso"}',
+            )
+        w.json(cast(JsonValue, await repos.create_repo(self.yard, name, owner, forge, actor=_actor(c))))
+
+    async def repo_token(self, c: Context, w: Writer) -> None:
+        """A token that can clone, fetch, and push one repo for an hour."""
+        repo = (await json_object(c)).get("repo", "")
+        if not isinstance(repo, str):
+            raise YardError(
+                400,
+                "bad_json",
+                "bad json",
+                help_text="repo is a string.",
+                example='{"repo": "https://github.com/org/heldso"}',
+            )
+        w.json(cast(JsonValue, await repos.repo_token(self.yard, repo, actor=_actor(c))))
 
     async def logs_get(self, c: Context, w: Writer) -> None:
         """Container logs from the journal; they outlive the container.

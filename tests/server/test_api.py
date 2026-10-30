@@ -740,8 +740,8 @@ async def test_installation_hook_keeps_every_account(yard, monkeypatch):
     await client.drain_tasks()
     state = json.loads((root / "apps" / "yard" / "data" / "github" / "state.json").read_text())
     assert state["installations"] == [
-        {"account": "stariodev", "id": "202", "selection": "all"},
-        {"account": "Bobowski", "id": "101", "selection": "all"},
+        {"account": "stariodev", "id": "202", "selection": "all", "type": ""},
+        {"account": "Bobowski", "id": "101", "selection": "all", "type": ""},
     ]
     assert "installation_id" not in state
     # The Bobowski app still counts as owned.
@@ -970,3 +970,144 @@ async def test_deploy_second_post_returns_the_running_job(yard, monkeypatch):
     gate.set()
     assert first.json()["deploy"]["id"] == second.json()["deploy"]["id"]
     assert second.json()["deploy"]["status"] == "running"
+
+
+def _gh_state(root, installations: list) -> None:
+    state = root / "apps" / "yard" / "data" / "github" / "state.json"
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(json.dumps({"app_id": "42", "installations": installations}))
+
+
+def _journal_event(out: str, name: str) -> dict:
+    return next(json.loads(line) for line in out.splitlines() if line.startswith("{") and f'"{name}"' in line)
+
+
+async def test_repo_create(yard, monkeypatch, capsys):
+    client, token, root = yard
+    monkeypatch.setattr(GitHub, "connected", lambda self: True)
+    made: list[tuple[str, str]] = []
+
+    async def fake_create(self, owner, name):
+        made.append((owner, name))
+        return f"https://github.com/{owner}/{name}"
+
+    monkeypatch.setattr(GitHub, "create_repo", fake_create)
+    _gh_state(root, [{"id": "101", "account": "org", "selection": "all", "type": "Organization"}])
+    res = await client.post("/api/v1/repos", json={"name": "heldso"}, headers=auth(token))
+    assert res.status_code == 200
+    assert res.json() == {"repo": "https://github.com/org/heldso"}
+    # The one connected forge and its one installation are the defaults.
+    assert made == [("org", "heldso")]
+    event = _journal_event(capsys.readouterr().out, "repo.create")
+    assert event["repo"] == "https://github.com/org/heldso"
+    assert event["forge"] == "github"
+    assert event["actor"] == "admin"
+
+
+async def test_repo_create_checks_the_body(yard):
+    client, token, _root = yard
+    res = await client.post("/api/v1/repos", json={"name": "heldso", "owner": 42}, headers=auth(token))
+    assert res.status_code == 400
+    assert res.json()["error"]["code"] == "bad_json"
+    res = await client.post("/api/v1/repos", json={"name": "heldso"})
+    assert res.status_code == 401
+
+
+async def test_repo_create_rejects_a_bad_name(yard, monkeypatch):
+    client, token, _root = yard
+    monkeypatch.setattr(GitHub, "connected", lambda self: True)
+    res = await client.post("/api/v1/repos", json={"name": "Bad Name"}, headers=auth(token))
+    assert res.status_code == 400
+    assert res.json()["error"]["code"] == "bad_name"
+
+
+async def test_repo_create_needs_a_connected_forge(yard):
+    client, token, _root = yard
+    res = await client.post("/api/v1/repos", json={"name": "heldso"}, headers=auth(token))
+    assert res.status_code == 502
+    assert "no forge is connected" in res.text
+    res = await client.post("/api/v1/repos", json={"name": "heldso", "forge": "github"}, headers=auth(token))
+    assert res.status_code == 502
+    assert "github is not connected" in res.text
+
+
+async def test_repo_create_needs_the_forge_when_two_are_connected(yard, monkeypatch):
+    client, token, _root = yard
+    monkeypatch.setattr(GitHub, "connected", lambda self: True)
+    monkeypatch.setattr(Origin, "connected", lambda self: True)
+    res = await client.post("/api/v1/repos", json={"name": "heldso"}, headers=auth(token))
+    assert res.status_code == 400
+    assert res.json()["error"]["code"] == "forge_required"
+
+
+async def test_repo_create_needs_an_owner_when_accounts_differ(yard, monkeypatch):
+    client, token, root = yard
+    monkeypatch.setattr(GitHub, "connected", lambda self: True)
+    _gh_state(
+        root,
+        [
+            {"id": "101", "account": "Bobowski", "selection": "all", "type": "User"},
+            {"id": "202", "account": "stariodev", "selection": "all", "type": "Organization"},
+        ],
+    )
+    res = await client.post("/api/v1/repos", json={"name": "heldso"}, headers=auth(token))
+    assert res.status_code == 400
+    assert res.json()["error"]["code"] == "owner_required"
+    assert "Bobowski" in res.text and "stariodev" in res.text
+
+
+async def test_repo_create_origin(yard, monkeypatch):
+    client, token, _root = yard
+    monkeypatch.setattr(GitHub, "connected", lambda self: True)
+    monkeypatch.setattr(Origin, "connected", lambda self: True)
+
+    async def fake_create(self, owner, name):
+        return f"https://origin.cursor.com/{owner}/{name}"
+
+    monkeypatch.setattr(Origin, "create_repo", fake_create)
+    res = await client.post(
+        "/api/v1/repos",
+        json={"name": "heldso", "owner": "org", "forge": "origin"},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+    assert res.json() == {"repo": "https://origin.cursor.com/org/heldso"}
+
+
+async def test_repo_token(yard, monkeypatch, capsys):
+    client, token, _root = yard
+    monkeypatch.setattr(GitHub, "connected", lambda self: True)
+    asked: list[str] = []
+
+    async def fake_repo_token(self, repo):
+        asked.append(repo)
+        return "ghs_secret", "2026-10-30T13:00:00Z"
+
+    monkeypatch.setattr(GitHub, "repo_token", fake_repo_token)
+    res = await client.post(
+        "/api/v1/repos/token",
+        json={"repo": "https://github.com/org/heldso.git"},
+        headers=auth(token),
+    )
+    assert res.status_code == 200
+    assert res.json() == {"username": "x-access-token", "token": "ghs_secret", "expires_at": "2026-10-30T13:00:00Z"}
+    assert asked == ["https://github.com/org/heldso"]
+    out = capsys.readouterr().out
+    event = _journal_event(out, "repo.token")
+    assert event["repo"] == "https://github.com/org/heldso"
+    assert event["actor"] == "admin"
+    # The journal never carries the token.
+    assert "ghs_secret" not in out
+
+
+async def test_repo_token_checks_the_repo(yard):
+    client, token, _root = yard
+    res = await client.post("/api/v1/repos/token", json={"repo": 42}, headers=auth(token))
+    assert res.status_code == 400
+    assert res.json()["error"]["code"] == "bad_json"
+    res = await client.post("/api/v1/repos/token", json={"repo": "https://example.com/a/b"}, headers=auth(token))
+    assert res.status_code == 400
+    res = await client.post("/api/v1/repos/token", json={"repo": "https://github.com/org/heldso"}, headers=auth(token))
+    assert res.status_code == 502
+    res = await client.post("/api/v1/repos/token", json={"repo": "https://github.com/org/heldso"})
+    assert res.status_code == 401
