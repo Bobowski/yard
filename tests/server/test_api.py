@@ -688,7 +688,14 @@ async def test_forges_find_the_installation_on_read(yard, monkeypatch):
     monkeypatch.setattr(GitHub, "find_installations", found_one)
     rows = (await client.get("/api/v1/forges", headers=auth(token))).json()
     found = next(row for row in rows if row["name"] == "github")
-    assert found["installations"] == [{"id": "101", "account": "org", "selection": "all"}]
+    assert found["installations"] == [
+        {
+            "id": "101",
+            "account": "org",
+            "selection": "all",
+            "settings_url": "https://github.com/settings/installations/101",
+        }
+    ]
     state = json.loads((root / "apps" / "yard" / "data" / "github" / "state.json").read_text())
     assert state["installations"] == [{"id": "101", "account": "org", "selection": "all"}]
 

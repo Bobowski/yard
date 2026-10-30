@@ -1369,9 +1369,10 @@ def _poll_installation(session: Client, name: str) -> None:
                     selection = str(entry.get("selection") or "")
                     if selection and selection != "all":
                         account = str(entry.get("account") or "")
+                        where = str(entry.get("settings_url") or "") or "the installation page"
                         print(
-                            f"warning: the {account + ' ' if account else ''}installation covers "
-                            "selected repos only; new repos need a grant",
+                            f"warning: the {account + ' ' if account else ''}installation covers selected repos only;"
+                            f" yard repo new needs all repositories. Change it on {where}",
                             file=sys.stderr,
                         )
             return

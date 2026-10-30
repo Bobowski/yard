@@ -277,7 +277,7 @@ def test_summary_has_no_secret(tmp_path):
         "host": "origin.cursor.com",
         "connected": True,
         "app_id": "app_1",
-        "installations": [{"id": "ins_1", "account": "org", "selection": "all"}],
+        "installations": [{"id": "ins_1", "account": "org", "selection": "all", "settings_url": ""}],
         "last_delivery": "",
         "last_check": "",
         "public_key": key,
@@ -553,7 +553,14 @@ def test_github_summary_has_no_secret(tmp_path):
     summary = github.summary()
     assert summary["name"] == "github" and summary["host"] == "github.com"
     assert summary["app_id"] == "42"
-    assert summary["installations"] == [{"id": "101", "account": "org", "selection": "all"}]
+    assert summary["installations"] == [
+        {
+            "id": "101",
+            "account": "org",
+            "selection": "all",
+            "settings_url": "https://github.com/settings/installations/101",
+        }
+    ]
     assert summary["slug"] == "yard-host"
     assert SECRET not in json.dumps(summary)
     assert "webhook_secret" not in summary

@@ -121,8 +121,10 @@ async def _forge_installation_rows(forge: Forge) -> list[Check]:
         account = str(installation.get("account") or "")
         name = f"{forge.name} installation {account}" if account else f"{forge.name} installation"
         if str(installation.get("selection") or "") != "all":
-            # A selected-repos install is legitimate; the user grants each new repo.
-            rows.append(_check(name, (True, "selected repos only; grant each new repo on the installation page", True)))
+            # Deploys work on a selected-repos install; yard repo new refuses it.
+            where = forge.settings_url(installation) or f"the installation page on {forge.host}"
+            detail = f"selected repos only; yard repo new needs all repositories: {where}"
+            rows.append(_check(name, (True, detail, True)))
         else:
             rows.append(_check(name, (True, "all repos")))
     return rows

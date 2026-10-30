@@ -497,7 +497,7 @@ def test_doctor_a_selected_installation_warns(tmp_path: Path, monkeypatch: pytes
         return {"name": "yard"}
 
     async def fake_find(self):
-        return [{"id": "101", "account": "org", "selection": "selected"}]
+        return [{"id": "101", "account": "org", "selection": "selected", "type": "Organization"}]
 
     async def fake_token(self, repo: str = ""):
         return "tok"
@@ -508,7 +508,10 @@ def test_doctor_a_selected_installation_warns(tmp_path: Path, monkeypatch: pytes
     found = _run(yard)
     row = found["github installation org"]
     assert row["ok"] and row["warn"]
-    assert row["detail"] == "selected repos only; grant each new repo on the installation page"
+    assert row["detail"] == (
+        "selected repos only; yard repo new needs all repositories:"
+        " https://github.com/organizations/org/settings/installations/101"
+    )
 
 
 def test_doctor_one_installation_row_per_account(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

@@ -112,6 +112,10 @@ class Forge:
         """User or Organization on GitHub. Subclasses read their own field."""
         return ""
 
+    def settings_url(self, installation: dict) -> str:
+        """The page where the owner changes the repo selection; "" when the forge has none."""
+        return ""
+
     def summary(self) -> dict:
         """What the API reports. Never a key, a secret, or a token."""
         return {
@@ -124,6 +128,7 @@ class Forge:
                     "id": str(entry.get("id") or ""),
                     "account": str(entry.get("account") or ""),
                     "selection": str(entry.get("selection") or ""),
+                    "settings_url": self.settings_url(entry),
                 }
                 for entry in self.installations
             ],
@@ -463,6 +468,14 @@ class GitHub(Forge):
     def account_type(self, installation: dict) -> str:
         account = installation.get("account")
         return str(account.get("type") or "") if isinstance(account, dict) else ""
+
+    def settings_url(self, installation: dict) -> str:
+        ident, account = str(installation.get("id") or ""), str(installation.get("account") or "")
+        if not ident:
+            return ""
+        if installation.get("type") == "Organization" and account:
+            return f"https://github.com/organizations/{account}/settings/installations/{ident}"
+        return f"https://github.com/settings/installations/{ident}"
 
     def summary(self) -> dict:
         summary = super().summary()
