@@ -1090,7 +1090,7 @@ async def test_repo_token(yard, monkeypatch, capsys):
         headers=auth(token),
     )
     assert res.status_code == 200
-    assert res.json() == {"token": "ghs_secret", "expires_at": "2026-10-30T13:00:00Z"}
+    assert res.json() == {"username": "x-access-token", "token": "ghs_secret", "expires_at": "2026-10-30T13:00:00Z"}
     assert asked == ["https://github.com/org/heldso"]
     out = capsys.readouterr().out
     event = _journal_event(out, "repo.push_token")

@@ -34,7 +34,8 @@ async def push_token(yard: Yard, repo: str, *, actor: str) -> dict:
         raise YardError(502, forge.name, f"{forge.name} is not connected. Run yard forge setup {forge.name}.")
     token, expires_at = await forge.push_token(repo)
     journal.send(yard.config, "repo.push_token", f"push token for {repo}", forge=forge.name, repo=repo, actor=actor)
-    return {"token": token, "expires_at": expires_at}
+    # Plain git takes it as the password for the user x-access-token; no gh is needed.
+    return {"username": "x-access-token", "token": token, "expires_at": expires_at}
 
 
 def _connected_forge(yard: Yard, name: str) -> Forge:
